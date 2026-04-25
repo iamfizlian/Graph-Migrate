@@ -75,30 +75,56 @@ class MessageUploader:
     def _upload_mime(
         self, raw: bytes, folder_id: str, *, date_props: list[dict[str, str]], app_id: str
     ) -> UploadResult:
-        """Single POST with raw MIME — fastest path. Followed by a date-PATCH.
+        """Create from MIME, then move into the target folder.
 
-        Graph's create-from-MIME endpoint is the *collection* URL with
-        Content-Type: text/plain and a base64-encoded MIME body; there is NO
-        ``/$value`` segment (that segment is for fetching a single message's
-        raw MIME, not for posting one).
+        Microsoft Graph's MIME-import endpoint is ``POST /users/{id}/messages``
+        (no folder segment) with Content-Type: text/plain and a base64-encoded
+        MIME body. The created message lands in the user's Drafts folder.
+        Posting MIME to ``mailFolders/{id}/messages`` returns
+        ``UnableToDeserializePostBody`` because that endpoint expects JSON.
+        Posting MIME to ``mailFolders/{id}/messages/$value`` returns
+        ``$value cannot be applied to a collection``. So the correct shape
+        is create-in-drafts then move.
+
+        After ``/move`` the message ID CHANGES, so we use the moved id for
+        the follow-up date PATCH.
         """
-        path = f"/users/{quote(self._mailbox)}/mailFolders/{folder_id}/messages"
         encoded = base64.b64encode(raw)
+        create_path = f"/users/{quote(self._mailbox)}/messages"
         resp = self._graph.post(
-            path,
+            create_path,
             content=encoded,
             headers={"Content-Type": "text/plain"},
             expect_status=(201, 202),
             app_id=app_id,
         )
         body = resp.json() if resp.content else {}
-        msg_id = body.get("id", "")
+        draft_id = body.get("id", "")
+        if not draft_id:
+            return UploadResult(
+                graph_message_id="",
+                bytes_uploaded=len(raw),
+                via="mime+move(no-id)",
+            )
+
+        move_path = f"/users/{quote(self._mailbox)}/messages/{draft_id}/move"
+        mv = self._graph.post(
+            move_path,
+            json={"destinationId": folder_id},
+            expect_status=(200, 201),
+            app_id=app_id,
+        )
+        moved = mv.json() if mv.content else {}
+        # Move returns the moved message; its id is regenerated.
+        msg_id = moved.get("id", draft_id)
+
         if msg_id and date_props:
             self._patch_dates(msg_id, date_props, app_id=app_id)
+
         return UploadResult(
             graph_message_id=msg_id,
             bytes_uploaded=len(raw),
-            via="mime",
+            via="mime+move",
         )
 
     def _patch_dates(
