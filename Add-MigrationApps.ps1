@@ -80,7 +80,7 @@ $mailReadWriteRole = $graphSp.AppRoles | Where-Object {
     $_.Value -eq 'Mail.ReadWrite' -and $_.AllowedMemberTypes -contains 'Application'
 }
 if (-not $mailReadWriteRole) {
-    throw "Could not find Mail.ReadWrite app role on Microsoft Graph SP — aborting."
+    throw "Could not find Mail.ReadWrite app role on Microsoft Graph SP - aborting."
 }
 
 # ---- 4. Loop and create -------------------------------------------------
@@ -93,7 +93,7 @@ for ($i = 0; $i -lt $Count; $i++) {
     # Skip if it already exists
     $existing = Get-MgApplication -Filter "displayName eq '$appName'" -ErrorAction SilentlyContinue
     if ($existing) {
-        Write-Host "  ! '$appName' already exists (AppId $($existing.AppId)) — SKIPPING." -ForegroundColor Yellow
+        Write-Host "  ! '$appName' already exists (AppId $($existing.AppId)) - SKIPPING." -ForegroundColor Yellow
         continue
     }
 
