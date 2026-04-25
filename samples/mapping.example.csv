@@ -1,0 +1,4 @@
+PSTPath,TargetMailbox,TargetRootFolder
+/srv/pst/jsmith.pst,jsmith@contoso.com,Imported PST
+/srv/pst/bdoe.pst,bdoe@contoso.com,Imported PST
+/srv/pst/legacy.pst,bdoe@contoso.com,Legacy Archive

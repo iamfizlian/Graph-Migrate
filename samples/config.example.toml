@@ -1,0 +1,59 @@
+log_level = "INFO"
+
+# ─── App pool ──────────────────────────────────────────────────────────────
+# Each [[apps]] entry is one Entra app registration with Mail.ReadWrite
+# (application). Aggregate Graph throughput scales ~linearly with len(apps)
+# because throttle buckets are keyed on (app_id, target_resource). The
+# per-mailbox cap ultimately bounds you per mailbox, but more apps means
+# more headroom across mailboxes you're migrating in parallel.
+#
+# Use ONE credential per app: client_secret OR client_certificate_path.
+
+[[apps]]
+name = "primary"
+tenant_id = "contoso.onmicrosoft.com"
+client_id = "00000000-0000-0000-0000-000000000000"
+client_secret = "REPLACE_WITH_SECRET_OR_USE_CERT"
+# client_certificate_path = "/etc/pstmigrate/primary.pem"
+# client_certificate_password = ""
+
+# Add more apps to multiply per-mailbox aggregate throughput:
+# [[apps]]
+# name = "secondary"
+# tenant_id = "contoso.onmicrosoft.com"
+# client_id = "11111111-1111-1111-1111-111111111111"
+# client_secret = "..."
+#
+# [[apps]]
+# name = "tertiary"
+# tenant_id = "contoso.onmicrosoft.com"
+# client_id = "22222222-2222-2222-2222-222222222222"
+# client_certificate_path = "/etc/pstmigrate/tertiary.pem"
+
+# ─── Throttle / retry ──────────────────────────────────────────────────────
+
+[throttle]
+max_retries = 8
+initial_backoff_seconds = 1.0
+max_backoff_seconds = 120.0
+backoff_multiplier = 2.0
+backoff_jitter = 0.25
+request_timeout_seconds = 120.0
+
+# ─── Migration tuning ──────────────────────────────────────────────────────
+
+[migration]
+workers_per_mailbox = 4
+max_parallel_mailboxes = 8
+target_root_folder = "Imported PST"
+skip_empty_folders = true
+fail_fast = false
+large_attachment_threshold_bytes = 3145728   # 3 MiB
+
+# ─── Paths ─────────────────────────────────────────────────────────────────
+
+[paths]
+state_dir = ".pstmigrate-state"
+work_dir = ".pstmigrate-work"
+log_dir = "logs"
+readpst_binary = "readpst"
