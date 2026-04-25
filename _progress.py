@@ -9,9 +9,21 @@ rows from previous broken runs do not pollute the picture.
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 DB = Path(".pstmigrate-state") / "state.sqlite"
+
+
+def fmt_ts(value) -> str:
+    """started_at is stored as REAL (unix epoch). Convert to local time."""
+    if value is None:
+        return "-"
+    try:
+        ts = float(value)
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def main() -> None:
@@ -60,7 +72,7 @@ def main() -> None:
         t = counts["t"] or 0
 
         print(f"{mbx:<14} {r['status']:<11} {d:>8} {f:>8} {s:>6} {p:>8} {t:>8}  "
-              f"{r['started_at']}")
+              f"{fmt_ts(r['started_at'])}")
 
     print()
     # global progress against current run
