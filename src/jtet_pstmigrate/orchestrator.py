@@ -192,11 +192,20 @@ class Orchestrator:
         root: str | None,
     ) -> str:
         pst_str = str(row.pst_path)
+        src = str(msg.file_path)
+        # If THIS exact .eml file is already marked done, don't touch the row
+        # (touching it as 'skipped' would downgrade it and break dedupe on the
+        # next run, causing the message to be re-uploaded as a duplicate).
+        if self._state.is_row_done(row.target_mailbox, pst_str, src):
+            return "skipped"
         if self._state.is_message_done(row.target_mailbox, msg.dedupe_key):
+            # Different file with the same internet message-id (e.g. a copy in
+            # a different folder). Record it as a skipped *new* row so the
+            # audit shows which copies were de-duplicated.
             self._state.upsert_message(
                 mailbox=row.target_mailbox,
                 pst_path=pst_str,
-                source_path=str(msg.file_path),
+                source_path=src,
                 dedupe_key=msg.dedupe_key,
                 status="skipped",
                 bytes_=msg.bytes_,

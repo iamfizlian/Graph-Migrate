@@ -197,6 +197,23 @@ class StateStore:
             ).fetchone()
             return row is not None
 
+    def is_row_done(self, mailbox: str, pst_path: str, source_path: str) -> bool:
+        """Whether the *exact* (mailbox, pst, source) triple is already done.
+
+        Used to avoid downgrading a 'done' row to 'skipped' when a re-run
+        encounters the same .eml file. Without this check, the dedupe hit on
+        the message's own done row caused the upsert to overwrite status to
+        'skipped', which broke idempotency on the next run.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM messages "
+                "WHERE target_mailbox=? AND pst_path=? AND source_path=? AND status='done' "
+                "LIMIT 1",
+                (mailbox, pst_path, source_path),
+            ).fetchone()
+            return row is not None
+
     def upsert_message(
         self,
         *,
