@@ -241,23 +241,39 @@ def iter_messages(extracted_root: Path) -> Iterator[ExtractedMessage]:
                 logger.bind(ctx="pst").warning("Skipping unreadable {}: {}", eml, e)
 
 
+# Read only enough bytes from each .eml to capture standard RFC-822 headers.
+# 99%+ of real-world messages have all relevant headers (Message-ID, Subject,
+# Date, From, To) within the first 16 KB. Reading the full file just to
+# extract these is the dominant cost of iter_messages on large mailboxes
+# (60 GB across 200k files = ~60 GB of pointless disk I/O per startup).
+_HEADER_PEEK_BYTES = 16 * 1024
+
+
 def _build_message(eml: Path, pst_dir: Path) -> ExtractedMessage:
     rel = eml.relative_to(pst_dir).parts[:-1]   # drop the filename
-    raw = eml.read_bytes()
-    parsed = email.message_from_bytes(raw, policy=compat32)
+    file_size = eml.stat().st_size
+
+    # Fast path: read just the header bytes; do NOT slurp the whole .eml.
+    # The full bytes are read at upload time when we actually need them.
+    with eml.open("rb") as f:
+        head = f.read(_HEADER_PEEK_BYTES)
+    parsed = email.message_from_bytes(head, policy=compat32)
     message_id = (parsed.get("Message-ID") or parsed.get("Message-Id") or "").strip("<> \t")
     subject = parsed.get("Subject", "") or ""
     received = parsed.get("Date") or None
 
-    dedupe_key = (
-        f"imid:{message_id.lower()}" if message_id
-        else f"sha256:{hashlib.sha256(raw).hexdigest()}"
-    )
+    if message_id:
+        dedupe_key = f"imid:{message_id.lower()}"
+    else:
+        # Rare fallback: no Message-ID header. We need a stable fingerprint,
+        # so read the whole file to hash it.
+        raw = eml.read_bytes()
+        dedupe_key = f"sha256:{hashlib.sha256(raw).hexdigest()}"
 
     return ExtractedMessage(
         file_path=eml,
         folder_path=tuple(_clean_folder(p) for p in rel),
-        bytes_=len(raw),
+        bytes_=file_size,
         dedupe_key=dedupe_key,
         subject=subject[:500],
         received=received,
