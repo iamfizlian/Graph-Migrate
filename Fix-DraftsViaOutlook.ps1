@@ -121,13 +121,43 @@ $script:olFolderInbox        = 6
 $script:olFolderDrafts       = 16
 $script:olFolderJunk         = 23
 
-# DASL filter we hand to Items.Restrict() so Outlook only iterates draft
-# items in each folder rather than every message.  Equivalent SQL:
-#   PR_MESSAGE_FLAGS & 0x08 != 0  AND  MessageClass LIKE 'IPM.Note%'
-$script:DRAFT_RESTRICT = (
-    '@SQL=' +
-    '(NOT("http://schemas.microsoft.com/mapi/proptag/0x0E070003" & 8 = 0))' +
-    ' AND ("urn:schemas:httpmail:messageclass" LIKE ''IPM.Note%'')'
+# DASL filter we hand to Items.Restrict() so Outlook only iterates items
+# whose UNSENT bit is set rather than every message in the folder.
+#
+# Outlook's DASL parser is strict:
+#   - no SQL LIKE; use CI_PHRASEMATCH / CI_STARTSWITH for substring
+#   - no surrounding parentheses around the top-level NOT
+#   - bitwise AND result is truthy when non-zero (no need for "= 0")
+# So the simplest form that works is just:
+#   @SQL="<proptag>" & 8
+# We do the IPM.Note message-class check in the PowerShell loop as a
+# belt-and-braces guard.
+$script:DRAFT_RESTRICT = '@SQL="http://schemas.microsoft.com/mapi/proptag/0x0E070003" & 8'
+
+# System / hidden folder names we never modify, regardless of whether
+# they have DefaultItemType=0.  Case-insensitive whole-name match.
+# Includes the well-known "real Drafts / Outbox / Junk / Trash" set
+# (covered for delegated mailboxes where GetSharedDefaultFolder may
+# not return a usable EntryID), plus Teams / Yammer / RSS / sync
+# scratchpads that shouldn't have UNSENT messed with.
+$script:SKIP_FOLDER_NAMES = @(
+    'Drafts',
+    'Outbox',
+    'Deleted Items',
+    'Junk Email', 'Junk', 'Junk E-mail',
+    'Recoverable Items',
+    'Yammer Root',
+    'Conversation History',
+    'Conversation Action Settings',
+    'Sync Issues',
+    'Conflicts',
+    'Local Failures',
+    'Server Failures',
+    'RSS Feeds', 'RSS Subscriptions',
+    'Quick Step Settings',
+    'Files',                       # Teams scratch
+    'ExternalContacts',
+    'PersonMetadata'
 )
 
 # ---------------------------------------------------------------------------
@@ -211,17 +241,28 @@ function Get-FolderByPath {
 function Get-MailFoldersRecursive {
     <#
     .SYNOPSIS  Yield every IPF.Note folder under $Root, skipping any
-    folder whose EntryID is in $SkipIds.  Returns folders bottom-up so
-    that callers iterate leaves first; the order doesn't actually matter
-    here, it's just a clean DFS.
+    folder whose EntryID is in $SkipIds or whose name is in
+    $script:SKIP_FOLDER_NAMES.
+
+    When called against a mailbox root (no -Folder filter), pass
+    -IncludeRoot:$false so we don't try to Items.Restrict() the
+    mailbox root itself -- it has no real mail and Outlook's
+    DASL parser can choke on its hidden contents.
     #>
     [OutputType([__ComObject[]])]
     param(
         [Parameter(Mandatory)] $Root,
-        [Parameter(Mandatory)] [System.Collections.Generic.HashSet[string]]$SkipIds
+        [Parameter(Mandatory)] [System.Collections.Generic.HashSet[string]]$SkipIds,
+        [bool]$IncludeRoot = $true
     )
     $out = New-Object 'System.Collections.Generic.List[object]'
-    Walk-FolderInto $Root $SkipIds $out
+    if ($IncludeRoot) {
+        Walk-FolderInto $Root $SkipIds $out
+    } else {
+        foreach ($child in $Root.Folders) {
+            Walk-FolderInto $child $SkipIds $out
+        }
+    }
     return $out.ToArray()
 }
 
@@ -231,6 +272,14 @@ function Walk-FolderInto {
         [System.Collections.Generic.HashSet[string]]$SkipIds,
         [System.Collections.Generic.List[object]]$Out
     )
+    # Whole-subtree skip: any folder whose name matches a system folder
+    # we never want to touch.  We also skip its descendants because
+    # things like "Yammer Root\Inbound" or "Conversation History\Team Chat"
+    # are scratch areas that contain non-IPM.Note items we shouldn't
+    # rewrite.
+    foreach ($skipName in $script:SKIP_FOLDER_NAMES) {
+        if ($Folder.Name -ieq $skipName) { return }
+    }
     if ($SkipIds.Contains($Folder.EntryID)) { return }
 
     # DefaultItemType 0 = olMailItem; folders that hold contacts/calendars
@@ -357,9 +406,12 @@ function Fix-Mailbox {
 
         if ($FolderFilter) {
             $scoped = Get-FolderByPath -Root $root -Path $FolderFilter
-            $candidates = Get-MailFoldersRecursive -Root $scoped -SkipIds $skip
+            $candidates = Get-MailFoldersRecursive -Root $scoped -SkipIds $skip -IncludeRoot $true
         } else {
-            $candidates = Get-MailFoldersRecursive -Root $root -SkipIds $skip
+            # Mailbox root itself is a container, not a mail folder; don't
+            # add it to candidates or Items.Restrict() will trip on hidden
+            # store-level items.
+            $candidates = Get-MailFoldersRecursive -Root $root -SkipIds $skip -IncludeRoot $false
         }
 
         Write-Host ("[{0}] {1} mail folder(s) to scan{2}" -f
