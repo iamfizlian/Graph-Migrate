@@ -540,6 +540,22 @@ function Fix-Mailbox {
             return [pscustomobject]$stats
         }
 
+        # Verify what the recipient actually resolved to.  If FullAccess
+        # is missing and the address falls back to the local user, we'd
+        # be about to walk the WRONG mailbox -- log enough info to spot
+        # that.
+        $resolvedSmtp = $null
+        try {
+            $exu = $rcpt.AddressEntry.GetExchangeUser()
+            if ($exu) { $resolvedSmtp = $exu.PrimarySmtpAddress }
+        } catch { }
+        if ($resolvedSmtp) {
+            Write-Host ("[{0}] recipient resolved to {1}" -f $Upn, $resolvedSmtp) -ForegroundColor DarkGray
+            if ($resolvedSmtp -inotlike $Upn) {
+                Write-Warning ("[{0}] resolved SMTP {1} != requested UPN -- check FullAccess permissions." -f $Upn, $resolvedSmtp)
+            }
+        }
+
         # Fetch Inbox with retries + force MAPI to bind it.  Cold-launched
         # Outlook can otherwise hand back an unbound Inbox proxy whose
         # Items / Store / Parent all read as $null.
@@ -547,6 +563,17 @@ function Fix-Mailbox {
         if (-not $inbox) {
             $stats.Status = "ERROR: GetSharedDefaultFolder returned null for $Upn (FullAccess granted with -AutoMapping `$false?  Or is Outlook still starting?)"
             return [pscustomobject]$stats
+        }
+
+        # Diagnostic: confirm we're looking at the right mailbox's Inbox.
+        try {
+            $inboxItems = $inbox.Items.Count
+            $inboxStore = $null
+            try { $inboxStore = $inbox.Store.DisplayName } catch { }
+            Write-Host ("[{0}] Inbox bound: name='{1}', items={2}, store='{3}'" -f
+                $Upn, $inbox.Name, $inboxItems, ($inboxStore -as [string])) -ForegroundColor DarkGray
+        } catch {
+            Write-Verbose ("Could not read Inbox diagnostics: {0}" -f $_.Exception.Message)
         }
 
         # Resolve the mailbox root.  Three paths, tried in order; each is
@@ -609,14 +636,16 @@ function Fix-Mailbox {
             $(if ($IsDryRun) { ' (DRY RUN)' } else { '' })) -ForegroundColor Cyan
 
         foreach ($folder in $candidates) {
+            $display = Get-FolderDisplayPath $folder
+            $itemCount = -1
+            try { $itemCount = $folder.Items.Count } catch { }
+            Write-Host ("  scanning '{0}' ({1} item(s))..." -f $display, $itemCount) -ForegroundColor DarkGray
             $r = Fix-FolderItems -Folder $folder -IsDryRun $IsDryRun
-            if ($r.Found -gt 0) {
-                $msg = "  '{0}': {1} draft(s)" -f (Get-FolderDisplayPath $folder), $r.Found
-                if (-not $IsDryRun) {
-                    $msg += " -> fixed {0}, failed {1}" -f $r.Fixed, $r.Failed
-                }
-                Write-Host $msg
+            $msg = "  '{0}': {1} draft(s)" -f $display, $r.Found
+            if (-not $IsDryRun -and $r.Found -gt 0) {
+                $msg += " -> fixed {0}, failed {1}" -f $r.Fixed, $r.Failed
             }
+            Write-Host $msg
             $stats.Folders += 1
             $stats.Drafts  += $r.Found
             $stats.Fixed   += $r.Fixed
