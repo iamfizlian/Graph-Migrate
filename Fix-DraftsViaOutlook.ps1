@@ -32,7 +32,15 @@
 .PREREQUISITES
     1. Windows machine with Outlook desktop installed (2016 / 2019 /
        365 / LTSC).
-    2. Outlook signed in to a profile.  The account on that profile
+    2. **Open Outlook BEFORE running this script** and let it finish
+       syncing.  The script can cold-launch Outlook for you, but
+       Windows then shows a "Programmatic access" / "Allow access"
+       trust dialog, and the delegated mailboxes are still being
+       attached in the background while we try to enumerate folders.
+       Both can lead to "Inbox.Parent was null" errors.  Easiest is
+       to start Outlook, click through any prompts, wait for the send/
+       receive indicator to settle, and only then run this script.
+    3. Outlook signed in to a profile.  The account on that profile
        must have FullAccess on every target mailbox, granted with
        -AutoMapping $false so the mailboxes are NOT auto-attached:
 
@@ -436,7 +444,7 @@ function Fix-Mailbox {
         # GetSharedDefaultFolder call can return $null while MAPI
         # is still attaching the delegated mailbox.
         $inbox = $null
-        for ($attempt = 1; $attempt -le 4; $attempt++) {
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
             try {
                 $inbox = $Namespace.GetSharedDefaultFolder($rcpt, $script:olFolderInbox)
             } catch {
@@ -450,9 +458,30 @@ function Fix-Mailbox {
             return [pscustomobject]$stats
         }
 
-        $root = $inbox.Parent
+        # Resolve the mailbox root.  Two paths:
+        #   1. Inbox.Store.GetRootFolder()  -- works as soon as the store
+        #      object is bound, even if the folder hierarchy isn't fully
+        #      populated yet, and is the cleanest way to get the root.
+        #   2. Inbox.Parent  -- fallback for store providers that don't
+        #      expose GetRootFolder.  Can transiently be $null while a
+        #      cold-launched Outlook attaches the delegated mailbox, so
+        #      we retry it.
+        $root = $null
+        try {
+            $store = $inbox.Store
+            if ($store) { $root = $store.GetRootFolder() }
+        } catch {
+            Write-Verbose "Store.GetRootFolder() threw: $($_.Exception.Message)"
+        }
         if (-not $root) {
-            $stats.Status = "ERROR: Inbox.Parent was null for $Upn (mailbox store not fully loaded)"
+            for ($attempt = 1; $attempt -le 6; $attempt++) {
+                try { $root = $inbox.Parent } catch { }
+                if ($root) { break }
+                Start-Sleep -Seconds 2
+            }
+        }
+        if (-not $root) {
+            $stats.Status = "ERROR: could not resolve mailbox root for $Upn (Store.GetRootFolder() and Inbox.Parent both returned null -- is Outlook fully started and signed in?)"
             return [pscustomobject]$stats
         }
         $skip = Get-SkipFolderIds -Namespace $Namespace -Recipient $rcpt
@@ -528,11 +557,18 @@ function Main {
     }
 
     if ($launch.FreshLaunch) {
-        # Cold-launched Outlook hasn't necessarily attached the delegated
-        # mailboxes yet; wait until the default store is online before
-        # we start asking for shared folders.
-        if (-not (Wait-NamespaceReady -Namespace $ns -TimeoutSeconds 30)) {
-            Write-Warning "Outlook namespace did not become ready within 30s; proceeding anyway."
+        Write-Warning ""
+        Write-Warning "Outlook was not running; the script started it for you."
+        Write-Warning "If a 'Programmatic access' or 'Allow access' dialog appeared,"
+        Write-Warning "click Allow / Yes -- the script is paused waiting for MAPI."
+        Write-Warning ""
+        Write-Warning "For best results, open Outlook BEFORE running this script,"
+        Write-Warning "let it finish syncing, then re-run. Cold-launch can leave"
+        Write-Warning "delegated mailboxes only partially attached."
+        Write-Warning ""
+        # Wait for the namespace + give the user time to dismiss the trust prompt.
+        if (-not (Wait-NamespaceReady -Namespace $ns -TimeoutSeconds 60)) {
+            Write-Warning "Outlook namespace did not become ready within 60s; proceeding anyway."
         }
     }
 
