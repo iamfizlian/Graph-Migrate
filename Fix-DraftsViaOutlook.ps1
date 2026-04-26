@@ -129,18 +129,14 @@ $script:olFolderInbox        = 6
 $script:olFolderDrafts       = 16
 $script:olFolderJunk         = 23
 
-# DASL filter we hand to Items.Restrict() so Outlook only iterates items
-# whose UNSENT bit is set rather than every message in the folder.
-#
-# Outlook's DASL parser is strict:
-#   - no SQL LIKE; use CI_PHRASEMATCH / CI_STARTSWITH for substring
-#   - no surrounding parentheses around the top-level NOT
-#   - bitwise AND result is truthy when non-zero (no need for "= 0")
-# So the simplest form that works is just:
-#   @SQL="<proptag>" & 8
-# We do the IPM.Note message-class check in the PowerShell loop as a
-# belt-and-braces guard.
-$script:DRAFT_RESTRICT = '@SQL="http://schemas.microsoft.com/mapi/proptag/0x0E070003" & 8'
+# NOTE on filtering: we used to drive Items.Restrict() with a DASL
+# filter "@SQL=<proptag>0x0E070003 & 8" to make Outlook return only
+# the UNSENT-bit-set messages in each folder, but some Outlook desktop
+# builds reject @SQL bitwise expressions on extended-property URIs
+# ("Cannot parse condition" / "Error at @SQL=..." in Items.Restrict).
+# Iterating Items in PowerShell and reading PR_MESSAGE_FLAGS via the
+# PropertyAccessor is slower but works on every Outlook build we've
+# tested on Exchange Online.
 
 # System / hidden folder names we never modify, regardless of whether
 # they have DefaultItemType=0.  Case-insensitive whole-name match.
@@ -151,8 +147,8 @@ $script:DRAFT_RESTRICT = '@SQL="http://schemas.microsoft.com/mapi/proptag/0x0E07
 $script:SKIP_FOLDER_NAMES = @(
     'Drafts',
     'Outbox',
-    'Deleted Items',
-    'Junk Email', 'Junk', 'Junk E-mail',
+    'Deleted Items', 'Trash',
+    'Junk Email', 'Junk Mail', 'Junk', 'Junk E-mail',
     'Recoverable Items',
     'Yammer Root',
     'Conversation History',
@@ -359,10 +355,31 @@ function Walk-FolderInto {
 # Per-folder fix
 # ---------------------------------------------------------------------------
 
+function Get-FolderDisplayPath {
+    <#
+    .SYNOPSIS  Return a human-readable folder path.  When the parent
+    chain isn't fully bound yet, FolderPath comes back as raw EntryID
+    hex; in that case we just use the folder's Name.
+    #>
+    param($Folder)
+    try {
+        $p = $Folder.FolderPath
+        if ($p -and $p -notmatch '[0-9A-Fa-f]{30,}') {
+            return $p
+        }
+    } catch { }
+    try { return $Folder.Name } catch { return '<unnamed>' }
+}
+
 function Fix-FolderItems {
     <#
-    .SYNOPSIS  Clear MSGFLAG_UNSENT on every IPM.Note item in $Folder.
-    Returns a hashtable with Found/Fixed/Failed counts.
+    .SYNOPSIS  Clear MSGFLAG_UNSENT on every IPM.Note item in $Folder
+    whose UNSENT bit is currently set.  Returns Found/Fixed/Failed.
+
+    We iterate Items directly rather than using Items.Restrict() with a
+    DASL filter -- some Outlook desktop builds reject @SQL bitwise
+    expressions on extended-property URIs ('Cannot parse condition').
+    Iterating + filtering in PowerShell is slower but works everywhere.
     #>
     [OutputType([hashtable])]
     param(
@@ -372,26 +389,32 @@ function Fix-FolderItems {
     $found  = 0
     $fixed  = 0
     $failed = 0
+    $display = Get-FolderDisplayPath $Folder
 
+    # Snapshot EntryIDs of draft-flagged items first.  We don't touch
+    # PropertyAccessor in this pass so the Items collection is stable.
+    $entryIds = New-Object 'System.Collections.Generic.List[string]'
+    $itemCount = 0
     try {
-        $drafts = $Folder.Items.Restrict($script:DRAFT_RESTRICT)
+        $itemCount = $Folder.Items.Count
     } catch {
-        Write-Warning "  $($Folder.FolderPath): Items.Restrict failed -- $($_.Exception.Message)"
+        Write-Warning "  ${display}: Items.Count failed -- $($_.Exception.Message)"
         return @{ Found = 0; Fixed = 0; Failed = 0 }
     }
-
-    # Iterate by index to avoid the "collection modified during enumeration"
-    # behaviour you can hit when SetProperty causes Outlook to re-evaluate
-    # the restriction mid-loop.  We walk a snapshot of EntryIDs first and
-    # then re-fetch each item from $Folder by EntryID before mutating it.
-    $entryIds = New-Object 'System.Collections.Generic.List[string]'
-    $count = $drafts.Count
-    for ($i = 1; $i -le $count; $i++) {
+    for ($i = 1; $i -le $itemCount; $i++) {
         try {
-            $itm = $drafts.Item($i)
-            if ($itm -and $itm.EntryID) { $entryIds.Add($itm.EntryID) }
+            $itm = $Folder.Items.Item($i)
+            if (-not $itm) { continue }
+            $cls = $null
+            try { $cls = $itm.MessageClass } catch { }
+            if (-not $cls -or -not $cls.StartsWith('IPM.Note')) { continue }
+            $flags = 0
+            try { $flags = [int]$itm.PropertyAccessor.GetProperty($script:PR_MESSAGE_FLAGS_TAG) } catch { continue }
+            if (($flags -band $script:MSGFLAG_UNSENT) -ne 0) {
+                if ($itm.EntryID) { $entryIds.Add($itm.EntryID) }
+            }
         } catch {
-            # Item couldn't be loaded (corrupted, in flight, etc.) -- skip.
+            # Item couldn't be loaded -- skip.
         }
     }
     $found = $entryIds.Count
@@ -404,13 +427,21 @@ function Fix-FolderItems {
         return @{ Found = $found; Fixed = 0; Failed = 0 }
     }
 
-    $store = $Folder.Store
+    # Re-fetch each item by EntryID via the store and clear the bit.
+    $store = $null
+    try { $store = $Folder.Store } catch { }
     foreach ($eid in $entryIds) {
         try {
-            $itm = $store.GetItemFromID($eid)
+            $itm = $null
+            if ($store) {
+                try { $itm = $store.GetItemFromID($eid) } catch { }
+            }
+            if (-not $itm) {
+                # Fallback: ask the namespace directly.
+                try { $itm = $Folder.Application.Session.GetItemFromID($eid) } catch { }
+            }
             if (-not $itm) { $failed++; continue }
             if ($itm.MessageClass -and -not $itm.MessageClass.StartsWith('IPM.Note')) {
-                # Restriction should already exclude these, but belt-and-braces.
                 continue
             }
             $pa = $itm.PropertyAccessor
@@ -430,6 +461,53 @@ function Fix-FolderItems {
     }
 
     return @{ Found = $found; Fixed = $fixed; Failed = $failed }
+}
+
+# ---------------------------------------------------------------------------
+# MAPI binding helpers
+# ---------------------------------------------------------------------------
+
+function Force-FolderBind {
+    <#
+    .SYNOPSIS  Force MAPI to actually bind a Folder COM proxy by reading
+    a property that requires server-side resolution.  Returns $true on
+    success.  Cold-launched Outlook can hand back unbound proxies whose
+    Items/Store/Parent all read $null; this routine drives a few
+    retries with backoff to give MAPI time to attach.
+    #>
+    param($Folder, [int]$MaxAttempts = 6)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $null = $Folder.Items.Count
+            return $true
+        } catch {
+            Write-Verbose ("Force-FolderBind attempt {0}: {1}" -f $attempt, $_.Exception.Message)
+            Start-Sleep -Seconds 2
+        }
+    }
+    return $false
+}
+
+function Get-WellKnownFolderBound {
+    <#
+    .SYNOPSIS  GetSharedDefaultFolder() with retries + a Force-FolderBind
+    once we have a proxy back, so the caller gets a folder that actually
+    responds to .Items / .Folders.  Returns $null on persistent failure.
+    #>
+    param($Namespace, $Recipient, [int]$FolderType, [int]$MaxAttempts = 6)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $f = $null
+        try {
+            $f = $Namespace.GetSharedDefaultFolder($Recipient, $FolderType)
+        } catch {
+            Write-Verbose ("GetSharedDefaultFolder({0}) attempt {1}: {2}" -f $FolderType, $attempt, $_.Exception.Message)
+        }
+        if ($f) {
+            if (Force-FolderBind $f -MaxAttempts 3) { return $f }
+        }
+        Start-Sleep -Seconds 2
+    }
+    return $null
 }
 
 # ---------------------------------------------------------------------------
@@ -462,36 +540,13 @@ function Fix-Mailbox {
             return [pscustomobject]$stats
         }
 
-        # Retry a few times on cold-launched Outlook -- the first
-        # GetSharedDefaultFolder call can return $null while MAPI
-        # is still attaching the delegated mailbox.
-        $inbox = $null
-        for ($attempt = 1; $attempt -le 6; $attempt++) {
-            try {
-                $inbox = $Namespace.GetSharedDefaultFolder($rcpt, $script:olFolderInbox)
-            } catch {
-                Write-Verbose ("GetSharedDefaultFolder attempt {0} threw: {1}" -f $attempt, $_.Exception.Message)
-            }
-            if ($inbox) { break }
-            Start-Sleep -Seconds 2
-        }
+        # Fetch Inbox with retries + force MAPI to bind it.  Cold-launched
+        # Outlook can otherwise hand back an unbound Inbox proxy whose
+        # Items / Store / Parent all read as $null.
+        $inbox = Get-WellKnownFolderBound -Namespace $Namespace -Recipient $rcpt -FolderType $script:olFolderInbox
         if (-not $inbox) {
             $stats.Status = "ERROR: GetSharedDefaultFolder returned null for $Upn (FullAccess granted with -AutoMapping `$false?  Or is Outlook still starting?)"
             return [pscustomobject]$stats
-        }
-
-        # Force MAPI to actually bind the Inbox object.  Cold-launched
-        # Outlook can return an unbound Inbox proxy whose Items / Store /
-        # Parent all read as $null until something forces resolution.
-        # Reading Items.Count is enough to make MAPI fault the data in.
-        for ($attempt = 1; $attempt -le 6; $attempt++) {
-            try {
-                $null = $inbox.Items.Count
-                break
-            } catch {
-                Write-Verbose ("Inbox bind attempt {0} threw: {1}" -f $attempt, $_.Exception.Message)
-                Start-Sleep -Seconds 2
-            }
         }
 
         # Resolve the mailbox root.  Three paths, tried in order; each is
@@ -543,12 +598,8 @@ function Fix-Mailbox {
             Write-Warning ("[{0}] To cover other top-level folders, restart Outlook in this same login session and re-run." -f $Upn)
             $candidates = New-Object 'System.Collections.Generic.List[object]'
             foreach ($wellKnown in @($script:olFolderInbox, $script:olFolderSentMail)) {
-                try {
-                    $f = $Namespace.GetSharedDefaultFolder($rcpt, $wellKnown)
-                    if ($f) { Walk-FolderInto $f $skip $candidates }
-                } catch {
-                    Write-Verbose ("GetSharedDefaultFolder({0}) threw: {1}" -f $wellKnown, $_.Exception.Message)
-                }
+                $f = Get-WellKnownFolderBound -Namespace $Namespace -Recipient $rcpt -FolderType $wellKnown
+                if ($f) { Walk-FolderInto $f $skip $candidates }
             }
             $candidates = $candidates.ToArray()
         }
@@ -560,7 +611,7 @@ function Fix-Mailbox {
         foreach ($folder in $candidates) {
             $r = Fix-FolderItems -Folder $folder -IsDryRun $IsDryRun
             if ($r.Found -gt 0) {
-                $msg = "  '{0}': {1} draft(s)" -f $folder.FolderPath, $r.Found
+                $msg = "  '{0}': {1} draft(s)" -f (Get-FolderDisplayPath $folder), $r.Found
                 if (-not $IsDryRun) {
                     $msg += " -> fixed {0}, failed {1}" -f $r.Fixed, $r.Failed
                 }
