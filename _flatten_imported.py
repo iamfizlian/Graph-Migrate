@@ -110,14 +110,50 @@ def move_folder(graph: GraphClient, mailbox: str, folder_id: str, dest_parent_id
     graph.post(path, json={"destinationId": dest_parent_id}, expect_status=(200, 201))
 
 
-def delete_folder(graph: GraphClient, mailbox: str, folder_id: str) -> None:
+def get_folder(graph: GraphClient, mailbox: str, folder_id: str) -> dict:
+    """Fetch a single folder by id with the fields we care about."""
+    path = (
+        f"/users/{quote(mailbox)}/mailFolders/{folder_id}"
+        f"?$select=id,displayName,childFolderCount,totalItemCount"
+    )
+    resp = graph.get(path, expect_status=(200,))
+    return resp.json()
+
+
+def delete_folder_if_empty(graph: GraphClient, mailbox: str, folder_id: str) -> bool:
+    """Refetch the folder and only DELETE if it's truly empty.
+
+    Why this exists: per Microsoft's docs, DELETE on a non-empty mailFolder
+    succeeds and sends contents to Deleted Items. That's recoverable but not
+    desirable - if we ever reach a delete step with a folder that still has
+    content (orphan messages, a partially-failed merge, etc.), we'd rather
+    leave it in place and let the user see the leftover than soft-delete it.
+
+    Returns True if the folder was deleted, False if it was preserved.
+    """
+    log = logger.bind(ctx=f"flatten[{mailbox}]")
+    try:
+        fresh = get_folder(graph, mailbox, folder_id)
+    except GraphError as e:
+        log.warning("Could not refetch folder {} pre-delete ({}); skipping delete.", folder_id, e.status)
+        return False
+
+    items = int(fresh.get("totalItemCount") or 0)
+    subs = int(fresh.get("childFolderCount") or 0)
+    if items > 0 or subs > 0:
+        log.warning(
+            "Refusing to delete {!r}: still has {} items, {} subfolders. Re-run to clean up.",
+            fresh.get("displayName"), items, subs,
+        )
+        return False
+
     path = f"/users/{quote(mailbox)}/mailFolders/{folder_id}"
     try:
         graph.delete(path, expect_status=(204,))
+        return True
     except GraphError as e:
-        logger.bind(ctx=f"flatten[{mailbox}]").warning(
-            "Could not delete folder {} ({}). Likely not empty; leaving it.", folder_id, e.status
-        )
+        log.warning("Could not delete folder {} ({}); leaving it.", folder_id, e.status)
+        return False
 
 
 def find_imported_root(graph: GraphClient, mailbox: str) -> dict | None:
@@ -262,7 +298,7 @@ def execute_merge(
         existing = find_child_named(graph, mailbox, dst_id, sub["displayName"])
         if existing:
             sm, ss = execute_merge(graph, mailbox, sub["id"], existing["id"], log=log, depth=depth + 1)
-            delete_folder(graph, mailbox, sub["id"])
+            delete_folder_if_empty(graph, mailbox, sub["id"])
             moved += sm
             subs += ss + 1
         else:
@@ -384,7 +420,7 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
             dst = action["dst"]
             log.info("merge {!r} -> {!r}", src["displayName"], dst.get("displayName"))
             m, s = execute_merge(graph, mailbox, src["id"], dst["id"], log=log, depth=2)
-            delete_folder(graph, mailbox, src["id"])
+            delete_folder_if_empty(graph, mailbox, src["id"])
             total_msgs += m
             total_subs += s + 1
         else:
@@ -392,10 +428,11 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
             move_folder(graph, mailbox, src["id"], "msgFolderRoot")
             total_subs += 1
 
-    # Only delete Imported PST if we managed to clear it. If we couldn't
-    # resolve Inbox to drain root-level messages, it'll still have items
-    # and the delete will fail safely (delete_folder logs and continues).
-    delete_folder(graph, mailbox, imported["id"])
+    # Only delete Imported PST if every prior step actually cleared it.
+    # delete_folder_if_empty refuses to delete a folder that still has
+    # contents (items or subfolders), so leftover data stays visible to
+    # the user under 'Imported PST' rather than getting soft-deleted.
+    delete_folder_if_empty(graph, mailbox, imported["id"])
 
     stats["messages_moved"] = total_msgs
     stats["folders_processed"] = total_subs
