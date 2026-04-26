@@ -270,18 +270,26 @@ def plan_merge(
 def execute_merge(
     graph: GraphClient,
     mailbox: str,
-    src_id: str,
+    src: dict,
     dst_id: str,
     *,
+    src_path: str,
     log,
     depth: int,
 ) -> tuple[int, int]:
     """Actually move messages + subfolders from src into dst, recursively.
 
     Pre: dst exists. Post: src is empty (caller deletes it).
-    Returns (messages_moved, subfolders_processed).
+    `src_path` is the human-readable source path (e.g. 'Imported PST/Inbox')
+    used only for progress logging so the user can see which merge each
+    progress tick belongs to.
+
+    Returns (messages_moved_individually, subfolders_processed). Subfolders
+    that get folder-moved wholesale count in `subfolders_processed` but NOT
+    in `messages_moved_individually`, since those are one Graph call apiece.
     """
     indent = "  " * depth
+    src_id = src["id"]
     moved = 0
     while True:
         msgs = list_message_page(graph, mailbox, src_id)
@@ -291,13 +299,17 @@ def execute_merge(
             move_message(graph, mailbox, m["id"], dst_id)
             moved += 1
             if moved % 200 == 0:
-                log.info("{}... moved {} messages so far", indent, moved)
+                log.info("{}{!r}: moved {} messages so far", indent, src_path, moved)
 
     subs = 0
     for sub in list_child_folders(graph, mailbox, src_id):
         existing = find_child_named(graph, mailbox, dst_id, sub["displayName"])
         if existing:
-            sm, ss = execute_merge(graph, mailbox, sub["id"], existing["id"], log=log, depth=depth + 1)
+            sub_path = f"{src_path}/{sub['displayName']}"
+            sm, ss = execute_merge(
+                graph, mailbox, sub, existing["id"],
+                src_path=sub_path, log=log, depth=depth + 1,
+            )
             delete_folder_if_empty(graph, mailbox, sub["id"])
             moved += sm
             subs += ss + 1
@@ -387,7 +399,7 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
             plan_folders += 1
 
     log.info(
-        "Plan total: ~{} messages affected, {} folder operations.",
+        "Plan total: ~{} messages affected (item-by-item + folder-move subtrees), {} folder operations.",
         plan_msgs, plan_folders,
     )
 
@@ -397,11 +409,12 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
 
     # Execute
     log.info("Executing plan...")
-    total_msgs = 0
-    total_subs = 0
+    item_moves = 0  # messages moved one at a time (counted exactly)
+    folder_moves = 0  # whole-folder moves (each one Graph call, many messages relocated)
+    merges_done = 0  # number of folder merges completed (parents of item-moves)
 
     if root_direct_items > 0 and inbox_for_loose is not None:
-        log.info("moving {} direct items from '{}' -> Inbox", root_direct_items, ROOT_FOLDER_NAME)
+        log.info("moving {} direct items from {!r} -> Inbox", root_direct_items, ROOT_FOLDER_NAME)
         moved_loose = 0
         while True:
             msgs = list_message_page(graph, mailbox, imported["id"])
@@ -411,22 +424,31 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
                 move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
                 moved_loose += 1
                 if moved_loose % 200 == 0:
-                    log.info("  ... moved {} loose messages so far", moved_loose)
-        total_msgs += moved_loose
+                    log.info("  '{}' (loose root items): moved {} so far", ROOT_FOLDER_NAME, moved_loose)
+        item_moves += moved_loose
 
     for action in actions:
         src = action["src"]
         if action["kind"] == "merge":
             dst = action["dst"]
-            log.info("merge {!r} -> {!r}", src["displayName"], dst.get("displayName"))
-            m, s = execute_merge(graph, mailbox, src["id"], dst["id"], log=log, depth=2)
+            src_path = f"{ROOT_FOLDER_NAME}/{src['displayName']}"
+            dst_name = dst.get("displayName", "?")
+            log.info("merge {!r} -> {!r}", src_path, dst_name)
+            m, s = execute_merge(
+                graph, mailbox, src, dst["id"],
+                src_path=src_path, log=log, depth=2,
+            )
             delete_folder_if_empty(graph, mailbox, src["id"])
-            total_msgs += m
-            total_subs += s + 1
+            item_moves += m
+            # `s` counts every subfolder the merge touched, including ones that
+            # were folder-moved (single API calls). Track the folder-move count
+            # separately so the summary can show both.
+            folder_moves += s  # subfolder ops (mostly folder-moves)
+            merges_done += 1
         else:
             log.info("move {!r} -> mailbox root", src["displayName"])
             move_folder(graph, mailbox, src["id"], "msgFolderRoot")
-            total_subs += 1
+            folder_moves += 1
 
     # Only delete Imported PST if every prior step actually cleared it.
     # delete_folder_if_empty refuses to delete a folder that still has
@@ -434,9 +456,13 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
     # the user under 'Imported PST' rather than getting soft-deleted.
     delete_folder_if_empty(graph, mailbox, imported["id"])
 
-    stats["messages_moved"] = total_msgs
-    stats["folders_processed"] = total_subs
-    log.info("Done. Moved {} messages across {} folders.", total_msgs, total_subs)
+    stats["messages_moved"] = item_moves
+    stats["folders_processed"] = folder_moves + merges_done
+    log.info(
+        "Done. {} messages moved individually, {} top-level merges, {} folder-move ops "
+        "(each carrying an entire subtree). Plan estimated ~{} total messages affected.",
+        item_moves, merges_done, folder_moves, plan_msgs,
+    )
     return stats
 
 
