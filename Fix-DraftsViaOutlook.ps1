@@ -134,8 +134,9 @@ param(
 
 # MAPI property tag, expressed as the PropertyAccessor schema URI Outlook
 # wants. 0x0E07 is PR_MESSAGE_FLAGS; 0003 is the PT_LONG type code.
-$script:PR_MESSAGE_FLAGS_TAG = "http://schemas.microsoft.com/mapi/proptag/0x0E070003"
-$script:MSGFLAG_UNSENT       = 0x08
+$script:PR_MESSAGE_FLAGS_TAG       = "http://schemas.microsoft.com/mapi/proptag/0x0E070003"
+$script:PR_INTERNET_MESSAGE_ID_TAG = "http://schemas.microsoft.com/mapi/proptag/0x1035001E"
+$script:MSGFLAG_UNSENT             = 0x08
 
 # OlDefaultFolders constants (we don't load the interop assembly so we use
 # integer literals -- these values are stable across all Outlook versions).
@@ -744,20 +745,29 @@ function Fix-FolderItems {
     $failed = 0
     $display = Get-FolderDisplayPath $Folder
 
-    # Snapshot EntryIDs of draft-flagged items first.  We use
-    # GetFirst()/GetNext() rather than indexed Item() access -- per
-    # Outlook docs the cursor pattern is much faster for sequential
+    # Single pass over the folder to:
+    #   1. Snapshot EntryIDs of draft-flagged items (the work list).
+    #   2. Build a clean-twin index { lower(IMID) -> EntryID } for items
+    #      that already have UNSENT clear -- these are likely
+    #      already-clean ghost copies left by previous failed-verify
+    #      runs, and we want to short-circuit the copy-and-replace path
+    #      by deleting the dirty original instead of creating yet
+    #      another duplicate.
+    #
+    # We use GetFirst()/GetNext() rather than indexed Item() access --
+    # per Outlook docs the cursor pattern is much faster for sequential
     # iteration because it avoids re-resolving the index each call.
-    $entryIds = New-Object 'System.Collections.Generic.List[string]'
+    $entryIds     = New-Object 'System.Collections.Generic.List[string]'
+    $cleanTwinMap = @{}
     $itemCount = 0
     try {
         $itemCount = $Folder.Items.Count
     } catch {
         Write-Warning "  ${display}: Items.Count failed -- $($_.Exception.Message)"
-        return @{ Found = 0; Fixed = 0; Failed = 0; SilentNoop = 0 }
+        return @{ Found = 0; Fixed = 0; Failed = 0; SilentNoop = 0; ResolvedByTwin = 0 }
     }
     if ($itemCount -eq 0) {
-        return @{ Found = 0; Fixed = 0; Failed = 0; SilentNoop = 0 }
+        return @{ Found = 0; Fixed = 0; Failed = 0; SilentNoop = 0; ResolvedByTwin = 0 }
     }
     $items = $Folder.Items
     $scanProgressEvery = 100
@@ -773,24 +783,37 @@ function Fix-FolderItems {
                 try { $flags = [int]$itm.PropertyAccessor.GetProperty($script:PR_MESSAGE_FLAGS_TAG) } catch { }
                 if (($flags -band $script:MSGFLAG_UNSENT) -ne 0) {
                     if ($itm.EntryID) { $entryIds.Add($itm.EntryID) }
+                } else {
+                    # Already-clean candidate.  Index it by IMID so a
+                    # dirty draft with the same IMID can defer to it
+                    # instead of creating a third instance.
+                    $imid = $null
+                    try { $imid = [string]$itm.PropertyAccessor.GetProperty($script:PR_INTERNET_MESSAGE_ID_TAG) } catch { }
+                    if ($imid) {
+                        $key = $imid.ToLowerInvariant()
+                        if (-not $cleanTwinMap.ContainsKey($key)) {
+                            $cleanTwinMap[$key] = $itm.EntryID
+                        }
+                    }
                 }
             }
         } catch {
             # Item couldn't be loaded -- skip.
         }
         if (($scanned % $scanProgressEvery) -eq 0) {
-            Write-Host ("    scanned {0}/{1} ({2} drafts so far)" -f $scanned, $itemCount, $entryIds.Count) -ForegroundColor DarkGray
+            Write-Host ("    scanned {0}/{1} ({2} drafts so far, {3} clean twin(s) indexed)" `
+                -f $scanned, $itemCount, $entryIds.Count, $cleanTwinMap.Count) -ForegroundColor DarkGray
         }
         try { $itm = $items.GetNext() } catch { $itm = $null }
     }
     $found = $entryIds.Count
 
     if ($found -eq 0) {
-        return @{ Found = 0; Fixed = 0; Failed = 0; SilentNoop = 0 }
+        return @{ Found = 0; Fixed = 0; Failed = 0; SilentNoop = 0; ResolvedByTwin = 0 }
     }
 
     if ($IsDryRun) {
-        return @{ Found = $found; Fixed = 0; Failed = 0; SilentNoop = 0 }
+        return @{ Found = $found; Fixed = 0; Failed = 0; SilentNoop = 0; ResolvedByTwin = 0 }
     }
 
     # Re-fetch each item by EntryID and clear the bit.  Two write paths:
@@ -818,6 +841,7 @@ function Fix-FolderItems {
     $fixProgressEvery = 50
     $fixedSoFar = 0
     $silentNoop = 0
+    $resolvedByTwin = 0
     $cap = $script:MaxItemsCap
     foreach ($eid in $entryIds) {
         if ($cap -gt 0 -and $fixedSoFar -ge $cap) {
@@ -845,6 +869,28 @@ function Fix-FolderItems {
                 continue
             }
 
+            # Twin-resolution: if we already saw a clean message in this
+            # folder with the same InternetMessageId, the dirty draft is
+            # a duplicate from a previous run's botched verify.  Just
+            # delete it -- no need to create a third copy.
+            $srcImid = $null
+            try { $srcImid = [string]$pa.GetProperty($script:PR_INTERNET_MESSAGE_ID_TAG) } catch { }
+            if ($srcImid -and $cleanTwinMap.ContainsKey($srcImid.ToLowerInvariant())) {
+                try {
+                    $itm.Delete()
+                    $fixed++
+                    $resolvedByTwin++
+                } catch {
+                    $failed++
+                    Write-Verbose "  twin-delete failed for ${eid}: $($_.Exception.Message)"
+                }
+                if (($fixedSoFar % $fixProgressEvery) -eq 0) {
+                    Write-Host ("    processed {0}/{1} (verified-fixed {2}, twin-resolved {3}, silent-noop {4}, errored {5})" `
+                        -f $fixedSoFar, $found, $fixed, $resolvedByTwin, $silentNoop, $failed) -ForegroundColor DarkGray
+                }
+                continue
+            }
+
             if ($useRdo) {
                 # Extended-MAPI copy-and-replace path via Redemption.
                 # Creates a new message with UNSENT clear, deletes the
@@ -858,7 +904,16 @@ function Fix-FolderItems {
                     -StoreId    $storeId `
                     -NewEntryId ([ref]$newEid)
                 switch ($outcome) {
-                    'fixed'  { $fixed++ }
+                    'fixed'  {
+                        $fixed++
+                        # Register the new copy as a twin so subsequent
+                        # siblings in the same run pick it up via the
+                        # cheap delete path instead of a second
+                        # copy-and-replace.
+                        if ($srcImid -and $newEid) {
+                            $cleanTwinMap[$srcImid.ToLowerInvariant()] = $newEid
+                        }
+                    }
                     'noop'   { $silentNoop++ }
                     default  { $failed++ }
                 }
@@ -892,18 +947,25 @@ function Fix-FolderItems {
             Write-Verbose "  item $eid failed: $($_.Exception.Message)"
         }
         if (($fixedSoFar % $fixProgressEvery) -eq 0) {
-            Write-Host ("    processed {0}/{1} (verified-fixed {2}, silent-noop {3}, errored {4})" `
-                -f $fixedSoFar, $found, $fixed, $silentNoop, $failed) -ForegroundColor DarkGray
+            Write-Host ("    processed {0}/{1} (verified-fixed {2}, twin-resolved {3}, silent-noop {4}, errored {5})" `
+                -f $fixedSoFar, $found, $fixed, $resolvedByTwin, $silentNoop, $failed) -ForegroundColor DarkGray
         }
+    }
+
+    if ($resolvedByTwin -gt 0) {
+        Write-Host ("    twin-resolved {0}/{1} item(s) by deleting dirty originals against pre-existing clean copies." `
+            -f $resolvedByTwin, $found) -ForegroundColor DarkGreen
     }
 
     if ($silentNoop -gt 0) {
         Write-Warning ("  {0}: {1}/{2} write(s) reported success but the UNSENT bit did NOT clear on the server." -f $display, $silentNoop, $found)
         if ($useRdo) {
             Write-Warning '  The Redemption COPY-and-REPLACE path landed a new message but'
-            Write-Warning '  the cloud store applied UNSENT during Save() anyway.  This is'
-            Write-Warning '  unusual -- only path left is re-import via the official Network'
-            Write-Warning '  Upload PST Import service in the M365 Compliance Center.'
+            Write-Warning '  the cloud store applied UNSENT during Save() on those particular'
+            Write-Warning '  items.  Re-running the script usually picks them up on the next'
+            Write-Warning '  pass; if they remain stuck after 2-3 runs, the original message'
+            Write-Warning '  shape may be unusual (e.g. embedded forwarded item) -- inspect'
+            Write-Warning '  by EntryID in MFCMAPI before treating as data-loss-risk.'
         } else {
             Write-Warning '  This is the documented Outlook OOM block on PR_MESSAGE_FLAGS (computed property).'
             Write-Warning '  Install Outlook Redemption (https://www.dimastr.com/redemption/) and re-run --'
@@ -911,7 +973,13 @@ function Fix-FolderItems {
         }
     }
 
-    return @{ Found = $found; Fixed = $fixed; Failed = $failed; SilentNoop = $silentNoop }
+    return @{
+        Found          = $found
+        Fixed          = $fixed
+        Failed         = $failed
+        SilentNoop     = $silentNoop
+        ResolvedByTwin = $resolvedByTwin
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1100,7 +1168,11 @@ function Fix-Mailbox {
                 if ($r.SilentNoop -gt 0) {
                     $stuckPart = ", stuck {0}" -f $r.SilentNoop
                 }
-                $msg += " -> fixed {0}{1}, failed {2}" -f $r.Fixed, $stuckPart, $r.Failed
+                $twinPart = ''
+                if ($r.ResolvedByTwin -gt 0) {
+                    $twinPart = ", twin-resolved {0}" -f $r.ResolvedByTwin
+                }
+                $msg += " -> fixed {0}{1}{2}, failed {3}" -f $r.Fixed, $twinPart, $stuckPart, $r.Failed
             }
             Write-Host $msg
             $stats.Folders += 1
