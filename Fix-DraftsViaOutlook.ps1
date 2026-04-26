@@ -480,14 +480,29 @@ function Fix-Mailbox {
             return [pscustomobject]$stats
         }
 
-        # Resolve the mailbox root.  Two paths:
+        # Force MAPI to actually bind the Inbox object.  Cold-launched
+        # Outlook can return an unbound Inbox proxy whose Items / Store /
+        # Parent all read as $null until something forces resolution.
+        # Reading Items.Count is enough to make MAPI fault the data in.
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
+            try {
+                $null = $inbox.Items.Count
+                break
+            } catch {
+                Write-Verbose ("Inbox bind attempt {0} threw: {1}" -f $attempt, $_.Exception.Message)
+                Start-Sleep -Seconds 2
+            }
+        }
+
+        # Resolve the mailbox root.  Three paths, tried in order; each is
+        # robust against a different MAPI binding hiccup.
         #   1. Inbox.Store.GetRootFolder()  -- works as soon as the store
-        #      object is bound, even if the folder hierarchy isn't fully
-        #      populated yet, and is the cleanest way to get the root.
-        #   2. Inbox.Parent  -- fallback for store providers that don't
-        #      expose GetRootFolder.  Can transiently be $null while a
-        #      cold-launched Outlook attaches the delegated mailbox, so
-        #      we retry it.
+        #      COM object is bound.
+        #   2. Inbox.Parent  -- needs the folder hierarchy to be loaded;
+        #      transiently $null on cold-launched Outlook.
+        #   3. None of the above -- we still walk Inbox + Sent Items
+        #      directly via GetSharedDefaultFolder, which is enough to
+        #      cover the imported-PST scenario for this project.
         $root = $null
         try {
             $store = $inbox.Store
@@ -502,20 +517,40 @@ function Fix-Mailbox {
                 Start-Sleep -Seconds 2
             }
         }
-        if (-not $root) {
-            $stats.Status = "ERROR: could not resolve mailbox root for $Upn (Store.GetRootFolder() and Inbox.Parent both returned null -- is Outlook fully started and signed in?)"
-            return [pscustomobject]$stats
-        }
         $skip = Get-SkipFolderIds -Namespace $Namespace -Recipient $rcpt
 
         if ($FolderFilter) {
+            if (-not $root) {
+                $stats.Status = "ERROR: could not resolve mailbox root for $Upn; -Folder filter requires the root.  Try restarting Outlook first."
+                return [pscustomobject]$stats
+            }
             $scoped = Get-FolderByPath -Root $root -Path $FolderFilter
             $candidates = Get-MailFoldersRecursive -Root $scoped -SkipIds $skip -IncludeRoot $true
-        } else {
-            # Mailbox root itself is a container, not a mail folder; don't
+        } elseif ($root) {
+            # Best path: walk every IPF.Note folder under the mailbox root.
+            # The mailbox root itself is a container, not a mail folder; don't
             # add it to candidates or Items.Restrict() will trip on hidden
             # store-level items.
             $candidates = Get-MailFoldersRecursive -Root $root -SkipIds $skip -IncludeRoot $false
+        } else {
+            # Fallback: cold-launched Outlook hasn't fully bound the
+            # delegated store, so Inbox.Parent and Inbox.Store are both
+            # null.  Walk the folders we can reach directly via
+            # GetSharedDefaultFolder.  Misses user-created top-level
+            # folders like 'Archive' but covers Inbox + Sent Items, which
+            # is where imported-PST messages always end up.
+            Write-Warning ("[{0}] mailbox root unresolved; falling back to Inbox + Sent Items only." -f $Upn)
+            Write-Warning ("[{0}] To cover other top-level folders, restart Outlook in this same login session and re-run." -f $Upn)
+            $candidates = New-Object 'System.Collections.Generic.List[object]'
+            foreach ($wellKnown in @($script:olFolderInbox, $script:olFolderSentMail)) {
+                try {
+                    $f = $Namespace.GetSharedDefaultFolder($rcpt, $wellKnown)
+                    if ($f) { Walk-FolderInto $f $skip $candidates }
+                } catch {
+                    Write-Verbose ("GetSharedDefaultFolder({0}) threw: {1}" -f $wellKnown, $_.Exception.Message)
+                }
+            }
+            $candidates = $candidates.ToArray()
         }
 
         Write-Host ("[{0}] {1} mail folder(s) to scan{2}" -f
