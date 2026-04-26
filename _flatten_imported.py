@@ -161,6 +161,20 @@ def resolve_top_level_target(graph: GraphClient, mailbox: str, child_name: str) 
     return find_child_named(graph, mailbox, "msgFolderRoot", child_name)
 
 
+def recursive_item_count(graph: GraphClient, mailbox: str, folder: dict) -> int:
+    """Sum totalItemCount across `folder` and all its descendants.
+
+    Graph's totalItemCount only counts items directly inside a folder; to
+    get a true subtree size we have to walk. Cost: one GET per non-empty
+    branch. Used for accurate dry-run totals on wholesale folder-moves.
+    """
+    total = int(folder.get("totalItemCount") or 0)
+    if int(folder.get("childFolderCount") or 0) > 0:
+        for sub in list_child_folders(graph, mailbox, folder["id"]):
+            total += recursive_item_count(graph, mailbox, sub)
+    return total
+
+
 # -------------------------------------------------------- merge / move / flatten
 
 
@@ -200,11 +214,19 @@ def plan_merge(
             msgs += sm
             folders += sf
         else:
-            log.info(
-                "{}[move]   {!r} ({} items) -> {!r} (new, single folder-move)",
-                indent, sub["displayName"], sub_items, sub_path,
-            )
-            msgs += sub_items
+            if sub_subs > 0:
+                deep = recursive_item_count(graph, mailbox, sub)
+                log.info(
+                    "{}[move]   {!r} ({} direct items, {} subfolders, {} total in subtree) -> {!r} (new, single folder-move)",
+                    indent, sub["displayName"], sub_items, sub_subs, deep, sub_path,
+                )
+            else:
+                deep = sub_items
+                log.info(
+                    "{}[move]   {!r} ({} items) -> {!r} (new, single folder-move)",
+                    indent, sub["displayName"], sub_items, sub_path,
+                )
+            msgs += deep
             folders += 1
     return msgs, folders
 
@@ -260,20 +282,40 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
         stats["skipped"] = True
         return stats
 
+    root_direct_items = int(imported.get("totalItemCount") or 0)
     log.info(
         "Found '{}' ({} direct items, {} top-level subfolders)",
         ROOT_FOLDER_NAME,
-        imported.get("totalItemCount", 0),
+        root_direct_items,
         imported.get("childFolderCount", 0),
     )
+
+    # Direct items sitting in 'Imported PST' itself (above all subfolders) get
+    # moved into the live Inbox -- that's the closest semantic match for "loose"
+    # imported messages. We resolve Inbox via the well-known endpoint so it works
+    # in non-English tenants too.
+    inbox_for_loose: dict | None = None
+    if root_direct_items > 0:
+        inbox_for_loose = get_well_known_folder(graph, mailbox, "inbox")
+        if inbox_for_loose is None:
+            log.warning(
+                "{} direct items in '{}' but couldn't resolve Inbox; will leave them and skip the final delete.",
+                root_direct_items, ROOT_FOLDER_NAME,
+            )
 
     children = list_child_folders(graph, mailbox, imported["id"])
     log.info("Plan:")
 
-    # Build the plan first (always — for dry-run AND real run, so the user
+    if root_direct_items > 0 and inbox_for_loose is not None:
+        log.info(
+            "  [move-msgs] {} direct items in '{}' -> 'Inbox' (item-by-item)",
+            root_direct_items, ROOT_FOLDER_NAME,
+        )
+
+    # Build the plan first (always - for dry-run AND real run, so the user
     # sees the intent before any writes happen).
     actions: list[dict] = []
-    plan_msgs = 0
+    plan_msgs = root_direct_items if inbox_for_loose is not None else 0
     plan_folders = 0
     for child in children:
         name = child["displayName"]
@@ -289,29 +331,53 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
                 dst_path=tgt_name, log=log, depth=2,
             )
             actions.append({"kind": "merge", "src": child, "dst": target})
-            # plan_merge already counted the top-level child (folders += 1) and its messages,
-            # but we logged the top line ourselves; re-add to keep totals consistent.
             plan_msgs += sm
             plan_folders += sf
         else:
-            log.info("  [move]   {!r} ({} items, {} subfolders) -> mailbox root (new top-level folder)", name, items, subs)
+            if subs > 0:
+                deep = recursive_item_count(graph, mailbox, child)
+                log.info(
+                    "  [move]   {!r} ({} direct items, {} subfolders, {} total in subtree) -> mailbox root (new top-level folder)",
+                    name, items, subs, deep,
+                )
+            else:
+                deep = items
+                log.info(
+                    "  [move]   {!r} ({} items) -> mailbox root (new top-level folder)",
+                    name, items,
+                )
             actions.append({"kind": "move-root", "src": child})
-            plan_msgs += items
-            plan_folders += 1 + subs
+            plan_msgs += deep
+            plan_folders += 1
 
     log.info(
-        "Plan total: ~{} messages to move, {} folder operations.",
+        "Plan total: ~{} messages affected, {} folder operations.",
         plan_msgs, plan_folders,
     )
 
     if dry_run:
-        log.info("DRY RUN — no changes made.")
+        log.info("DRY RUN - no changes made.")
         return stats
 
     # Execute
     log.info("Executing plan...")
     total_msgs = 0
     total_subs = 0
+
+    if root_direct_items > 0 and inbox_for_loose is not None:
+        log.info("moving {} direct items from '{}' -> Inbox", root_direct_items, ROOT_FOLDER_NAME)
+        moved_loose = 0
+        while True:
+            msgs = list_message_page(graph, mailbox, imported["id"])
+            if not msgs:
+                break
+            for m in msgs:
+                move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
+                moved_loose += 1
+                if moved_loose % 200 == 0:
+                    log.info("  ... moved {} loose messages so far", moved_loose)
+        total_msgs += moved_loose
+
     for action in actions:
         src = action["src"]
         if action["kind"] == "merge":
@@ -326,6 +392,9 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
             move_folder(graph, mailbox, src["id"], "msgFolderRoot")
             total_subs += 1
 
+    # Only delete Imported PST if we managed to clear it. If we couldn't
+    # resolve Inbox to drain root-level messages, it'll still have items
+    # and the delete will fail safely (delete_folder logs and continues).
     delete_folder(graph, mailbox, imported["id"])
 
     stats["messages_moved"] = total_msgs
