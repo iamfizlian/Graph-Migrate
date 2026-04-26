@@ -108,7 +108,18 @@ param(
     [switch]$DryRun,
 
     [Parameter()]
-    [string]$Folder
+    [string]$Folder,
+
+    # Outlook's Object Model silently no-ops PropertyAccessor.SetProperty()
+    # on PR_MESSAGE_FLAGS (it's documented as a "computed" property).  The
+    # Redemption COM library (https://www.dimastr.com/redemption/) bypasses
+    # this restriction by writing through Extended MAPI directly.  By
+    # default we try Redemption if it's registered on the box and only fall
+    # back to the OOM path if it's not.  Pass -NoRedemption to force the
+    # OOM path (useful only as an A/B control test -- it will not actually
+    # clear the bit).
+    [Parameter()]
+    [switch]$NoRedemption
 )
 
 # ---------------------------------------------------------------------------
@@ -234,6 +245,97 @@ function Wait-NamespaceReady {
         Start-Sleep -Milliseconds 500
     }
     return $false
+}
+
+# ---------------------------------------------------------------------------
+# Redemption (Extended MAPI) helpers
+# ---------------------------------------------------------------------------
+
+function Get-RedemptionSession {
+    <#
+    .SYNOPSIS  Build an RDOSession that shares the running Outlook
+    MAPI session.  Returns $null if Redemption isn't registered.
+
+    Why we need this: Outlook's Object Model silently rejects writes
+    to PR_MESSAGE_FLAGS via PropertyAccessor.SetProperty -- the call
+    returns Success but the bit doesn't move.  Redemption's RDOMail
+    talks to Extended MAPI directly (the same layer MFCMAPI uses),
+    so it can write computed-but-not-actually-computed properties
+    that OOM blocks.  We share Outlook's MAPIOBJECT so Redemption
+    inherits the same authenticated session and FullAccess delegation
+    permissions -- no separate logon, no second profile.
+    #>
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)] $Namespace
+    )
+    $rdo = $null
+    try {
+        $rdo = New-Object -ComObject Redemption.RDOSession
+    } catch {
+        Write-Verbose ("Redemption.RDOSession not available: {0}" -f $_.Exception.Message)
+        return $null
+    }
+    try {
+        # Hand Redemption Outlook's existing MAPI session.  Without this
+        # RDOSession would attempt its own profile logon, which fails on
+        # locked-down servers and would not see Outlook's delegate
+        # FullAccess grants either way.
+        $rdo.MAPIOBJECT = $Namespace.MAPIOBJECT
+    } catch {
+        Write-Warning ("Redemption was loaded but could not attach to Outlook's MAPI session: {0}" -f $_.Exception.Message)
+        Write-Warning '  Falling back to the OOM path -- expect 0 fixes / many "stuck" items.'
+        return $null
+    }
+    return $rdo
+}
+
+function Set-MessageSentFlagViaRedemption {
+    <#
+    .SYNOPSIS  Clear MSGFLAG_UNSENT on a single message via Redemption.
+    Returns one of:
+        'fixed'    - bit was cleared and verified
+        'noop'     - write succeeded but the verify pass shows the bit is
+                     still set (cloud store rejected the write -- last-
+                     ditch sign that even Extended MAPI can't move it)
+        'failed'   - exception during open/write/save
+    #>
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] $RdoSession,
+        [Parameter(Mandatory)][string]$EntryId,
+        [Parameter(Mandatory)][string]$StoreId,
+        [Parameter(Mandatory)] $VerifyItem  # the OOM MailItem we already
+                                            # have for the verify pass
+    )
+    try {
+        # Open via Extended MAPI.  StoreID is required for delegated
+        # mailboxes -- without it Redemption defaults to the primary
+        # store and GetMessageFromID will return $null.
+        $rdoMail = $RdoSession.GetMessageFromID($EntryId, $StoreId)
+        if (-not $rdoMail) { return 'failed' }
+
+        # Redemption exposes MSGFLAG_UNSENT as the Sent boolean (true
+        # means "has been sent" i.e. UNSENT bit clear).  Setting this
+        # writes PR_MESSAGE_FLAGS via IMessage::SetProps, the same path
+        # MFCMAPI takes, which is NOT in OOM's blocked-property list.
+        $rdoMail.Sent = $true
+        $rdoMail.Save()
+    } catch {
+        Write-Verbose ("RDO write failed for {0}: {1}" -f $EntryId, $_.Exception.Message)
+        return 'failed'
+    }
+
+    # Re-read PR_MESSAGE_FLAGS via the PropertyAccessor to confirm the
+    # bit is actually clear on the server (PA reads work fine; only PA
+    # writes are blocked).
+    try {
+        $after = [int]$VerifyItem.PropertyAccessor.GetProperty($script:PR_MESSAGE_FLAGS_TAG)
+        if (($after -band $script:MSGFLAG_UNSENT) -eq 0) { return 'fixed' }
+        return 'noop'
+    } catch {
+        return 'noop'
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -384,7 +486,8 @@ function Fix-FolderItems {
     [OutputType([hashtable])]
     param(
         [Parameter(Mandatory)] $Folder,
-        [Parameter(Mandatory)][bool]$IsDryRun
+        [Parameter(Mandatory)][bool]$IsDryRun,
+        [Parameter()] $RdoSession   # may be $null -> falls back to OOM
     )
     $found  = 0
     $fixed  = 0
@@ -401,10 +504,10 @@ function Fix-FolderItems {
         $itemCount = $Folder.Items.Count
     } catch {
         Write-Warning "  ${display}: Items.Count failed -- $($_.Exception.Message)"
-        return @{ Found = 0; Fixed = 0; Failed = 0 }
+        return @{ Found = 0; Fixed = 0; Failed = 0; SilentNoop = 0 }
     }
     if ($itemCount -eq 0) {
-        return @{ Found = 0; Fixed = 0; Failed = 0 }
+        return @{ Found = 0; Fixed = 0; Failed = 0; SilentNoop = 0 }
     }
     $items = $Folder.Items
     $scanProgressEvery = 100
@@ -433,18 +536,38 @@ function Fix-FolderItems {
     $found = $entryIds.Count
 
     if ($found -eq 0) {
-        return @{ Found = 0; Fixed = 0; Failed = 0 }
+        return @{ Found = 0; Fixed = 0; Failed = 0; SilentNoop = 0 }
     }
 
     if ($IsDryRun) {
-        return @{ Found = $found; Fixed = 0; Failed = 0 }
+        return @{ Found = $found; Fixed = 0; Failed = 0; SilentNoop = 0 }
     }
 
-    # Re-fetch each item by EntryID via the store and clear the bit.
+    # Re-fetch each item by EntryID and clear the bit.  Two write paths:
+    #
+    #   * Redemption (preferred when $RdoSession is non-null).  Goes
+    #     through Extended MAPI (IMessage::SetProps) directly, which
+    #     bypasses Outlook's OOM "computed property" block on
+    #     PR_MESSAGE_FLAGS.  The Sent boolean is Redemption's
+    #     high-level wrapper around clearing MSGFLAG_UNSENT.
+    #
+    #   * OOM PropertyAccessor (fallback when Redemption isn't
+    #     available).  Documented to silently no-op on
+    #     PR_MESSAGE_FLAGS -- left in only as a control test, will
+    #     produce mostly $silentNoop counts.
+    #
+    # In either case we re-read the property AFTER the save and only
+    # count an item as Fixed when the MSGFLAG_UNSENT bit actually
+    # cleared on the server.
     $store = $null
-    try { $store = $Folder.Store } catch { }
+    $storeId = $null
+    try { $store = $Folder.Store }   catch { }
+    try { $storeId = $Folder.StoreID } catch { }
+    $useRdo = ($null -ne $RdoSession -and $null -ne $storeId)
+
     $fixProgressEvery = 50
     $fixedSoFar = 0
+    $silentNoop = 0
     foreach ($eid in $entryIds) {
         $fixedSoFar++
         try {
@@ -466,20 +589,68 @@ function Fix-FolderItems {
                 # Already clean -- somebody else's process moved faster than us.
                 continue
             }
-            $newVal = $current -band (-bnot $script:MSGFLAG_UNSENT)
-            $pa.SetProperty($script:PR_MESSAGE_FLAGS_TAG, $newVal)
-            $itm.Save()
-            $fixed++
+
+            if ($useRdo) {
+                # Extended-MAPI path via Redemption.
+                $outcome = Set-MessageSentFlagViaRedemption `
+                    -RdoSession $RdoSession `
+                    -EntryId    $eid `
+                    -StoreId    $storeId `
+                    -VerifyItem $itm
+                switch ($outcome) {
+                    'fixed'  { $fixed++ }
+                    'noop'   { $silentNoop++ }
+                    default  { $failed++ }
+                }
+            } else {
+                # OOM PropertyAccessor path -- known broken, kept as control.
+                $newVal = $current -band (-bnot $script:MSGFLAG_UNSENT)
+                $pa.SetProperty($script:PR_MESSAGE_FLAGS_TAG, $newVal)
+                $itm.Save()
+
+                $verifyItm = $null
+                try {
+                    if ($store) { $verifyItm = $store.GetItemFromID($eid) }
+                    if (-not $verifyItm) {
+                        $verifyItm = $Folder.Application.Session.GetItemFromID($eid)
+                    }
+                } catch { $verifyItm = $null }
+                if ($verifyItm) {
+                    $after = $null
+                    try { $after = [int]$verifyItm.PropertyAccessor.GetProperty($script:PR_MESSAGE_FLAGS_TAG) } catch { }
+                    if ($null -ne $after -and ($after -band $script:MSGFLAG_UNSENT) -eq 0) {
+                        $fixed++
+                    } else {
+                        $silentNoop++
+                    }
+                } else {
+                    $silentNoop++
+                }
+            }
         } catch {
             $failed++
             Write-Verbose "  item $eid failed: $($_.Exception.Message)"
         }
         if (($fixedSoFar % $fixProgressEvery) -eq 0) {
-            Write-Host ("    fixed {0}/{1} ({2} failed)" -f $fixedSoFar, $found, $failed) -ForegroundColor DarkGray
+            Write-Host ("    processed {0}/{1} (verified-fixed {2}, silent-noop {3}, errored {4})" `
+                -f $fixedSoFar, $found, $fixed, $silentNoop, $failed) -ForegroundColor DarkGray
         }
     }
 
-    return @{ Found = $found; Fixed = $fixed; Failed = $failed }
+    if ($silentNoop -gt 0) {
+        Write-Warning ("  {0}: {1}/{2} write(s) returned success but the UNSENT bit did NOT clear on the server." -f $display, $silentNoop, $found)
+        if ($useRdo) {
+            Write-Warning '  Redemption write succeeded locally but the cloud store rejected it.'
+            Write-Warning '  This is the worst-case outcome: Extended MAPI also cannot clear the bit.'
+            Write-Warning '  Only path left is re-import via the official Network Upload PST Import service.'
+        } else {
+            Write-Warning '  This is the documented Outlook OOM block on PR_MESSAGE_FLAGS (computed property).'
+            Write-Warning '  Install Outlook Redemption (https://www.dimastr.com/redemption/) and re-run --'
+            Write-Warning '  the script will detect it and use the Extended MAPI path automatically.'
+        }
+    }
+
+    return @{ Found = $found; Fixed = $fixed; Failed = $failed; SilentNoop = $silentNoop }
 }
 
 # ---------------------------------------------------------------------------
@@ -539,7 +710,8 @@ function Fix-Mailbox {
         [Parameter(Mandatory)] $Namespace,
         [Parameter(Mandatory)][string]$Upn,
         [Parameter(Mandatory)][bool]$IsDryRun,
-        [Parameter()][string]$FolderFilter
+        [Parameter()][string]$FolderFilter,
+        [Parameter()] $RdoSession   # may be $null -> OOM fallback
     )
 
     $stats = [ordered]@{
@@ -547,6 +719,7 @@ function Fix-Mailbox {
         Folders  = 0
         Drafts   = 0
         Fixed    = 0
+        Stuck    = 0
         Failed   = 0
         Status   = 'ok'
     }
@@ -659,20 +832,27 @@ function Fix-Mailbox {
             $itemCount = -1
             try { $itemCount = $folder.Items.Count } catch { }
             Write-Host ("  scanning '{0}' ({1} item(s))..." -f $display, $itemCount) -ForegroundColor DarkGray
-            $r = Fix-FolderItems -Folder $folder -IsDryRun $IsDryRun
+            $r = Fix-FolderItems -Folder $folder -IsDryRun $IsDryRun -RdoSession $RdoSession
             $msg = "  '{0}': {1} draft(s)" -f $display, $r.Found
             if (-not $IsDryRun -and $r.Found -gt 0) {
-                $msg += " -> fixed {0}, failed {1}" -f $r.Fixed, $r.Failed
+                $stuckPart = ''
+                if ($r.SilentNoop -gt 0) {
+                    $stuckPart = ", stuck {0}" -f $r.SilentNoop
+                }
+                $msg += " -> fixed {0}{1}, failed {2}" -f $r.Fixed, $stuckPart, $r.Failed
             }
             Write-Host $msg
             $stats.Folders += 1
             $stats.Drafts  += $r.Found
             $stats.Fixed   += $r.Fixed
+            $stats.Stuck   += [int]$r.SilentNoop
             $stats.Failed  += $r.Failed
         }
 
         if ($stats.Failed -gt 0) {
             $stats.Status = ("{0} failed" -f $stats.Failed)
+        } elseif ($stats.Stuck -gt 0) {
+            $stats.Status = ("{0} stuck (OOM no-op)" -f $stats.Stuck)
         }
     } catch {
         $stats.Status = "ERROR: $($_.Exception.Message)"
@@ -747,9 +927,38 @@ function Main {
     }
     Write-Verbose ("Namespace ready: {0} store(s) attached." -f $storeCount)
 
+    # Stand up a Redemption session that shares Outlook's MAPI session.
+    # If Redemption isn't installed (or -NoRedemption is set) we fall
+    # back to the OOM PropertyAccessor path, which is documented to
+    # silently no-op on PR_MESSAGE_FLAGS -- Stuck count will reflect
+    # that and the per-folder warning will tell the user to install it.
+    $rdo = $null
+    if (-not $NoRedemption) {
+        $rdo = Get-RedemptionSession -Namespace $ns
+        if ($rdo) {
+            Write-Host "Redemption (Extended MAPI) session attached -- using it for PR_MESSAGE_FLAGS writes." -ForegroundColor Green
+        } else {
+            Write-Warning ""
+            Write-Warning "Outlook Redemption is not registered on this machine."
+            Write-Warning "PR_MESSAGE_FLAGS writes will go through the OOM PropertyAccessor"
+            Write-Warning "and Microsoft documents that path as a silent no-op for this"
+            Write-Warning "property -- expect Stuck = Drafts and Fixed = 0."
+            Write-Warning ""
+            Write-Warning "  Install Redemption (~30 seconds, free for in-house use):"
+            Write-Warning "    1. Download from https://www.dimastr.com/redemption/"
+            Write-Warning "    2. Unzip Redemption64.dll into C:\Program Files\Redemption\"
+            Write-Warning "    3. From an elevated cmd:  regsvr32 ""C:\Program Files\Redemption\Redemption64.dll"""
+            Write-Warning "    4. Re-run this script -- it will pick Redemption up automatically."
+            Write-Warning ""
+        }
+    } else {
+        Write-Warning "-NoRedemption specified; using the broken OOM path as a control test."
+    }
+
     $results = New-Object 'System.Collections.Generic.List[pscustomobject]'
     foreach ($upn in $script:Mailbox) {
-        $r = Fix-Mailbox -Namespace $ns -Upn $upn -IsDryRun:$DryRun.IsPresent -FolderFilter $Folder
+        $r = Fix-Mailbox -Namespace $ns -Upn $upn -IsDryRun:$DryRun.IsPresent `
+            -FolderFilter $Folder -RdoSession $rdo
         $results.Add($r)
     }
 
