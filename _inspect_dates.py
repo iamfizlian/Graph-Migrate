@@ -90,7 +90,8 @@ def resolve_folder_id(graph: GraphClient, mailbox: str, folder: str) -> tuple[st
 def fetch_messages(graph: GraphClient, mailbox: str, folder_id: str, top: int) -> list[dict]:
     select = (
         "id,subject,sentDateTime,receivedDateTime,"
-        "createdDateTime,lastModifiedDateTime,from,internetMessageId"
+        "createdDateTime,lastModifiedDateTime,from,internetMessageId,"
+        "isDraft,isRead"
     )
     path = (
         f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"

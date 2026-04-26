@@ -26,6 +26,23 @@ we PATCH each message after creation with a set of MAPI extended properties:
 This costs an extra request per message. For pure archival migrations every
 message will need it, so the overhead is unavoidable; the alternative (wrong
 dates everywhere) defeats the purpose of preserving the archive.
+
+Draft-flag fix
+--------------
+Both the MIME path and the JSON path create messages whose initial
+PR_MESSAGE_FLAGS value has the MSGFLAG_UNSENT bit (0x08) set, because
+Graph treats freshly-created messages as drafts. Moving the message to
+Inbox / Sent Items / etc. preserves its content and its dates, but does
+NOT clear MSGFLAG_UNSENT, so every imported message is permanently
+flagged isDraft=true. Outlook on the web is the most visible casualty:
+imported mail shows up under Drafts and the regular folders display
+"Draft" badges and lose their date-sort.
+
+The fix is to set PR_MESSAGE_FLAGS (tag 0x0E07, PT_LONG) to MSGFLAG_READ
+(0x01) at PATCH time. That clears UNSENT and SUBMIT, marks the item as
+read, and lets Outlook treat it as ordinary mail. We bundle this into the
+same extended-property PATCH that sets the date metadata, so it costs no
+additional Graph round-trip per message.
 """
 
 from __future__ import annotations
@@ -47,6 +64,11 @@ PROP_CLIENT_SUBMIT_TIME = "SystemTime 0x0039"
 PROP_MESSAGE_DELIVERY_TIME = "SystemTime 0x0E06"
 PROP_CREATION_TIME = "SystemTime 0x3007"
 PROP_LAST_MODIFICATION_TIME = "SystemTime 0x3008"
+# PR_MESSAGE_FLAGS, PT_LONG. Setting this to MSGFLAG_READ (0x01) clears
+# MSGFLAG_UNSENT (0x08) and MSGFLAG_SUBMIT (0x04), which is what makes
+# Graph stop reporting the message as isDraft=true.
+PROP_MESSAGE_FLAGS = "Integer 0x0E07"
+MSGFLAG_READ = "1"
 
 
 class UploadResult:
@@ -168,7 +190,11 @@ class MessageUploader:
 
         visible_only = [
             p for p in date_props
-            if p["id"] in (PROP_MESSAGE_DELIVERY_TIME, PROP_CLIENT_SUBMIT_TIME)
+            if p["id"] in (
+                PROP_MESSAGE_DELIVERY_TIME,
+                PROP_CLIENT_SUBMIT_TIME,
+                PROP_MESSAGE_FLAGS,
+            )
         ]
         if not visible_only:
             return
@@ -361,23 +387,29 @@ def _decode_text(part) -> str:
 
 
 def _date_props_from_eml(raw: bytes) -> list[dict[str, str]]:
-    """Build the singleValueExtendedProperties payload to set original timestamps.
+    """Build the singleValueExtendedProperties payload to set original
+    timestamps and clear the draft flag.
 
-    Returns [] if the .eml has no usable Date header — in that case Graph's
-    default (current server time) is the best we can do.
+    The PR_MESSAGE_FLAGS entry is always returned, even when the .eml has
+    no usable Date header -- the dates can fall back to import-time, but
+    we never want to leave a message flagged as a draft. Date entries are
+    only included when a real Date header parses successfully.
     """
+    msg_flags = {"id": PROP_MESSAGE_FLAGS, "value": MSGFLAG_READ}
+
     try:
         parsed = email.message_from_bytes(raw, policy=policy.compat32)
     except Exception:
-        return []
+        return [msg_flags]
 
     sent_iso = _header_to_iso(parsed.get("Date"))
     received_iso = _header_to_iso(_last_received_date(parsed)) or sent_iso
     if not sent_iso and not received_iso:
-        return []
+        return [msg_flags]
     sent_iso = sent_iso or received_iso
 
     return [
+        msg_flags,
         {"id": PROP_CLIENT_SUBMIT_TIME, "value": sent_iso},
         {"id": PROP_MESSAGE_DELIVERY_TIME, "value": received_iso},
         {"id": PROP_CREATION_TIME, "value": received_iso},
