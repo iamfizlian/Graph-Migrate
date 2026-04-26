@@ -391,8 +391,10 @@ function Fix-FolderItems {
     $failed = 0
     $display = Get-FolderDisplayPath $Folder
 
-    # Snapshot EntryIDs of draft-flagged items first.  We don't touch
-    # PropertyAccessor in this pass so the Items collection is stable.
+    # Snapshot EntryIDs of draft-flagged items first.  We use
+    # GetFirst()/GetNext() rather than indexed Item() access -- per
+    # Outlook docs the cursor pattern is much faster for sequential
+    # iteration because it avoids re-resolving the index each call.
     $entryIds = New-Object 'System.Collections.Generic.List[string]'
     $itemCount = 0
     try {
@@ -401,21 +403,32 @@ function Fix-FolderItems {
         Write-Warning "  ${display}: Items.Count failed -- $($_.Exception.Message)"
         return @{ Found = 0; Fixed = 0; Failed = 0 }
     }
-    for ($i = 1; $i -le $itemCount; $i++) {
+    if ($itemCount -eq 0) {
+        return @{ Found = 0; Fixed = 0; Failed = 0 }
+    }
+    $items = $Folder.Items
+    $scanProgressEvery = 100
+    $scanned = 0
+    try { $itm = $items.GetFirst() } catch { $itm = $null }
+    while ($itm) {
+        $scanned++
         try {
-            $itm = $Folder.Items.Item($i)
-            if (-not $itm) { continue }
             $cls = $null
             try { $cls = $itm.MessageClass } catch { }
-            if (-not $cls -or -not $cls.StartsWith('IPM.Note')) { continue }
-            $flags = 0
-            try { $flags = [int]$itm.PropertyAccessor.GetProperty($script:PR_MESSAGE_FLAGS_TAG) } catch { continue }
-            if (($flags -band $script:MSGFLAG_UNSENT) -ne 0) {
-                if ($itm.EntryID) { $entryIds.Add($itm.EntryID) }
+            if ($cls -and $cls.StartsWith('IPM.Note')) {
+                $flags = 0
+                try { $flags = [int]$itm.PropertyAccessor.GetProperty($script:PR_MESSAGE_FLAGS_TAG) } catch { }
+                if (($flags -band $script:MSGFLAG_UNSENT) -ne 0) {
+                    if ($itm.EntryID) { $entryIds.Add($itm.EntryID) }
+                }
             }
         } catch {
             # Item couldn't be loaded -- skip.
         }
+        if (($scanned % $scanProgressEvery) -eq 0) {
+            Write-Host ("    scanned {0}/{1} ({2} drafts so far)" -f $scanned, $itemCount, $entryIds.Count) -ForegroundColor DarkGray
+        }
+        try { $itm = $items.GetNext() } catch { $itm = $null }
     }
     $found = $entryIds.Count
 
@@ -430,7 +443,10 @@ function Fix-FolderItems {
     # Re-fetch each item by EntryID via the store and clear the bit.
     $store = $null
     try { $store = $Folder.Store } catch { }
+    $fixProgressEvery = 50
+    $fixedSoFar = 0
     foreach ($eid in $entryIds) {
+        $fixedSoFar++
         try {
             $itm = $null
             if ($store) {
@@ -457,6 +473,9 @@ function Fix-FolderItems {
         } catch {
             $failed++
             Write-Verbose "  item $eid failed: $($_.Exception.Message)"
+        }
+        if (($fixedSoFar % $fixProgressEvery) -eq 0) {
+            Write-Host ("    fixed {0}/{1} ({2} failed)" -f $fixedSoFar, $found, $failed) -ForegroundColor DarkGray
         }
     }
 
