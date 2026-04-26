@@ -98,16 +98,17 @@ def fuzzy_key(msg: dict) -> FuzzyKey | None:
 
 @dataclass(slots=True)
 class DedupIndex:
-    """Set of fuzzy keys already present in the destination mailbox."""
+    """Frozen snapshot of fuzzy keys present in the destination mailbox.
+
+    Built once before any moves happen and not mutated during the run --
+    we want to skip only messages that collide with the *original* live
+    mailbox content, not with messages we just moved this run.
+    """
     keys: set[FuzzyKey] = field(default_factory=set)
     skipped: int = 0  # running count of source messages skipped as duplicates
 
     def has(self, k: FuzzyKey | None) -> bool:
         return k is not None and k in self.keys
-
-    def add(self, k: FuzzyKey | None) -> None:
-        if k is not None:
-            self.keys.add(k)
 
 # Top-level Imported PST folders whose displayName matches one of these
 # predicates get merged into the corresponding Graph well-known folder
@@ -430,7 +431,14 @@ def execute_merge(
 
     `dedup`, if provided, is checked for every message before moving. Any
     source message whose fuzzy key already exists in the destination is
-    skipped (left in `src`). Skipped count goes into dedup.skipped.
+    skipped (left in `src`). Skipped count goes into dedup.skipped. The
+    index is FROZEN at the snapshot taken before flattening started --
+    we don't grow it as we move, otherwise a PST that contains the same
+    email in two folders (e.g. Inbox and Inbox/Sent) would have only the
+    first copy land and the second silently dropped. Frozen behavior
+    mirrors what the original PST import would have done for the live
+    mailbox: any pre-existing duplicate stays where it was, anything new
+    flows through.
 
     With dedup enabled, wholesale folder-moves are disabled: we create a
     matching folder under dst when one doesn't exist, then merge into it
@@ -443,36 +451,36 @@ def execute_merge(
     moved = 0
 
     # ------ messages directly in `src` ------
-    while True:
-        msgs = list_message_page(graph, mailbox, src_id, with_dedup_fields=dedup is not None)
-        if not msgs:
-            break
-        # Track messages we *visit* this page; if dedup leaves them all in
-        # place, listing the same page again would loop forever, so when
-        # dedup is on we page using $skip-style by tracking processed ids.
-        all_skipped_this_page = True
-        for m in msgs:
-            if dedup is not None:
-                k = fuzzy_key(m)
-                if dedup.has(k):
-                    dedup.skipped += 1
-                    continue
-                # Move it, and remember its key so duplicates among the
-                # imported messages themselves don't all flood through.
-                move_message(graph, mailbox, m["id"], dst_id)
-                dedup.add(k)
-                moved += 1
-                all_skipped_this_page = False
-            else:
-                move_message(graph, mailbox, m["id"], dst_id)
-                moved += 1
+    if dedup is not None:
+        # Snapshot every message in this folder up front, then iterate.
+        # Why: paging-while-mutating doesn't compose with skipping. If we
+        # paged and moved, skipped messages would stay in the folder and
+        # re-appear on every subsequent page, inflating the skip counter
+        # and risking premature termination via the "all skipped" guard.
+        # The dedup index is also FROZEN here on purpose: we only want to
+        # skip messages that collide with the *original* destination
+        # content, not with messages we just moved this run (otherwise
+        # PST-internal cross-folder dups would silently get dropped).
+        all_msgs = list(iter_all_messages(graph, mailbox, src_id))
+        for m in all_msgs:
+            k = fuzzy_key(m)
+            if dedup.has(k):
+                dedup.skipped += 1
+                continue
+            move_message(graph, mailbox, m["id"], dst_id)
+            moved += 1
             if moved and moved % 200 == 0:
                 log.info("{}{!r}: moved {} messages so far", indent, src_path, moved)
-        if dedup is not None and all_skipped_this_page:
-            # Every message in this page is staying put. Re-listing would
-            # return the same items forever; break out and let them stay
-            # in the source folder for the user to review.
-            break
+    else:
+        while True:
+            msgs = list_message_page(graph, mailbox, src_id, with_dedup_fields=False)
+            if not msgs:
+                break
+            for m in msgs:
+                move_message(graph, mailbox, m["id"], dst_id)
+                moved += 1
+                if moved and moved % 200 == 0:
+                    log.info("{}{!r}: moved {} messages so far", indent, src_path, moved)
 
     # ------ subfolders ------
     subs = 0
@@ -655,30 +663,26 @@ def flatten_mailbox(
     if root_direct_items > 0 and inbox_for_loose is not None:
         log.info("moving {} direct items from {!r} -> Inbox", root_direct_items, ROOT_FOLDER_NAME)
         moved_loose = 0
-        while True:
-            msgs = list_message_page(
-                graph, mailbox, imported["id"],
-                with_dedup_fields=dedup is not None,
-            )
-            if not msgs:
-                break
-            all_skipped = True
-            for m in msgs:
-                if dedup is not None:
-                    k = fuzzy_key(m)
-                    if dedup.has(k):
-                        dedup.skipped += 1
-                        continue
-                    move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
-                    dedup.add(k)
-                else:
-                    move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
+        if dedup is not None:
+            # Snapshot first; see comment in execute_merge for why.
+            for m in list(iter_all_messages(graph, mailbox, imported["id"])):
+                if dedup.has(fuzzy_key(m)):
+                    dedup.skipped += 1
+                    continue
+                move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
                 moved_loose += 1
-                all_skipped = False
                 if moved_loose % 200 == 0:
                     log.info("  '{}' (loose root items): moved {} so far", ROOT_FOLDER_NAME, moved_loose)
-            if dedup is not None and all_skipped:
-                break
+        else:
+            while True:
+                msgs = list_message_page(graph, mailbox, imported["id"], with_dedup_fields=False)
+                if not msgs:
+                    break
+                for m in msgs:
+                    move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
+                    moved_loose += 1
+                    if moved_loose % 200 == 0:
+                        log.info("  '{}' (loose root items): moved {} so far", ROOT_FOLDER_NAME, moved_loose)
         item_moves += moved_loose
 
     for action in actions:
