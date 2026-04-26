@@ -153,6 +153,11 @@ def get_ews_token(app: AuthConfig) -> str:
 def _envelope(mailbox: str, body: str) -> str:
     """Wrap an EWS body fragment in a SOAP envelope with impersonation
     set to the target mailbox."""
+    # Exchange2013_SP1 is the documented lowest-common-denominator value
+    # accepted by Exchange Online; values like 'Exchange2016_SP1' are not
+    # in the RequestServerVersion enum (cloud rejects them with
+    # ErrorInvalidServerVersion). Everything we need (extended properties,
+    # bitmask restrictions, batched UpdateItem) is exposed here.
     safe_mbx = escape(mailbox)
     return (
         '<?xml version="1.0" encoding="utf-8"?>'
@@ -161,7 +166,7 @@ def _envelope(mailbox: str, body: str) -> str:
         'xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types" '
         'xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">'
         '<soap:Header>'
-        '<t:RequestServerVersion Version="Exchange2016_SP1"/>'
+        '<t:RequestServerVersion Version="Exchange2013_SP1"/>'
         '<t:ExchangeImpersonation>'
         '<t:ConnectingSID>'
         f'<t:PrimarySmtpAddress>{safe_mbx}</t:PrimarySmtpAddress>'
@@ -265,6 +270,40 @@ class EwsError(Exception):
     pass
 
 
+# SOAP faultcodes that are permanent client/server bugs -- retrying buys
+# nothing. The faultcode comes back as e.g. 'a:ErrorInvalidServerVersion'
+# in the SOAP envelope; we strip the namespace prefix before matching.
+_TERMINAL_FAULTCODES = frozenset({
+    "ErrorInvalidServerVersion",     # bad RequestServerVersion value
+    "ErrorAccessDenied",              # missing full_access_as_app or app policy
+    "ErrorInvalidUserOid",            # mailbox doesn't exist / typo
+    "ErrorNonExistentMailbox",
+    "ErrorImpersonateUserDenied",     # impersonation not authorised
+    "ErrorSchemaValidation",          # we built a malformed SOAP body
+    "ErrorInvalidIdMalformed",
+})
+
+
+def _parse_soap_fault(body: bytes) -> tuple[str | None, str | None]:
+    """Pull faultcode + faultstring out of a SOAP 500 response. Returns
+    (None, None) if the body isn't a SOAP fault we recognise."""
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return None, None
+    fault = root.find(f"{NS_S}Body/{NS_S}Fault")
+    if fault is None:
+        return None, None
+    code_el = fault.find("faultcode")
+    msg_el = fault.find("faultstring")
+    code = (code_el.text or "") if code_el is not None else ""
+    # Strip 'a:' / 's:' / 'soap:' style prefixes that EWS uses on faultcodes.
+    if ":" in code:
+        code = code.split(":", 1)[1]
+    msg = (msg_el.text or "") if msg_el is not None else ""
+    return code or None, msg or None
+
+
 class EwsClient:
     """One-mailbox EWS client.
 
@@ -321,6 +360,18 @@ class EwsClient:
                 time.sleep(wait)
                 attempt += 1
                 continue
+
+            # 500 responses from EWS commonly carry a SOAP Fault with a
+            # specific faultcode. Permanent client errors (bad server
+            # version, bad scope, malformed request) are not worth
+            # retrying -- surface them immediately. Anything else falls
+            # through to the generic 5xx retry below.
+            if resp.status_code == 500:
+                fault_code, fault_msg = _parse_soap_fault(resp.content)
+                if fault_code and fault_code in _TERMINAL_FAULTCODES:
+                    raise EwsError(
+                        f"EWS terminal error {fault_code}: {fault_msg or '(no message)'}"
+                    )
 
             if 500 <= resp.status_code < 600 and attempt < 5:
                 wait = min(30.0, 2.0 ** attempt)
