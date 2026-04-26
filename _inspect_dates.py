@@ -93,12 +93,35 @@ def fetch_messages(graph: GraphClient, mailbox: str, folder_id: str, top: int) -
         "createdDateTime,lastModifiedDateTime,from,internetMessageId,"
         "isDraft,isRead"
     )
+    # $expand pulls back PR_MESSAGE_FLAGS (0x0E07) and PR_SUBMIT_FLAGS (0x0E14)
+    # alongside the message so we can compare what Graph stores in MAPI to
+    # what it reports via the high-level isDraft / isRead properties. If
+    # those disagree we know the bug is in Graph's derivation, not in our
+    # writes.
+    expand = (
+        "singleValueExtendedProperties("
+        "$filter=id eq 'Integer 0x0E07' or id eq 'Integer 0x0E14')"
+    )
     path = (
         f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"
-        f"?$top={top}&$select={select}&$orderby=receivedDateTime desc"
+        f"?$top={top}&$select={select}&$expand={expand}"
+        f"&$orderby=receivedDateTime desc"
     )
     resp = graph.get(path, expect_status=(200,))
     return resp.json().get("value", [])
+
+
+def _ext_prop_int(msg: dict, prop_id: str) -> int | None:
+    """Pull the integer value of a single extended property out of the
+    expanded singleValueExtendedProperties array on a message."""
+    for ep in msg.get("singleValueExtendedProperties") or []:
+        if ep.get("id") == prop_id:
+            v = ep.get("value")
+            try:
+                return int(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def fetch_smtp_date_header(graph: GraphClient, mailbox: str, msg_id: str) -> str | None:
@@ -171,10 +194,15 @@ def main() -> int:
             return "no"
         return "?"
 
+    def hex_or_dash(v: int | None) -> str:
+        # Show the raw MAPI flag value as hex so the bits are easy to read
+        # against the legend below the table.
+        return "-" if v is None else f"0x{v:04x}"
+
     print()
     base_hdr = (
         f"{'subject':<40} {'sentDateTime':<22} {'receivedDateTime':<22} "
-        f"{'lastMod':<22} {'created':<22} {'draft':<5} {'read':<5}"
+        f"{'lastMod':<22} {'draft':<5} {'read':<5} {'msgFlg':<8} {'subFlg':<8}"
     )
     hdr = base_hdr + (f" {'SMTP Date:':<32}" if ns.smtp else "")
     print(hdr)
@@ -182,14 +210,17 @@ def main() -> int:
 
     for m in messages:
         subj = (m.get("subject") or "(no subject)").strip()
+        msg_flags = _ext_prop_int(m, "Integer 0x0E07")
+        sub_flags = _ext_prop_int(m, "Integer 0x0E14")
         row = (
             f"{fmt(subj, 40)} "
             f"{fmt(m.get('sentDateTime'), 22)} "
             f"{fmt(m.get('receivedDateTime'), 22)} "
             f"{fmt(m.get('lastModifiedDateTime'), 22)} "
-            f"{fmt(m.get('createdDateTime'), 22)} "
             f"{flag(m.get('isDraft')):<5} "
-            f"{flag(m.get('isRead')):<5}"
+            f"{flag(m.get('isRead')):<5} "
+            f"{hex_or_dash(msg_flags):<8} "
+            f"{hex_or_dash(sub_flags):<8}"
         )
         if ns.smtp:
             row += f" {fmt(smtp_dates.get(m['id']), 32)}"
@@ -198,16 +229,20 @@ def main() -> int:
     print()
     print(
         "How to read this:\n"
-        "  draft=yes -> Graph reports isDraft=true; OWA shows the message in "
-        "Drafts and adds 'Draft' badges in regular folders. Run\n"
-        "             _fix_drafts.py to clear it.\n"
-        "  sent/received/SMTP Date all old, lastMod=today -> messages are "
-        "fine; lastMod just bumped on the most recent move. OWA may\n"
-        "             still display a 'modified' column if the mailbox view "
-        "is customized.\n"
-        "  receivedDateTime=today/future, SMTP Date=old -> something "
-        "rewrote the receive time during import.\n"
-        "  SMTP Date itself today/future -> the PST source had bad metadata."
+        "  draft / read are Graph's high-level booleans.\n"
+        "  msgFlg = PR_MESSAGE_FLAGS (0x0E07).  Bits: 0x01 READ, 0x02 UNMODIFIED,\n"
+        "           0x04 SUBMITTED, 0x08 UNSENT (the draft bit), 0x10 HASATTACH,\n"
+        "           0x20 FROMME.\n"
+        "  subFlg = PR_SUBMIT_FLAGS (0x0E14).  0x01 LOCKED, 0x02 PREPROCESS.\n"
+        "  If draft=yes but msgFlg has UNSENT (0x08) clear, Graph is deriving\n"
+        "  isDraft from something other than PR_MESSAGE_FLAGS (likely subFlg or\n"
+        "  a cached field).  If msgFlg still has UNSENT set after _fix_drafts.py,\n"
+        "  the PATCH didn't fully overwrite the property and we need a different\n"
+        "  approach.\n"
+        "  Date column meanings:\n"
+        "    sent/received/SMTP all old, lastMod=today  -> fine, just move bumped lastMod\n"
+        "    receivedDateTime=today, SMTP=old           -> import rewrote receive time\n"
+        "    SMTP itself today/future                   -> bad PST source metadata"
     )
     return 0
 

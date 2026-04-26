@@ -53,15 +53,36 @@ PAGE_SIZE = 100
 #  - Deleted Items: trash; their state doesn't matter for the user
 SKIP_TOP_LEVEL = frozenset({"Drafts", "Deleted Items"})
 
-# PR_MESSAGE_FLAGS, PT_LONG; setting this to MSGFLAG_READ (0x01) clears
-# MSGFLAG_UNSENT (0x08) and MSGFLAG_SUBMIT (0x04). That's what flips
-# isDraft from true to false on a previously-imported message.
+# PR_MESSAGE_FLAGS, PT_LONG.  Bits we care about:
+#   MSGFLAG_READ      0x01  - has been read
+#   MSGFLAG_UNMODIFIED 0x02 - no pending edits
+#   MSGFLAG_SUBMIT    0x04  - was successfully submitted (i.e. NOT a draft)
+#   MSGFLAG_UNSENT    0x08  - is a draft awaiting submission  <-- WANT 0
+# We set 0x05 (READ | SUBMIT) so the message looks like a delivered/sent
+# item. Setting just 0x01 (the previous attempt) cleared UNSENT and READ
+# applied, but Graph kept reporting isDraft=true on at least some tenants
+# -- it appears to also consider PR_SUBMIT_FLAGS / SUBMITTED bit.
 PROP_MESSAGE_FLAGS = "Integer 0x0E07"
-FIX_PAYLOAD = {
+MSG_FLAGS_VALUE = "5"  # MSGFLAG_READ | MSGFLAG_SUBMIT
+
+# PR_SUBMIT_FLAGS, PT_LONG.  Should be 0 for a delivered/sent message
+# (any nonzero value indicates "submission in progress" workflow).
+PROP_SUBMIT_FLAGS = "Integer 0x0E14"
+SUBMIT_FLAGS_VALUE = "0"
+
+EXT_PROP_PAYLOAD = {
     "singleValueExtendedProperties": [
-        {"id": PROP_MESSAGE_FLAGS, "value": "1"},
+        {"id": PROP_MESSAGE_FLAGS, "value": MSG_FLAGS_VALUE},
+        {"id": PROP_SUBMIT_FLAGS, "value": SUBMIT_FLAGS_VALUE},
     ]
 }
+
+# Direct write of the high-level isDraft property is undocumented (the
+# Graph reference page lists isDraft without a 'writeable' annotation),
+# but in practice some tenants accept it. We try this first because if
+# it works it's the cleanest possible PATCH; on rejection we fall back
+# to the MAPI-flag bundle above.
+DIRECT_PAYLOAD = {"isDraft": False}
 
 
 def _strip_base(url: str) -> str:
@@ -102,14 +123,46 @@ def iter_draft_message_ids(graph: GraphClient, mailbox: str, folder_id: str):
         path = _strip_base(next_link) if next_link else None
 
 
-def patch_one(graph: GraphClient, mailbox: str, msg_id: str) -> None:
+def patch_one(graph: GraphClient, mailbox: str, msg_id: str) -> str:
+    """Try PATCH strategies in order; return the strategy name that worked.
+
+    Strategies:
+      'direct'  : PATCH {"isDraft": false}.  Undocumented; some tenants accept
+                  it. Cleanest fix when it works.
+      'mapi'    : PATCH PR_MESSAGE_FLAGS=5 + PR_SUBMIT_FLAGS=0 via
+                  singleValueExtendedProperties. Reliable mechanism but
+                  Graph's isDraft derivation has been observed to lag this
+                  on some tenants.
+
+    On success returns one of the strategy names. On total failure raises
+    the last GraphError encountered.
+    """
     path = f"/users/{quote(mailbox)}/messages/{msg_id}"
-    graph.patch(path, json=FIX_PAYLOAD, expect_status=(200,))
+    last_err: GraphError | None = None
+    try:
+        graph.patch(path, json=DIRECT_PAYLOAD, expect_status=(200,))
+        return "direct"
+    except GraphError as e:
+        last_err = e
+    try:
+        graph.patch(path, json=EXT_PROP_PAYLOAD, expect_status=(200,))
+        return "mapi"
+    except GraphError as e:
+        last_err = e
+    raise last_err  # type: ignore[misc]
 
 
 def fix_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
     log = logger.bind(ctx=f"fix-drafts[{mailbox}]")
-    stats = {"mailbox": mailbox, "folders_walked": 0, "drafts_found": 0, "fixed": 0, "failed": 0}
+    stats = {
+        "mailbox": mailbox,
+        "folders_walked": 0,
+        "drafts_found": 0,
+        "fixed": 0,
+        "failed": 0,
+        "via_direct": 0,
+        "via_mapi": 0,
+    }
 
     def walk(folder: dict, prefix: str) -> None:
         path_label = f"{prefix}/{folder['displayName']}" if prefix else folder["displayName"]
@@ -122,8 +175,9 @@ def fix_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
             if not dry_run:
                 for mid in ids:
                     try:
-                        patch_one(graph, mailbox, mid)
+                        via = patch_one(graph, mailbox, mid)
                         stats["fixed"] += 1
+                        stats[f"via_{via}"] = stats.get(f"via_{via}", 0) + 1
                     except GraphError as e:
                         stats["failed"] += 1
                         log.warning("    couldn't patch {} ({})", mid, e.status)
@@ -144,8 +198,11 @@ def fix_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
         log.info("DRY RUN -- would PATCH {} message(s) across {} folder(s).",
                  stats["drafts_found"], stats["folders_walked"])
     else:
-        log.info("Fixed {} of {} draft(s); {} failed.",
-                 stats["fixed"], stats["drafts_found"], stats["failed"])
+        log.info(
+            "Fixed {} of {} draft(s); {} failed.  (via direct: {}, via mapi: {})",
+            stats["fixed"], stats["drafts_found"], stats["failed"],
+            stats["via_direct"], stats["via_mapi"],
+        )
     return stats
 
 
