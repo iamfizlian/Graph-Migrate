@@ -290,52 +290,129 @@ function Get-RedemptionSession {
     return $rdo
 }
 
-function Set-MessageSentFlagViaRedemption {
+function Clear-UnsentBitViaRedemptionCopy {
     <#
-    .SYNOPSIS  Clear MSGFLAG_UNSENT on a single message via Redemption.
+    .SYNOPSIS  Clear MSGFLAG_UNSENT by recreating the message.
+
+    Why a copy and not an in-place update: per MAPI spec
+    (MS-OXCMSG, IMessage::SetProps),
+    PR_MESSAGE_FLAGS becomes effectively immutable after the first
+    IMessage::SaveChanges -- the cloud store silently rejects further
+    writes to that property regardless of which client (Graph, EWS,
+    OOM, or even Extended MAPI via Redemption) issues them.  So
+    even Redemption's $rdoMail.Sent = $true ; Save() is a no-op on
+    an existing message.
+
+    BUT -- on a *brand new* message, the client owns PR_MESSAGE_FLAGS
+    until the first save.  So we:
+        1. Open the source message via Redemption.
+        2. Add a fresh blank message to the same folder
+           (RDOFolder.Items.Add returns an unsaved IMessage).
+        3. RDOMail.CopyTo(blank) copies every property except
+           EntryID/StoreEntryID/RecordKey/InstanceKey/SearchKey/
+           ParentEntryID/etc, which Redemption excludes by default.
+        4. Set blank.Sent = $true *before* Save() so the first save
+           writes PR_MESSAGE_FLAGS without the UNSENT bit.
+        5. Save the new message -- it lands without the Draft badge.
+        6. Delete the original.
+
+    Caveats:
+        * The new item gets a new EntryID and a new InternetMessageId
+          (Redemption preserves the source MIME ID by default; we
+          could explicitly preserve it if needed).
+        * Conversation threading is preserved because
+          PR_CONVERSATION_INDEX / TOPIC are copied.
+        * DateTimeReceived, DateTimeSent, Sender* are all copied.
+
     Returns one of:
-        'fixed'    - bit was cleared and verified
-        'noop'     - write succeeded but the verify pass shows the bit is
-                     still set (cloud store rejected the write -- last-
-                     ditch sign that even Extended MAPI can't move it)
-        'failed'   - exception during open/write/save
+        'fixed'   - new message created with UNSENT clear, original deleted
+        'noop'    - new message landed but its UNSENT bit is also set
+                    (cloud store applied UNSENT during save anyway --
+                    extremely unusual, would mean the server is
+                    auto-flagging *all* PSTs-imported-style writes)
+        'failed'  - exception during any step (source NOT deleted)
+
+    Sets the [ref] $NewEntryId to the new message's EntryID on
+    success so the caller can record the mapping if it wants.
     #>
     [OutputType([string])]
     param(
         [Parameter(Mandatory)] $RdoSession,
         [Parameter(Mandatory)][string]$EntryId,
         [Parameter(Mandatory)][string]$StoreId,
-        [Parameter(Mandatory)] $VerifyItem  # the OOM MailItem we already
-                                            # have for the verify pass
+        [Parameter()] [ref]$NewEntryId
     )
-    try {
-        # Open via Extended MAPI.  StoreID is required for delegated
-        # mailboxes -- without it Redemption defaults to the primary
-        # store and GetMessageFromID will return $null.
-        $rdoMail = $RdoSession.GetMessageFromID($EntryId, $StoreId)
-        if (-not $rdoMail) { return 'failed' }
 
-        # Redemption exposes MSGFLAG_UNSENT as the Sent boolean (true
-        # means "has been sent" i.e. UNSENT bit clear).  Setting this
-        # writes PR_MESSAGE_FLAGS via IMessage::SetProps, the same path
-        # MFCMAPI takes, which is NOT in OOM's blocked-property list.
-        $rdoMail.Sent = $true
-        $rdoMail.Save()
+    $src    = $null
+    $folder = $null
+    $dst    = $null
+    try {
+        $src = $RdoSession.GetMessageFromID($EntryId, $StoreId)
+        if (-not $src) { return 'failed' }
+
+        # Containing folder for the new copy.  We deliberately keep the
+        # new item in the SAME folder as the original so the user-visible
+        # location does not move.
+        $folder = $src.Parent
+        if (-not $folder) { return 'failed' }
+
+        $msgClass = 'IPM.Note'
+        try { if ($src.MessageClass) { $msgClass = $src.MessageClass } } catch { }
+
+        # Items.Add returns an RDOMail that has NOT been saved yet.  Until
+        # the first Save(), we own all of its properties including
+        # PR_MESSAGE_FLAGS.
+        $dst = $folder.Items.Add($msgClass)
+        if (-not $dst) { return 'failed' }
+
+        # CopyTo against an IMessage destination copies properties without
+        # saving.  Redemption excludes the identity / instance properties
+        # automatically, so we don't have to enumerate an exclusion list.
+        $src.CopyTo($dst)
+
+        # Critical: clear the UNSENT bit BEFORE the first save.  Once
+        # SaveChanges runs, the server takes over PR_MESSAGE_FLAGS and
+        # we're back at the silent-no-op wall.
+        $dst.Sent = $true
+
+        $dst.Save()
     } catch {
-        Write-Verbose ("RDO write failed for {0}: {1}" -f $EntryId, $_.Exception.Message)
+        Write-Verbose ("RDO copy-replace failed for {0}: {1}" -f $EntryId, $_.Exception.Message)
         return 'failed'
     }
 
-    # Re-read PR_MESSAGE_FLAGS via the PropertyAccessor to confirm the
-    # bit is actually clear on the server (PA reads work fine; only PA
-    # writes are blocked).
+    # Verify the bit is actually clear on the freshly-saved item.  Read
+    # PR_MESSAGE_FLAGS directly via Redemption's Fields collection so we
+    # don't have to round-trip through OOM and a fresh GetItemFromID.
+    $verified = $false
     try {
-        $after = [int]$VerifyItem.PropertyAccessor.GetProperty($script:PR_MESSAGE_FLAGS_TAG)
-        if (($after -band $script:MSGFLAG_UNSENT) -eq 0) { return 'fixed' }
-        return 'noop'
+        $tagInt = 0x0E070003
+        $after = [int]$dst.Fields.Item($tagInt)
+        if (($after -band $script:MSGFLAG_UNSENT) -eq 0) { $verified = $true }
     } catch {
+        Write-Verbose ("RDO verify of new copy failed for {0}: {1}" -f $EntryId, $_.Exception.Message)
+    }
+
+    if (-not $verified) {
+        # Server somehow set UNSENT during Save() despite our pre-save clear.
+        # Don't delete the source -- caller will count this as 'noop'.
         return 'noop'
     }
+
+    if ($PSBoundParameters.ContainsKey('NewEntryId')) {
+        try { $NewEntryId.Value = $dst.EntryID } catch { }
+    }
+
+    # Source recreation succeeded; delete the original so the user sees
+    # exactly one copy in the folder.  If Delete throws, we still return
+    # 'fixed' but the user will see a duplicate -- worth surfacing.
+    try {
+        $src.Delete()
+    } catch {
+        Write-Warning ("  copy succeeded but original delete failed (duplicate left in folder): {0}" -f $_.Exception.Message)
+    }
+
+    return 'fixed'
 }
 
 # ---------------------------------------------------------------------------
@@ -591,12 +668,17 @@ function Fix-FolderItems {
             }
 
             if ($useRdo) {
-                # Extended-MAPI path via Redemption.
-                $outcome = Set-MessageSentFlagViaRedemption `
+                # Extended-MAPI copy-and-replace path via Redemption.
+                # Creates a new message with UNSENT clear, deletes the
+                # original.  The OOM $itm we have above will become a
+                # zombie handle after this call -- which is fine because
+                # we don't reference it again in this iteration.
+                $newEid = $null
+                $outcome = Clear-UnsentBitViaRedemptionCopy `
                     -RdoSession $RdoSession `
                     -EntryId    $eid `
                     -StoreId    $storeId `
-                    -VerifyItem $itm
+                    -NewEntryId ([ref]$newEid)
                 switch ($outcome) {
                     'fixed'  { $fixed++ }
                     'noop'   { $silentNoop++ }
@@ -638,15 +720,16 @@ function Fix-FolderItems {
     }
 
     if ($silentNoop -gt 0) {
-        Write-Warning ("  {0}: {1}/{2} write(s) returned success but the UNSENT bit did NOT clear on the server." -f $display, $silentNoop, $found)
+        Write-Warning ("  {0}: {1}/{2} write(s) reported success but the UNSENT bit did NOT clear on the server." -f $display, $silentNoop, $found)
         if ($useRdo) {
-            Write-Warning '  Redemption write succeeded locally but the cloud store rejected it.'
-            Write-Warning '  This is the worst-case outcome: Extended MAPI also cannot clear the bit.'
-            Write-Warning '  Only path left is re-import via the official Network Upload PST Import service.'
+            Write-Warning '  The Redemption COPY-and-REPLACE path landed a new message but'
+            Write-Warning '  the cloud store applied UNSENT during Save() anyway.  This is'
+            Write-Warning '  unusual -- only path left is re-import via the official Network'
+            Write-Warning '  Upload PST Import service in the M365 Compliance Center.'
         } else {
             Write-Warning '  This is the documented Outlook OOM block on PR_MESSAGE_FLAGS (computed property).'
             Write-Warning '  Install Outlook Redemption (https://www.dimastr.com/redemption/) and re-run --'
-            Write-Warning '  the script will detect it and use the Extended MAPI path automatically.'
+            Write-Warning '  the script will detect it and use the Extended MAPI copy-and-replace path automatically.'
         }
     }
 
