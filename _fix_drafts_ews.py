@@ -281,6 +281,20 @@ _TERMINAL_FAULTCODES = frozenset({
     "ErrorImpersonateUserDenied",     # impersonation not authorised
     "ErrorSchemaValidation",          # we built a malformed SOAP body
     "ErrorInvalidIdMalformed",
+    "ErrorInvalidPropertyRequest",    # asked for a non-requestable FieldURI
+    "ErrorInvalidArgument",
+    "ErrorMissingArgument",
+    "ErrorInvalidRequest",
+    "ErrorInvalidPropertyAppend",
+    "ErrorInvalidPropertyDelete",
+    "ErrorInvalidPropertySet",
+    "ErrorInvalidPropertyUpdateSentMessage",  # KEY: cloud's lock on sent-message props
+    "ErrorObjectTypeChanged",
+    "ErrorIncorrectUpdatePropertyCount",
+    "ErrorUnsupportedMimeConversion",
+    "ErrorRequestStreamTooLarge",
+    "ErrorInvalidExtendedProperty",
+    "ErrorInvalidExtendedPropertyValue",
 })
 
 

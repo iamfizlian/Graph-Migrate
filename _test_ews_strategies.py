@@ -70,12 +70,15 @@ def _get_item_with_flags(ews: EwsClient, item_id: str, change_key: str) -> tuple
     If the response doesn't include a new ChangeKey we keep the old one
     so the caller can still issue the next UpdateItem.
     """
+    # Note: 'message:IsDraft' is NOT a valid AdditionalProperties FieldURI
+    # in EWS (it's only present in the response shape, not requestable).
+    # Asking for it makes the server return ErrorInvalidPropertyRequest as
+    # a 500. We rely on PR_MESSAGE_FLAGS (the source of truth) instead.
     body = (
         '<m:GetItem>'
         '<m:ItemShape>'
         '<t:BaseShape>IdOnly</t:BaseShape>'
         '<t:AdditionalProperties>'
-        '<t:FieldURI FieldURI="message:IsDraft"/>'
         f'<t:ExtendedFieldURI PropertyTag="{PROP_TAG_MESSAGE_FLAGS}" PropertyType="Integer"/>'
         f'<t:ExtendedFieldURI PropertyTag="{PROP_TAG_SUBMIT_FLAGS}" PropertyType="Integer"/>'
         '</t:AdditionalProperties>'
