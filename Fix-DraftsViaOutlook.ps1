@@ -165,17 +165,49 @@ $script:SKIP_FOLDER_NAMES = @(
 # ---------------------------------------------------------------------------
 
 function Get-OutlookApplication {
-    [OutputType([__ComObject])]
+    <#
+    .SYNOPSIS  Attach to a running Outlook session if there is one,
+    otherwise cold-launch one.  Returns a hashtable so the caller can
+    tell whether MAPI needs a moment to settle before issuing
+    GetSharedDefaultFolder calls.
+    #>
+    [OutputType([hashtable])]
     param()
     try {
         $existing = [System.Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')
         Write-Verbose "Attached to a running Outlook session."
-        return $existing
+        return @{ App = $existing; FreshLaunch = $false }
     } catch {
         Write-Host "Starting Outlook..." -ForegroundColor DarkGray
         $new = New-Object -ComObject Outlook.Application
-        return $new
+        return @{ App = $new; FreshLaunch = $true }
     }
+}
+
+function Wait-NamespaceReady {
+    <#
+    .SYNOPSIS  Block until the MAPI namespace has at least one store
+    loaded.  After a cold launch GetSharedDefaultFolder() will silently
+    return $null while Outlook is still spinning up its session, which
+    later surfaces as 'Cannot bind argument to parameter Root because
+    it is null' deep inside the walker.
+    #>
+    param(
+        [Parameter(Mandatory)] $Namespace,
+        [int]$TimeoutSeconds = 30
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            if ($Namespace.Stores.Count -gt 0 -and $Namespace.DefaultStore) {
+                return $true
+            }
+        } catch {
+            # Stores collection not available yet; keep waiting.
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
 }
 
 # ---------------------------------------------------------------------------
@@ -400,9 +432,30 @@ function Fix-Mailbox {
             return [pscustomobject]$stats
         }
 
-        $inbox = $Namespace.GetSharedDefaultFolder($rcpt, $script:olFolderInbox)
-        $root  = $inbox.Parent
-        $skip  = Get-SkipFolderIds -Namespace $Namespace -Recipient $rcpt
+        # Retry a few times on cold-launched Outlook -- the first
+        # GetSharedDefaultFolder call can return $null while MAPI
+        # is still attaching the delegated mailbox.
+        $inbox = $null
+        for ($attempt = 1; $attempt -le 4; $attempt++) {
+            try {
+                $inbox = $Namespace.GetSharedDefaultFolder($rcpt, $script:olFolderInbox)
+            } catch {
+                Write-Verbose ("GetSharedDefaultFolder attempt {0} threw: {1}" -f $attempt, $_.Exception.Message)
+            }
+            if ($inbox) { break }
+            Start-Sleep -Seconds 2
+        }
+        if (-not $inbox) {
+            $stats.Status = "ERROR: GetSharedDefaultFolder returned null for $Upn (FullAccess granted with -AutoMapping `$false?  Or is Outlook still starting?)"
+            return [pscustomobject]$stats
+        }
+
+        $root = $inbox.Parent
+        if (-not $root) {
+            $stats.Status = "ERROR: Inbox.Parent was null for $Upn (mailbox store not fully loaded)"
+            return [pscustomobject]$stats
+        }
+        $skip = Get-SkipFolderIds -Namespace $Namespace -Recipient $rcpt
 
         if ($FolderFilter) {
             $scoped = Get-FolderByPath -Root $root -Path $FolderFilter
@@ -464,13 +517,23 @@ function Main {
         throw "No mailboxes specified."
     }
 
-    $outlook = Get-OutlookApplication
+    $launch = Get-OutlookApplication
+    $outlook = $launch.App
     $ns = $outlook.GetNamespace('MAPI')
     try {
         # No-op if Outlook is already logged on; otherwise uses the default profile.
         $null = $ns.Logon($null, $null, $false, $false)
     } catch {
         # Already logged on -> Logon throws "namespace already logged on".  Ignore.
+    }
+
+    if ($launch.FreshLaunch) {
+        # Cold-launched Outlook hasn't necessarily attached the delegated
+        # mailboxes yet; wait until the default store is online before
+        # we start asking for shared folders.
+        if (-not (Wait-NamespaceReady -Namespace $ns -TimeoutSeconds 30)) {
+            Write-Warning "Outlook namespace did not become ready within 30s; proceeding anyway."
+        }
     }
 
     $results = New-Object 'System.Collections.Generic.List[pscustomobject]'
