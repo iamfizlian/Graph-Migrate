@@ -119,7 +119,13 @@ param(
     # OOM path (useful only as an A/B control test -- it will not actually
     # clear the bit).
     [Parameter()]
-    [switch]$NoRedemption
+    [switch]$NoRedemption,
+
+    # Cap how many items we attempt per folder.  Used for debug-style
+    # runs where we want to inspect 1-3 items with full diagnostics
+    # rather than process hundreds.  0 / unset = no cap.
+    [Parameter()]
+    [int]$MaxItems = 0
 )
 
 # ---------------------------------------------------------------------------
@@ -290,6 +296,35 @@ function Get-RedemptionSession {
     return $rdo
 }
 
+# Emits a verbose snapshot of PR_MESSAGE_FLAGS at every interesting
+# step on the first item we process, then sets $script:_diagShown so
+# subsequent items run quietly.  Diagnostic output looks like:
+#
+#   DIAG src.Fields[0x0E070003]   = 0x0001 (UNSENT=False, READ=True, ...)
+#   DIAG dst after Items.Add      = 0x0009 (UNSENT=True, ...)
+#   DIAG dst after CopyTo         = 0x0001 (UNSENT=False, ...)
+#   DIAG dst after Sent=true      = 0x0001
+#   DIAG dst after Fields write   = 0x0001
+#   DIAG dst after Save()         = 0x0009 (UNSENT=True)   <- server overrode!
+#
+# That last line is the smoking gun if Exchange Online is force-setting
+# UNSENT during the new-message save.  If the line shows UNSENT=False
+# then the COPY path is working and the verify pass is wrong.
+$script:_diagShown = $false
+function Format-MessageFlags {
+    param([int]$Flags)
+    $bits = New-Object 'System.Collections.Generic.List[string]'
+    if ($Flags -band 0x01) { [void]$bits.Add('READ') }
+    if ($Flags -band 0x02) { [void]$bits.Add('UNMOD') }
+    if ($Flags -band 0x04) { [void]$bits.Add('SUBMIT') }
+    if ($Flags -band 0x08) { [void]$bits.Add('UNSENT') }
+    if ($Flags -band 0x10) { [void]$bits.Add('HASATTACH') }
+    if ($Flags -band 0x20) { [void]$bits.Add('FROMME') }
+    if ($Flags -band 0x40) { [void]$bits.Add('ASSOC') }
+    if ($Flags -band 0x80) { [void]$bits.Add('RESEND') }
+    if ($bits.Count -eq 0) { 'none' } else { $bits -join '|' }
+}
+
 function Clear-UnsentBitViaRedemptionCopy {
     <#
     .SYNOPSIS  Clear MSGFLAG_UNSENT by recreating the message.
@@ -343,6 +378,9 @@ function Clear-UnsentBitViaRedemptionCopy {
         [Parameter()] [ref]$NewEntryId
     )
 
+    $tagInt = 0x0E070003
+    $diag   = -not $script:_diagShown
+
     $src    = $null
     $folder = $null
     $dst    = $null
@@ -359,48 +397,133 @@ function Clear-UnsentBitViaRedemptionCopy {
         $msgClass = 'IPM.Note'
         try { if ($src.MessageClass) { $msgClass = $src.MessageClass } } catch { }
 
+        if ($diag) {
+            Write-Host '' -ForegroundColor Yellow
+            Write-Host '==== DIAG: first copy-and-replace; logging every flag write ====' -ForegroundColor Yellow
+            Write-Host ("DIAG src.MessageClass = '{0}'" -f $msgClass) -ForegroundColor Yellow
+            try {
+                $f0 = [int]$src.Fields.Item($tagInt)
+                Write-Host ("DIAG src.Fields[0x0E070003]   = 0x{0:X4}  ({1})" -f $f0, (Format-MessageFlags $f0)) -ForegroundColor Yellow
+            } catch {
+                Write-Host "DIAG src.Fields read failed: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+
         # Items.Add returns an RDOMail that has NOT been saved yet.  Until
         # the first Save(), we own all of its properties including
         # PR_MESSAGE_FLAGS.
         $dst = $folder.Items.Add($msgClass)
         if (-not $dst) { return 'failed' }
+        if ($diag) {
+            try {
+                $f1 = [int]$dst.Fields.Item($tagInt)
+                Write-Host ("DIAG dst after Items.Add      = 0x{0:X4}  ({1})" -f $f1, (Format-MessageFlags $f1)) -ForegroundColor Yellow
+            } catch {
+                Write-Host "DIAG dst.Fields read after Items.Add failed: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
 
         # CopyTo against an IMessage destination copies properties without
         # saving.  Redemption excludes the identity / instance properties
         # automatically, so we don't have to enumerate an exclusion list.
         $src.CopyTo($dst)
+        if ($diag) {
+            try {
+                $f2 = [int]$dst.Fields.Item($tagInt)
+                Write-Host ("DIAG dst after CopyTo         = 0x{0:X4}  ({1})" -f $f2, (Format-MessageFlags $f2)) -ForegroundColor Yellow
+            } catch { }
+        }
 
-        # Critical: clear the UNSENT bit BEFORE the first save.  Once
-        # SaveChanges runs, the server takes over PR_MESSAGE_FLAGS and
-        # we're back at the silent-no-op wall.
-        $dst.Sent = $true
+        # Belt + suspenders: try BOTH ways to clear UNSENT before the
+        # first save.
+        #
+        #   (a) RDOMail.Sent = $true           -- Redemption's high-level
+        #                                         wrapper for clearing
+        #                                         MSGFLAG_UNSENT.
+        #   (b) Fields[0x0E070003] = explicit  -- direct Extended MAPI
+        #                                         property write, in
+        #                                         case (a) is a no-op
+        #                                         on this Redemption
+        #                                         build.
+        try { $dst.Sent = $true } catch {
+            if ($diag) { Write-Host "DIAG dst.Sent = `$true threw: $($_.Exception.Message)" -ForegroundColor Red }
+        }
+        if ($diag) {
+            try {
+                $f3 = [int]$dst.Fields.Item($tagInt)
+                Write-Host ("DIAG dst after Sent=`$true     = 0x{0:X4}  ({1})" -f $f3, (Format-MessageFlags $f3)) -ForegroundColor Yellow
+            } catch { }
+        }
+
+        try {
+            $current = [int]$dst.Fields.Item($tagInt)
+            $newVal  = $current -band (-bnot $script:MSGFLAG_UNSENT)
+            $dst.Fields.Item($tagInt) = $newVal
+        } catch {
+            if ($diag) { Write-Host "DIAG dst.Fields write threw: $($_.Exception.Message)" -ForegroundColor Red }
+        }
+        if ($diag) {
+            try {
+                $f4 = [int]$dst.Fields.Item($tagInt)
+                Write-Host ("DIAG dst after Fields write   = 0x{0:X4}  ({1})" -f $f4, (Format-MessageFlags $f4)) -ForegroundColor Yellow
+            } catch { }
+        }
 
         $dst.Save()
+        if ($diag) {
+            try {
+                $f5 = [int]$dst.Fields.Item($tagInt)
+                Write-Host ("DIAG dst after Save() inproc  = 0x{0:X4}  ({1})" -f $f5, (Format-MessageFlags $f5)) -ForegroundColor Yellow
+            } catch { }
+            # Re-open via EntryID so we read the SERVER's state, not the
+            # in-process RDOMail's cached property bag.  This is the
+            # ground truth.
+            try {
+                $newEid = $dst.EntryID
+                $reopen = $RdoSession.GetMessageFromID($newEid, $StoreId)
+                if ($reopen) {
+                    $f6 = [int]$reopen.Fields.Item($tagInt)
+                    $color = if ($f6 -band $script:MSGFLAG_UNSENT) { 'Red' } else { 'Green' }
+                    Write-Host ("DIAG dst RE-FETCH from store = 0x{0:X4}  ({1})  <-- ground truth" -f $f6, (Format-MessageFlags $f6)) -ForegroundColor $color
+                } else {
+                    Write-Host 'DIAG could not re-fetch new message via GetMessageFromID' -ForegroundColor Red
+                }
+            } catch {
+                Write-Host "DIAG re-fetch failed: $($_.Exception.Message)" -ForegroundColor Red
+            }
+            Write-Host '==== /DIAG ====' -ForegroundColor Yellow
+            Write-Host '' -ForegroundColor Yellow
+            $script:_diagShown = $true
+        }
     } catch {
         Write-Verbose ("RDO copy-replace failed for {0}: {1}" -f $EntryId, $_.Exception.Message)
         return 'failed'
     }
 
-    # Verify the bit is actually clear on the freshly-saved item.  Read
-    # PR_MESSAGE_FLAGS directly via Redemption's Fields collection so we
-    # don't have to round-trip through OOM and a fresh GetItemFromID.
+    # Verify by RE-FETCHING the new message via its EntryID (the
+    # in-process $dst's property bag can lag behind the server).
     $verified = $false
+    $newEid   = $null
     try {
-        $tagInt = 0x0E070003
-        $after = [int]$dst.Fields.Item($tagInt)
-        if (($after -band $script:MSGFLAG_UNSENT) -eq 0) { $verified = $true }
+        $newEid = $dst.EntryID
+        $reopen = $RdoSession.GetMessageFromID($newEid, $StoreId)
+        if ($reopen) {
+            $after = [int]$reopen.Fields.Item($tagInt)
+            if (($after -band $script:MSGFLAG_UNSENT) -eq 0) { $verified = $true }
+        }
     } catch {
         Write-Verbose ("RDO verify of new copy failed for {0}: {1}" -f $EntryId, $_.Exception.Message)
     }
 
     if (-not $verified) {
-        # Server somehow set UNSENT during Save() despite our pre-save clear.
-        # Don't delete the source -- caller will count this as 'noop'.
+        # Server set UNSENT during Save() despite our pre-save clear.
+        # Don't delete the source -- caller will count this as 'noop' and
+        # we'll still have the original to investigate / re-import.
         return 'noop'
     }
 
-    if ($PSBoundParameters.ContainsKey('NewEntryId')) {
-        try { $NewEntryId.Value = $dst.EntryID } catch { }
+    if ($PSBoundParameters.ContainsKey('NewEntryId') -and $newEid) {
+        try { $NewEntryId.Value = $newEid } catch { }
     }
 
     # Source recreation succeeded; delete the original so the user sees
@@ -645,7 +768,12 @@ function Fix-FolderItems {
     $fixProgressEvery = 50
     $fixedSoFar = 0
     $silentNoop = 0
+    $cap = $script:MaxItemsCap
     foreach ($eid in $entryIds) {
+        if ($cap -gt 0 -and $fixedSoFar -ge $cap) {
+            Write-Host ("    -MaxItems cap ({0}) reached; stopping early." -f $cap) -ForegroundColor Yellow
+            break
+        }
         $fixedSoFar++
         try {
             $itm = $null
@@ -1037,6 +1165,8 @@ function Main {
     } else {
         Write-Warning "-NoRedemption specified; using the broken OOM path as a control test."
     }
+
+    $script:MaxItemsCap = [int]$MaxItems
 
     $results = New-Object 'System.Collections.Generic.List[pscustomobject]'
     foreach ($upn in $script:Mailbox) {
