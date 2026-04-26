@@ -312,30 +312,38 @@ function Get-RedemptionSession {
 # then the COPY path is working and the verify pass is wrong.
 $script:_diagShown = $false
 
-# PowerShell can NOT invoke a parameterized COM property via the
-# obvious `.Fields.Item($tag)` syntax -- it resolves `.Fields.Item`
-# to a PSParameterizedProperty wrapper and then complains that the
-# wrapper has no method named 'Item'.  The workaround is reflection
-# through System.__ComObject.InvokeMember, which dispatches via
-# IDispatch the way VBA / VBScript would.
+# Redemption registers RDOMail.Fields as a *parameterized property*
+# at the IDispatch level: callable as `mail.Fields(propTag)` rather
+# than as a property that returns a collection.  PowerShell exposes
+# such properties as System.Management.Automation.PSParameterizedProperty.
+# That means:
+#   - `$mail.Fields.Item($tag)` fails -- PSParameterizedProperty has
+#                                        no Item method.
+#   - `$mail.Fields.GetType().InvokeMember('Item', ...)` also fails
+#                                        for the same reason.
+# The two ways that *do* work are:
+#   1. `$mail.Fields.Invoke($tag)` -- calls the get accessor through
+#                                     the PSParameterizedProperty
+#                                     wrapper.
+#   2. `$mail.GetType().InvokeMember('Fields', GetProperty, ..., @($tag))`
+#                                  -- treats Fields as the indexed
+#                                     property of the parent RDOMail
+#                                     and dispatches through its
+#                                     IDispatch.  This is the only
+#                                     option for the SET path
+#                                     (PSParameterizedProperty has
+#                                     no settable Invoke).
 #
-# Both helpers accept either an int property tag (0x0E070003) OR a
-# DASL string ("http://schemas.microsoft.com/mapi/proptag/0x0E070003")
-# -- Redemption's RDOFields collection supports both.
+# Both helpers accept either an int prop tag (0x0E070003) OR a DASL
+# string ("http://schemas.microsoft.com/mapi/proptag/0x0E070003")
+# -- Redemption supports both index types.
 function Get-RdoMailField {
     [OutputType([object])]
     param(
         [Parameter(Mandatory)]$Mail,
         [Parameter(Mandatory)]$Key
     )
-    $fields = $Mail.Fields
-    return $fields.GetType().InvokeMember(
-        'Item',
-        [System.Reflection.BindingFlags]::GetProperty,
-        $null,
-        $fields,
-        @([object]$Key)
-    )
+    return $Mail.Fields.Invoke([object]$Key)
 }
 
 function Set-RdoMailField {
@@ -344,12 +352,11 @@ function Set-RdoMailField {
         [Parameter(Mandatory)]$Key,
         [Parameter(Mandatory)]$Value
     )
-    $fields = $Mail.Fields
-    [void]$fields.GetType().InvokeMember(
-        'Item',
+    [void]$Mail.GetType().InvokeMember(
+        'Fields',
         [System.Reflection.BindingFlags]::SetProperty,
         $null,
-        $fields,
+        $Mail,
         @([object]$Key, [object]$Value)
     )
 }
