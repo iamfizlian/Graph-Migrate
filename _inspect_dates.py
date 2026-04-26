@@ -163,17 +163,20 @@ def main() -> int:
             for m in messages:
                 smtp_dates[m["id"]] = fetch_smtp_date_header(graph, ns.mailbox, m["id"])
 
+    def flag(v: object) -> str:
+        # Compact yes/no/? for boolean columns. Helps spot isDraft=true at a glance.
+        if v is True:
+            return "yes"
+        if v is False:
+            return "no"
+        return "?"
+
     print()
-    if ns.smtp:
-        hdr = (
-            f"{'subject':<40} {'sentDateTime':<22} {'receivedDateTime':<22} "
-            f"{'lastModifiedDateTime':<22} {'created':<22} {'SMTP Date:':<32}"
-        )
-    else:
-        hdr = (
-            f"{'subject':<40} {'sentDateTime':<22} {'receivedDateTime':<22} "
-            f"{'lastModifiedDateTime':<22} {'created':<22}"
-        )
+    base_hdr = (
+        f"{'subject':<40} {'sentDateTime':<22} {'receivedDateTime':<22} "
+        f"{'lastMod':<22} {'created':<22} {'draft':<5} {'read':<5}"
+    )
+    hdr = base_hdr + (f" {'SMTP Date:':<32}" if ns.smtp else "")
     print(hdr)
     print("-" * len(hdr))
 
@@ -184,7 +187,9 @@ def main() -> int:
             f"{fmt(m.get('sentDateTime'), 22)} "
             f"{fmt(m.get('receivedDateTime'), 22)} "
             f"{fmt(m.get('lastModifiedDateTime'), 22)} "
-            f"{fmt(m.get('createdDateTime'), 22)}"
+            f"{fmt(m.get('createdDateTime'), 22)} "
+            f"{flag(m.get('isDraft')):<5} "
+            f"{flag(m.get('isRead')):<5}"
         )
         if ns.smtp:
             row += f" {fmt(smtp_dates.get(m['id']), 32)}"
@@ -192,12 +197,17 @@ def main() -> int:
 
     print()
     print(
-        "If 'sentDateTime'/'receivedDateTime'/SMTP Date are old but "
-        "'lastModifiedDateTime' is today, the messages themselves are\n"
-        "fine -- only the modified-stamp moved. If receivedDateTime is "
-        "today/future while SMTP Date is old, something rewrote the\n"
-        "receive time during import. If SMTP Date itself is today/future, "
-        "the PST source had bad metadata."
+        "How to read this:\n"
+        "  draft=yes -> Graph reports isDraft=true; OWA shows the message in "
+        "Drafts and adds 'Draft' badges in regular folders. Run\n"
+        "             _fix_drafts.py to clear it.\n"
+        "  sent/received/SMTP Date all old, lastMod=today -> messages are "
+        "fine; lastMod just bumped on the most recent move. OWA may\n"
+        "             still display a 'modified' column if the mailbox view "
+        "is customized.\n"
+        "  receivedDateTime=today/future, SMTP Date=old -> something "
+        "rewrote the receive time during import.\n"
+        "  SMTP Date itself today/future -> the PST source had bad metadata."
     )
     return 0
 
