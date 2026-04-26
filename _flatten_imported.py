@@ -196,19 +196,36 @@ def list_message_page(
     return resp.json().get("value", [])
 
 
-def iter_all_messages(graph: GraphClient, mailbox: str, folder_id: str):
-    """Yield every message in a folder (paged), with dedup fields populated."""
-    path = (
-        f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"
-        f"?$top=999&$select=id,subject,sentDateTime,from"
-    )
-    while path:
-        resp = graph.get(path, expect_status=(200,))
-        body = resp.json()
-        for m in body.get("value", []):
-            yield m
-        next_link = body.get("@odata.nextLink")
-        path = _strip_base(next_link) if next_link else None
+def iter_all_messages(
+    graph: GraphClient,
+    mailbox: str,
+    folder_id: str,
+    *,
+    include_hidden: bool = False,
+):
+    """Yield every message in a folder (paged), with dedup fields populated.
+
+    Graph's /messages endpoint defaults to excluding isHidden=true items
+    (rules-table fragments, IPM.Configuration messages, recall reports,
+    etc. that some PST importers drop into folders). Those still count
+    toward totalItemCount, so without an explicit hidden pass a 'visible'
+    drain leaves the source folder non-empty and we refuse to delete it.
+    Pass `include_hidden=True` to additionally yield those items via a
+    separate filtered query.
+    """
+    base = f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"
+    select = "$select=id,subject,sentDateTime,from"
+    queries = [f"{base}?$top=999&{select}"]
+    if include_hidden:
+        queries.append(f"{base}?$top=999&{select}&$filter=isHidden eq true")
+    for path in queries:
+        while path:
+            resp = graph.get(path, expect_status=(200,))
+            body = resp.json()
+            for m in body.get("value", []):
+                yield m
+            next_link = body.get("@odata.nextLink")
+            path = _strip_base(next_link) if next_link else None
 
 
 def move_message(graph: GraphClient, mailbox: str, msg_id: str, dest_id: str) -> None:
@@ -517,26 +534,40 @@ def execute_merge(
         # skip messages that collide with the *original* destination
         # content, not with messages we just moved this run (otherwise
         # PST-internal cross-folder dups would silently get dropped).
-        all_msgs = list(iter_all_messages(graph, mailbox, src_id))
+        all_msgs = list(iter_all_messages(graph, mailbox, src_id, include_hidden=True))
         for m in all_msgs:
             k = fuzzy_key(m)
             if dedup.has(k):
                 dedup.skipped += 1
                 continue
-            move_message(graph, mailbox, m["id"], dst_id)
-            moved += 1
-            if moved and moved % 200 == 0:
-                log.info("{}{!r}: moved {} messages so far", indent, src_path, moved)
-    else:
-        while True:
-            msgs = list_message_page(graph, mailbox, src_id, with_dedup_fields=False)
-            if not msgs:
-                break
-            for m in msgs:
+            try:
                 move_message(graph, mailbox, m["id"], dst_id)
                 moved += 1
                 if moved and moved % 200 == 0:
                     log.info("{}{!r}: moved {} messages so far", indent, src_path, moved)
+            except GraphError as e:
+                subj = (m.get("subject") or "(no subject)")[:80]
+                log.warning(
+                    "{}{!r}: could not move item {!r} ({}); leaving in place.",
+                    indent, src_path, subj, e.status,
+                )
+    else:
+        # Snapshot first (visible + hidden), then move. See iter_all_messages
+        # docstring for why we explicitly drain hidden items, and the dedup
+        # branch above for why snapshot-then-move avoids pagination drift.
+        all_msgs = list(iter_all_messages(graph, mailbox, src_id, include_hidden=True))
+        for m in all_msgs:
+            try:
+                move_message(graph, mailbox, m["id"], dst_id)
+                moved += 1
+                if moved and moved % 200 == 0:
+                    log.info("{}{!r}: moved {} messages so far", indent, src_path, moved)
+            except GraphError as e:
+                subj = (m.get("subject") or "(no subject)")[:80]
+                log.warning(
+                    "{}{!r}: could not move item {!r} ({}); leaving in place.",
+                    indent, src_path, subj, e.status,
+                )
 
     # ------ subfolders ------
     subs = 0
@@ -728,24 +759,36 @@ def flatten_mailbox(
         moved_loose = 0
         if dedup is not None:
             # Snapshot first; see comment in execute_merge for why.
-            for m in list(iter_all_messages(graph, mailbox, imported["id"])):
+            for m in list(iter_all_messages(graph, mailbox, imported["id"], include_hidden=True)):
                 if dedup.has(fuzzy_key(m)):
                     dedup.skipped += 1
                     continue
-                move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
-                moved_loose += 1
-                if moved_loose % 200 == 0:
-                    log.info("  '{}' (loose root items): moved {} so far", ROOT_FOLDER_NAME, moved_loose)
-        else:
-            while True:
-                msgs = list_message_page(graph, mailbox, imported["id"], with_dedup_fields=False)
-                if not msgs:
-                    break
-                for m in msgs:
+                try:
                     move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
                     moved_loose += 1
                     if moved_loose % 200 == 0:
                         log.info("  '{}' (loose root items): moved {} so far", ROOT_FOLDER_NAME, moved_loose)
+                except GraphError as e:
+                    subj = (m.get("subject") or "(no subject)")[:80]
+                    log.warning(
+                        "  '{}' (loose root items): could not move {!r} ({}); leaving.",
+                        ROOT_FOLDER_NAME, subj, e.status,
+                    )
+        else:
+            # Snapshot (visible + hidden) then move, same reasoning as in
+            # execute_merge's non-dedup branch.
+            for m in list(iter_all_messages(graph, mailbox, imported["id"], include_hidden=True)):
+                try:
+                    move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
+                    moved_loose += 1
+                    if moved_loose % 200 == 0:
+                        log.info("  '{}' (loose root items): moved {} so far", ROOT_FOLDER_NAME, moved_loose)
+                except GraphError as e:
+                    subj = (m.get("subject") or "(no subject)")[:80]
+                    log.warning(
+                        "  '{}' (loose root items): could not move {!r} ({}); leaving.",
+                        ROOT_FOLDER_NAME, subj, e.status,
+                    )
         item_moves += moved_loose
 
     for action in actions:

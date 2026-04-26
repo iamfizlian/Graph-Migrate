@@ -103,6 +103,42 @@ def list_message_page(graph: GraphClient, mailbox: str, folder_id: str) -> list[
     return resp.json().get("value", [])
 
 
+def snapshot_all_message_ids(
+    graph: GraphClient,
+    mailbox: str,
+    folder_id: str,
+    *,
+    hidden_only: bool = False,
+) -> list[dict]:
+    """Page through every message in the folder once and return [{id, subject}, ...].
+
+    Snapshotting up front (instead of re-listing after each move) avoids two
+    classes of bug:
+      - pagination drift, where moving items shifts the page window and we
+        skip or revisit messages
+      - infinite loops, where a silently-failing move would leave the same
+        item visible on page 1 forever
+
+    Pass `hidden_only=True` to enumerate items with isHidden=true. By default
+    Graph's /messages endpoint excludes those, but they still count toward
+    totalItemCount; some PST importers leave behind rules-table fragments,
+    IPM.Configuration messages, or recall reports as hidden items.
+    """
+    flt = "&$filter=isHidden eq true" if hidden_only else ""
+    path = (
+        f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"
+        f"?$top={PAGE_SIZE}&$select=id,subject{flt}"
+    )
+    out: list[dict] = []
+    while path:
+        resp = graph.get(path, expect_status=(200,))
+        body = resp.json()
+        out.extend(body.get("value", []))
+        next_link = body.get("@odata.nextLink")
+        path = _strip_base(next_link) if next_link else None
+    return out
+
+
 def get_folder(graph: GraphClient, mailbox: str, folder_id: str) -> dict:
     path = (
         f"/users/{quote(mailbox)}/mailFolders/{folder_id}"
@@ -196,16 +232,34 @@ def consolidate_subtree_into_sent(
     moved = 0
 
     if not dry_run:
-        # Move messages directly in this folder.
-        while True:
-            msgs = list_message_page(graph, mailbox, folder["id"])
-            if not msgs:
-                break
+        # Two passes: first visible messages (the default for GET /messages),
+        # then explicitly hidden ones. Hidden items are MAPI artifacts that
+        # don't appear in the default listing but DO count toward
+        # totalItemCount, so without this second pass delete_folder_if_empty
+        # would always refuse to clean up the source.
+        for hidden_only in (False, True):
+            msgs = snapshot_all_message_ids(
+                graph, mailbox, folder["id"], hidden_only=hidden_only,
+            )
+            if hidden_only and msgs:
+                log.info(
+                    "  {!r}: also moving {} hidden item(s) (rules/config artifacts).",
+                    src_path, len(msgs),
+                )
             for m in msgs:
-                move_message(graph, mailbox, m["id"], sent_items_id)
-                moved += 1
-                if moved % 200 == 0:
-                    log.info("  {!r}: moved {} messages so far", src_path, moved)
+                try:
+                    move_message(graph, mailbox, m["id"], sent_items_id)
+                    moved += 1
+                    if moved % 200 == 0:
+                        log.info("  {!r}: moved {} messages so far", src_path, moved)
+                except GraphError as e:
+                    subj = (m.get("subject") or "(no subject)")[:80]
+                    log.warning(
+                        "  {!r}: could not move {}item {!r} ({}); leaving in place.",
+                        src_path,
+                        "hidden " if hidden_only else "",
+                        subj, e.status,
+                    )
     else:
         moved += int(folder.get("totalItemCount") or 0)
 
