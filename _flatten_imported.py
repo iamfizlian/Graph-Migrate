@@ -174,32 +174,34 @@ def plan_merge(
     log,
     depth: int,
 ) -> tuple[int, int]:
-    """Walk and log the full merge plan for `src` -> `dst` recursively.
+    """Walk subfolders of `src` and log the plan for each, recursively.
 
-    Returns (planned_messages, planned_folders) for stats. Pure logging,
-    no side effects beyond the GET requests needed to walk the tree.
+    The caller is responsible for logging the src -> dst header line for
+    `src` itself; this function only emits lines for sub-entries.
+
+    Returns (planned_messages, planned_folders) where folders counts
+    src plus all descendant folders. Pure logging — no side effects
+    beyond the GET requests needed to walk the tree.
     """
     indent = "  " * depth
-    src_items = int(src.get("totalItemCount") or 0)
-    src_subs = int(src.get("childFolderCount") or 0)
-    log.info(
-        "{}[merge]  {!r} ({} items, {} subfolders) -> {!r}",
-        indent, src["displayName"], src_items, src_subs, dst_path,
-    )
-
-    msgs = src_items
-    folders = 1
+    msgs = int(src.get("totalItemCount") or 0)
+    folders = 1  # the src folder itself
     for sub in list_child_folders(graph, mailbox, src["id"]):
         existing = find_child_named(graph, mailbox, dst["id"], sub["displayName"])
         sub_path = f"{dst_path}/{sub['displayName']}"
+        sub_items = int(sub.get("totalItemCount") or 0)
+        sub_subs = int(sub.get("childFolderCount") or 0)
         if existing:
+            log.info(
+                "{}[merge]  {!r} ({} items, {} subfolders) -> {!r}",
+                indent, sub["displayName"], sub_items, sub_subs, sub_path,
+            )
             sm, sf = plan_merge(graph, mailbox, sub, existing, sub_path, log=log, depth=depth + 1)
             msgs += sm
             folders += sf
         else:
-            sub_items = int(sub.get("totalItemCount") or 0)
             log.info(
-                "{}  [move]   {!r} ({} items) -> {!r} (new, single folder-move)",
+                "{}[move]   {!r} ({} items) -> {!r} (new, single folder-move)",
                 indent, sub["displayName"], sub_items, sub_path,
             )
             msgs += sub_items
