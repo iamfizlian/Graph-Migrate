@@ -121,9 +121,25 @@ class DedupIndex:
 # Order matters; first match wins.
 
 
+# Known aliases for the canonical Sent Items folder used by various clients.
+# Outlook -> "Sent Items" / "Sentitems"
+# Apple Mail / older IMAP -> "Sent Messages"
+# Gmail (default IMAP mapping) -> "Sent Mail"
+# IMAP RFC / many MUAs -> "Sent"
+# We deliberately do NOT match arbitrary "Sent <something>" names because
+# users do create folders like "Sent To Auditor" or "Sent - Q3 Reports" that
+# should NOT be silently merged into Sent Items.
+_SENT_VARIANT_NAMES = frozenset({
+    "sent",
+    "sent items",
+    "sentitems",
+    "sent mail",
+    "sent messages",
+})
+
+
 def _is_sent_variant(name: str) -> bool:
-    n = name.strip().lower()
-    return n == "sent" or n == "sentitems" or n.startswith("sent ")
+    return (name or "").strip().lower() in _SENT_VARIANT_NAMES
 
 
 WELL_KNOWN_RULES: list[tuple] = [

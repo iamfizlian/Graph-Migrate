@@ -12,13 +12,18 @@ folder. This script consolidates them.
 
 Detection rule (intentionally narrow):
 
-  - Walk every folder in the mailbox.
-  - For each folder whose displayName matches a 'Sent' variant
-    (matches _is_sent_variant from the flatten script: 'sent',
-    'sentitems', or any name starting with 'sent ')...
+  - Walk every folder in the mailbox EXCEPT the 'Imported PST' subtree
+    (handled by _flatten_imported.py) and the 'Deleted Items' subtree
+    (the user's trash; leave it alone).
+  - For each folder whose displayName is one of the well-known sent
+    aliases ('Sent', 'Sent Items', 'Sentitems', 'Sent Mail',
+    'Sent Messages')...
   - ...EXCEPT the actual well-known 'sentitems' folder itself...
   - ...move every message in it (and its subtree) into the live
     Sent Items folder, then delete the (now-empty) source.
+
+User-created folders with arbitrary 'Sent <something>' names (e.g.
+'Sent To Auditor', 'Sent - Q3 Reports') are NOT touched.
 
 Read-only by default (--dry-run). All GETs + POST /move + DELETE only.
 
@@ -45,10 +50,28 @@ from jtet_pstmigrate.orchestrator import load_mapping
 
 PAGE_SIZE = 100
 
+# Top-level folder names whose entire subtree we deliberately ignore:
+#  - Imported PST: flatten handles those Sent variants via WELL_KNOWN_RULES
+#    (recursive since 53a66a0). Doing it here too would race with flatten
+#    and pull messages out of folders the user is mid-migrating.
+#  - Deleted Items: that's the user's trash. If they soft-deleted Imported PST
+#    or some old Sent-named folder, leave it where it is.
+SKIP_TOP_LEVEL = frozenset({"Imported PST", "Deleted Items"})
+
+# Known aliases for the canonical Sent Items folder. See the matching
+# comment in _flatten_imported.py for why this is a closed set rather than
+# a "Sent <anything>" prefix match.
+_SENT_VARIANT_NAMES = frozenset({
+    "sent",
+    "sent items",
+    "sentitems",
+    "sent mail",
+    "sent messages",
+})
+
 
 def _is_sent_variant(name: str) -> bool:
-    n = (name or "").strip().lower()
-    return n == "sent" or n == "sentitems" or n.startswith("sent ")
+    return (name or "").strip().lower() in _SENT_VARIANT_NAMES
 
 
 def _strip_base(url: str) -> str:
@@ -130,10 +153,16 @@ def find_misplaced_sent_folders(
     graph: GraphClient,
     mailbox: str,
     sent_items_id: str,
+    *,
+    skip_top_level: frozenset[str] = SKIP_TOP_LEVEL,
 ) -> list[tuple[dict, str]]:
     """Return [(folder, breadcrumb_path)] for every folder in the mailbox
     whose name matches the sent-variant predicate, EXCEPT the canonical
     Sent Items folder itself.
+
+    Top-level folders whose displayName is in `skip_top_level` are not
+    descended into at all -- by default that excludes 'Imported PST'
+    (handled by flatten) and 'Deleted Items' (the user's trash).
     """
     found: list[tuple[dict, str]] = []
 
@@ -146,6 +175,8 @@ def find_misplaced_sent_folders(
                 walk(sub, path)
 
     for top in list_child_folders(graph, mailbox, "msgFolderRoot"):
+        if top.get("displayName") in skip_top_level:
+            continue
         walk(top, "")
     return found
 
