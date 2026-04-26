@@ -339,6 +339,31 @@ def resolve_top_level_target(graph: GraphClient, mailbox: str, child_name: str) 
     return find_child_named(graph, mailbox, "msgFolderRoot", child_name)
 
 
+def resolve_subfolder_target(
+    graph: GraphClient,
+    mailbox: str,
+    parent_dst_id: str,
+    child_name: str,
+) -> tuple[dict | None, bool]:
+    """Decide where a NESTED Imported PST subfolder should merge into.
+
+    Same WELL_KNOWN_RULES are applied as at the top level (so a 'Sent'
+    folder buried inside, say, Imported PST/Inbox/Sent ends up in the
+    live Sent Items folder, not as a stranded Inbox/Sent subfolder).
+
+    Returns (target_folder_dict_or_None, was_well_known_rule). If the
+    second value is True the caller should NOT later try to delete the
+    promoted folder via `parent_dst_id` -- the messages went to a
+    well-known folder elsewhere in the mailbox.
+    """
+    for predicate, well_known in WELL_KNOWN_RULES:
+        if predicate(child_name):
+            wk = get_well_known_folder(graph, mailbox, well_known)
+            if wk is not None:
+                return wk, True
+    return find_child_named(graph, mailbox, parent_dst_id, child_name), False
+
+
 def recursive_item_count(graph: GraphClient, mailbox: str, folder: dict) -> int:
     """Sum totalItemCount across `folder` and all its descendants.
 
@@ -379,19 +404,34 @@ def plan_merge(
     msgs = int(src.get("totalItemCount") or 0)
     folders = 1  # the src folder itself
     for sub in list_child_folders(graph, mailbox, src["id"]):
-        existing = find_child_named(graph, mailbox, dst["id"], sub["displayName"])
-        sub_path = f"{dst_path}/{sub['displayName']}"
+        existing, via_well_known = resolve_subfolder_target(
+            graph, mailbox, dst["id"], sub["displayName"],
+        )
         sub_items = int(sub.get("totalItemCount") or 0)
         sub_subs = int(sub.get("childFolderCount") or 0)
         if existing:
-            log.info(
-                "{}[merge]  {!r} ({} items, {} subfolders) -> {!r}",
-                indent, sub["displayName"], sub_items, sub_subs, sub_path,
-            )
-            sm, sf = plan_merge(graph, mailbox, sub, existing, sub_path, log=log, depth=depth + 1)
+            if via_well_known:
+                # The subfolder name matches a well-known rule (e.g. 'Sent'
+                # nested under Inbox -> live Sent Items). Show the actual
+                # destination, not "<dst_path>/<name>", so the user sees
+                # the redirection in the dry-run.
+                wk_path = existing.get("displayName", "?")
+                log.info(
+                    "{}[merge*] {!r} ({} items, {} subfolders) -> {!r} (well-known rule)",
+                    indent, sub["displayName"], sub_items, sub_subs, wk_path,
+                )
+                sm, sf = plan_merge(graph, mailbox, sub, existing, wk_path, log=log, depth=depth + 1)
+            else:
+                sub_path = f"{dst_path}/{sub['displayName']}"
+                log.info(
+                    "{}[merge]  {!r} ({} items, {} subfolders) -> {!r}",
+                    indent, sub["displayName"], sub_items, sub_subs, sub_path,
+                )
+                sm, sf = plan_merge(graph, mailbox, sub, existing, sub_path, log=log, depth=depth + 1)
             msgs += sm
             folders += sf
         else:
+            sub_path = f"{dst_path}/{sub['displayName']}"
             if sub_subs > 0:
                 deep = recursive_item_count(graph, mailbox, sub)
                 log.info(
@@ -485,9 +525,16 @@ def execute_merge(
     # ------ subfolders ------
     subs = 0
     for sub in list_child_folders(graph, mailbox, src_id):
-        existing = find_child_named(graph, mailbox, dst_id, sub["displayName"])
+        existing, via_well_known = resolve_subfolder_target(
+            graph, mailbox, dst_id, sub["displayName"],
+        )
         sub_path = f"{src_path}/{sub['displayName']}"
         if existing:
+            if via_well_known:
+                log.info(
+                    "{}redirecting {!r} -> {!r} (well-known rule)",
+                    indent, sub_path, existing.get("displayName", "?"),
+                )
             sm, ss = execute_merge(
                 graph, mailbox, sub, existing["id"],
                 src_path=sub_path, log=log, depth=depth + 1, dedup=dedup,
