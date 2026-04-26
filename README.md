@@ -531,6 +531,92 @@ Resume is per-(mailbox, PST), so it is safe to migrate a single mailbox now,
 then come back later and run the full mapping — the canary's already-imported
 messages will be skipped.
 
+## Post-import remediation: clearing stuck "draft" flags
+
+PSTs imported through the Microsoft Graph mail API (this tool, plus every
+other Graph-based migrator we've tested) land each message with the MAPI
+`MSGFLAG_UNSENT` bit (0x08) of `PR_MESSAGE_FLAGS` set. In Outlook on the
+Web that surfaces as a "Draft" badge on every imported item and inflates
+the Drafts folder with hundreds of historical messages. Content is
+intact — it's a metadata-only problem — but the UX is wrong.
+
+We've empirically verified (commits `4cf2171`, `bfcea7f`, `0dc779d`)
+that **neither Microsoft Graph nor EWS can clear this flag** on Exchange
+Online: every documented write path (PATCH `isDraft`, PATCH the extended
+property, `/copy`, EWS `SetItemField`, `DeleteItemField`, multi-property
+updates, `CreateItem` from MIME) returns Success while leaving the bit
+unchanged. The cloud's MAPI store rejects the writes silently at a layer
+beneath the public API frontends.
+
+Outlook desktop talks to Exchange Online over **MAPI/HTTP**, a separate
+protocol from Graph and EWS, and on that path the property write is
+accepted. `Fix-DraftsViaOutlook.ps1` automates the fix.
+
+### One-time setup
+
+Grant the admin account that's signed in to Outlook FullAccess on every
+imported mailbox, with auto-mapping disabled so the mailboxes don't
+attach to the profile:
+
+```powershell
+Connect-ExchangeOnline
+$admin = "your-admin@jteatono365.onmicrosoft.com"
+Import-Csv .\mapping.csv | ForEach-Object {
+    Add-MailboxPermission -Identity $_.TargetMailbox -User $admin `
+        -AccessRights FullAccess -InheritanceType All `
+        -AutoMapping $false
+}
+```
+
+`-AutoMapping $false` matters; with it `$true` Outlook auto-attaches
+all 13 mailboxes to the admin's profile, slowing startup and cluttering
+the folder pane. We open them programmatically.
+
+### Fix one mailbox at a time first
+
+```powershell
+.\Fix-DraftsViaOutlook.ps1 `
+    -Mailbox allysonp@jteatono365.onmicrosoft.com -DryRun
+
+.\Fix-DraftsViaOutlook.ps1 `
+    -Mailbox allysonp@jteatono365.onmicrosoft.com
+
+.\.venv\Scripts\python.exe _inspect_dates.py -c config.toml `
+    --mailbox allysonp@jteatono365.onmicrosoft.com --folder sentitems --top 5
+```
+
+Expected after the second command: every row shows `draft=no` and
+`msgFlg=0x0411` (UNSENT bit cleared). Throughput is roughly 25 items/sec,
+so a mailbox with 485 stuck drafts finishes in well under a minute.
+
+### Then everything
+
+```powershell
+.\Fix-DraftsViaOutlook.ps1 -MappingFile .\mapping.csv
+```
+
+The script walks every mail folder in each mailbox except the well-known
+**Drafts**, **Deleted Items**, **Outbox**, and **Junk Email** folders
+(legitimate drafts there should stay drafts). It uses an Outlook
+`Items.Restrict` DASL filter so it only pulls items that actually have
+the UNSENT bit set, rather than iterating every message.
+
+### Diagnostic helpers (kept for posterity)
+
+These scripts proved Graph and EWS could not solve the problem and are
+preserved as evidence / future reference:
+
+- `_fix_drafts.py` — Graph PATCH attempt (returns 200 OK, no effect).
+- `_test_copy_strategy.py` — Graph `/copy` test (new copy is also a draft).
+- `_fix_drafts_ews.py` — EWS UpdateItem batch (reports Success, no effect).
+- `_test_ews_strategies.py` — five EWS write paths in one diagnostic;
+  table output for each.
+- `_test_ews_recreate.py` — EWS CreateItem from MIME into a non-Drafts
+  folder (new item is also a draft).
+- `_inspect_dates.py` — read-only inspector that prints `isDraft`,
+  `isRead`, `PR_MESSAGE_FLAGS`, and date columns. Use this after any
+  fix attempt to confirm whether the bit actually moved.
+
 ## How it works
 
 ```
@@ -639,3 +725,10 @@ actually balancing across the pool.
 logs/
   import_20260424_204500.jsonl  # structured per-event log
 ```
+
+## License
+
+`jtet-pstmigrate` is released under the [Apache License, Version 2.0](LICENSE).
+See [NOTICE](NOTICE) for third-party attribution and a note on the GPL boundary
+with the external `readpst` binary, which this project invokes but does not
+bundle or redistribute.
