@@ -196,36 +196,29 @@ def list_message_page(
     return resp.json().get("value", [])
 
 
-def iter_all_messages(
-    graph: GraphClient,
-    mailbox: str,
-    folder_id: str,
-    *,
-    include_hidden: bool = False,
-):
-    """Yield every message in a folder (paged), with dedup fields populated.
+def iter_all_messages(graph: GraphClient, mailbox: str, folder_id: str):
+    """Yield every (visible) message in a folder, paged, with dedup fields populated.
 
-    Graph's /messages endpoint defaults to excluding isHidden=true items
-    (rules-table fragments, IPM.Configuration messages, recall reports,
-    etc. that some PST importers drop into folders). Those still count
-    toward totalItemCount, so without an explicit hidden pass a 'visible'
-    drain leaves the source folder non-empty and we refuse to delete it.
-    Pass `include_hidden=True` to additionally yield those items via a
-    separate filtered query.
+    Note on residual items: Graph v1.0's /messages collection only exposes
+    IPM.Note items in the regular table. It does NOT expose Folder Associated
+    Information (FAI) items -- folder views, custom rules, search criteria,
+    forms -- which PST imports commonly carry. Those still count toward
+    mailFolder.totalItemCount, so after iterating this collection the source
+    folder may look non-empty by that metric. delete_folder_if_drained
+    handles that case at folder-delete time: as long as no visible messages
+    remain, the FAI residual goes away with the folder when we delete it.
     """
-    base = f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"
-    select = "$select=id,subject,sentDateTime,from"
-    queries = [f"{base}?$top=999&{select}"]
-    if include_hidden:
-        queries.append(f"{base}?$top=999&{select}&$filter=isHidden eq true")
-    for path in queries:
-        while path:
-            resp = graph.get(path, expect_status=(200,))
-            body = resp.json()
-            for m in body.get("value", []):
-                yield m
-            next_link = body.get("@odata.nextLink")
-            path = _strip_base(next_link) if next_link else None
+    path = (
+        f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"
+        f"?$top=999&$select=id,subject,sentDateTime,from"
+    )
+    while path:
+        resp = graph.get(path, expect_status=(200,))
+        body = resp.json()
+        for m in body.get("value", []):
+            yield m
+        next_link = body.get("@odata.nextLink")
+        path = _strip_base(next_link) if next_link else None
 
 
 def move_message(graph: GraphClient, mailbox: str, msg_id: str, dest_id: str) -> None:
@@ -296,13 +289,22 @@ def get_folder(graph: GraphClient, mailbox: str, folder_id: str) -> dict:
 
 
 def delete_folder_if_empty(graph: GraphClient, mailbox: str, folder_id: str) -> bool:
-    """Refetch the folder and only DELETE if it's truly empty.
+    """Refetch the folder and DELETE if it's effectively empty for the user.
 
     Why this exists: per Microsoft's docs, DELETE on a non-empty mailFolder
     succeeds and sends contents to Deleted Items. That's recoverable but not
     desirable - if we ever reach a delete step with a folder that still has
-    content (orphan messages, a partially-failed merge, etc.), we'd rather
-    leave it in place and let the user see the leftover than soft-delete it.
+    real user mail (orphan messages, a partially-failed merge, etc.), we'd
+    rather leave it in place and let the user see the leftover than
+    soft-delete it.
+
+    'Effectively empty' = no subfolders AND no visible messages. We allow
+    deletion when totalItemCount > 0 only if GET /messages returns nothing,
+    which means the residual is FAI (folder-associated information): folder
+    views, custom rules, search criteria, forms. Graph v1.0 doesn't enumerate
+    or move these individually -- they live in a parallel MAPI table -- but
+    they get cleaned up automatically when the folder itself is deleted.
+    PST imports very commonly leave FAI residual behind.
 
     Returns True if the folder was deleted, False if it was preserved.
     """
@@ -315,19 +317,47 @@ def delete_folder_if_empty(graph: GraphClient, mailbox: str, folder_id: str) -> 
 
     items = int(fresh.get("totalItemCount") or 0)
     subs = int(fresh.get("childFolderCount") or 0)
-    if items > 0 or subs > 0:
+    name = fresh.get("displayName")
+
+    if subs > 0:
         log.warning(
-            "Refusing to delete {!r}: still has {} items, {} subfolders. Re-run to clean up.",
-            fresh.get("displayName"), items, subs,
+            "Refusing to delete {!r}: still has {} subfolder(s). Re-run to clean up.",
+            name, subs,
         )
         return False
+
+    if items > 0:
+        # Verify those items aren't visible messages we missed.
+        visible_path = (
+            f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"
+            f"?$top=1&$select=id"
+        )
+        try:
+            visible_resp = graph.get(visible_path, expect_status=(200,))
+            visible = visible_resp.json().get("value", [])
+        except GraphError as e:
+            log.warning(
+                "Could not check {!r} for visible messages ({}); leaving it.",
+                name, e.status,
+            )
+            return False
+        if visible:
+            log.warning(
+                "Refusing to delete {!r}: still has visible message(s). Re-run to clean up.",
+                name,
+            )
+            return False
+        log.info(
+            "{!r}: {} residual FAI item(s) (rules/views/config) will be removed with the folder.",
+            name, items,
+        )
 
     path = f"/users/{quote(mailbox)}/mailFolders/{folder_id}"
     try:
         graph.delete(path, expect_status=(204,))
         return True
     except GraphError as e:
-        log.warning("Could not delete folder {} ({}); leaving it.", folder_id, e.status)
+        log.warning("Could not delete folder {!r} ({}); leaving it.", name, e.status)
         return False
 
 
@@ -534,7 +564,7 @@ def execute_merge(
         # skip messages that collide with the *original* destination
         # content, not with messages we just moved this run (otherwise
         # PST-internal cross-folder dups would silently get dropped).
-        all_msgs = list(iter_all_messages(graph, mailbox, src_id, include_hidden=True))
+        all_msgs = list(iter_all_messages(graph, mailbox, src_id))
         for m in all_msgs:
             k = fuzzy_key(m)
             if dedup.has(k):
@@ -555,7 +585,7 @@ def execute_merge(
         # Snapshot first (visible + hidden), then move. See iter_all_messages
         # docstring for why we explicitly drain hidden items, and the dedup
         # branch above for why snapshot-then-move avoids pagination drift.
-        all_msgs = list(iter_all_messages(graph, mailbox, src_id, include_hidden=True))
+        all_msgs = list(iter_all_messages(graph, mailbox, src_id))
         for m in all_msgs:
             try:
                 move_message(graph, mailbox, m["id"], dst_id)
@@ -759,7 +789,7 @@ def flatten_mailbox(
         moved_loose = 0
         if dedup is not None:
             # Snapshot first; see comment in execute_merge for why.
-            for m in list(iter_all_messages(graph, mailbox, imported["id"], include_hidden=True)):
+            for m in list(iter_all_messages(graph, mailbox, imported["id"])):
                 if dedup.has(fuzzy_key(m)):
                     dedup.skipped += 1
                     continue
@@ -777,7 +807,7 @@ def flatten_mailbox(
         else:
             # Snapshot (visible + hidden) then move, same reasoning as in
             # execute_merge's non-dedup branch.
-            for m in list(iter_all_messages(graph, mailbox, imported["id"], include_hidden=True)):
+            for m in list(iter_all_messages(graph, mailbox, imported["id"])):
                 try:
                     move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
                     moved_loose += 1

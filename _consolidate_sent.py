@@ -107,10 +107,9 @@ def snapshot_all_message_ids(
     graph: GraphClient,
     mailbox: str,
     folder_id: str,
-    *,
-    hidden_only: bool = False,
 ) -> list[dict]:
-    """Page through every message in the folder once and return [{id, subject}, ...].
+    """Page through every (visible) message in the folder and return
+    [{id, subject}, ...].
 
     Snapshotting up front (instead of re-listing after each move) avoids two
     classes of bug:
@@ -119,15 +118,18 @@ def snapshot_all_message_ids(
       - infinite loops, where a silently-failing move would leave the same
         item visible on page 1 forever
 
-    Pass `hidden_only=True` to enumerate items with isHidden=true. By default
-    Graph's /messages endpoint excludes those, but they still count toward
-    totalItemCount; some PST importers leave behind rules-table fragments,
-    IPM.Configuration messages, or recall reports as hidden items.
+    Note on residual items: Graph v1.0's /messages collection only exposes
+    IPM.Note items in the regular table. It does NOT expose Folder Associated
+    Information (FAI) items -- folder views, custom rules, search criteria,
+    forms -- which PST imports commonly carry. Those still count toward
+    mailFolder.totalItemCount, so after this drain the source folder may
+    look non-empty by that metric. delete_folder_if_drained handles that
+    case: as long as no visible messages remain, the FAI residual goes away
+    with the folder when we delete it.
     """
-    flt = "&$filter=isHidden eq true" if hidden_only else ""
     path = (
         f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"
-        f"?$top={PAGE_SIZE}&$select=id,subject{flt}"
+        f"?$top={PAGE_SIZE}&$select=id,subject"
     )
     out: list[dict] = []
     while path:
@@ -164,16 +166,42 @@ def move_message(graph: GraphClient, mailbox: str, msg_id: str, dest_id: str) ->
     graph.post(path, json={"destinationId": dest_id}, expect_status=(200, 201))
 
 
-def delete_folder_if_empty(graph: GraphClient, mailbox: str, folder: dict, log) -> bool:
+def delete_folder_if_drained(graph: GraphClient, mailbox: str, folder: dict, log) -> bool:
+    """Delete the folder if it's effectively empty for the user.
+
+    Refuses to delete if:
+      - any subfolders remain, OR
+      - any visible message remains in the folder
+
+    Allows deletion when totalItemCount > 0 only if GET /messages returns
+    nothing. In that case the residual items are FAI (folder-associated
+    information) entries -- views, rules, custom search criteria, forms --
+    that Graph v1.0 doesn't enumerate or move individually. They go away
+    when the folder itself is deleted.
+    """
     fresh = get_folder(graph, mailbox, folder["id"])
     items = int(fresh.get("totalItemCount") or 0)
     subs = int(fresh.get("childFolderCount") or 0)
-    if items > 0 or subs > 0:
-        log.warning(
-            "Refusing to delete {!r}: still has {} items, {} subfolders.",
-            fresh.get("displayName"), items, subs,
-        )
+    name = fresh.get("displayName")
+
+    if subs > 0:
+        log.warning("Refusing to delete {!r}: still has {} subfolder(s).", name, subs)
         return False
+
+    if items > 0:
+        # Verify those items aren't visible messages we somehow missed.
+        visible = list_message_page(graph, mailbox, folder["id"])
+        if visible:
+            log.warning(
+                "Refusing to delete {!r}: still has {} visible message(s).",
+                name, len(visible),
+            )
+            return False
+        log.info(
+            "{!r}: {} residual FAI item(s) (rules/views/config) will be removed with the folder.",
+            name, items,
+        )
+
     try:
         graph.delete(
             f"/users/{quote(mailbox)}/mailFolders/{folder['id']}",
@@ -181,7 +209,7 @@ def delete_folder_if_empty(graph: GraphClient, mailbox: str, folder: dict, log) 
         )
         return True
     except GraphError as e:
-        log.warning("Could not delete {!r} ({}); leaving it.", fresh.get("displayName"), e.status)
+        log.warning("Could not delete {!r} ({}); leaving it.", name, e.status)
         return False
 
 
@@ -232,34 +260,21 @@ def consolidate_subtree_into_sent(
     moved = 0
 
     if not dry_run:
-        # Two passes: first visible messages (the default for GET /messages),
-        # then explicitly hidden ones. Hidden items are MAPI artifacts that
-        # don't appear in the default listing but DO count toward
-        # totalItemCount, so without this second pass delete_folder_if_empty
-        # would always refuse to clean up the source.
-        for hidden_only in (False, True):
-            msgs = snapshot_all_message_ids(
-                graph, mailbox, folder["id"], hidden_only=hidden_only,
-            )
-            if hidden_only and msgs:
-                log.info(
-                    "  {!r}: also moving {} hidden item(s) (rules/config artifacts).",
-                    src_path, len(msgs),
+        # Snapshot all visible messages, then move. (Pagination-while-mutating
+        # is fragile; see snapshot_all_message_ids docstring.) FAI residual
+        # is handled at folder-delete time by delete_folder_if_drained.
+        for m in snapshot_all_message_ids(graph, mailbox, folder["id"]):
+            try:
+                move_message(graph, mailbox, m["id"], sent_items_id)
+                moved += 1
+                if moved % 200 == 0:
+                    log.info("  {!r}: moved {} messages so far", src_path, moved)
+            except GraphError as e:
+                subj = (m.get("subject") or "(no subject)")[:80]
+                log.warning(
+                    "  {!r}: could not move item {!r} ({}); leaving in place.",
+                    src_path, subj, e.status,
                 )
-            for m in msgs:
-                try:
-                    move_message(graph, mailbox, m["id"], sent_items_id)
-                    moved += 1
-                    if moved % 200 == 0:
-                        log.info("  {!r}: moved {} messages so far", src_path, moved)
-                except GraphError as e:
-                    subj = (m.get("subject") or "(no subject)")[:80]
-                    log.warning(
-                        "  {!r}: could not move {}item {!r} ({}); leaving in place.",
-                        src_path,
-                        "hidden " if hidden_only else "",
-                        subj, e.status,
-                    )
     else:
         moved += int(folder.get("totalItemCount") or 0)
 
@@ -275,7 +290,7 @@ def consolidate_subtree_into_sent(
                 src_path=sub_path, dry_run=dry_run,
             )
             if not dry_run:
-                delete_folder_if_empty(graph, mailbox, sub, log)
+                delete_folder_if_drained(graph, mailbox, sub, log)
     return moved
 
 
@@ -320,7 +335,7 @@ def consolidate_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> d
             src_path=path, dry_run=False,
         )
         total_moved += moved
-        delete_folder_if_empty(graph, mailbox, folder, log)
+        delete_folder_if_drained(graph, mailbox, folder, log)
         log.info("  -> moved {} messages from {!r}", moved, path)
 
     log.info("Done. {} messages moved into Sent Items across {} folder(s).", total_moved, len(misplaced))
