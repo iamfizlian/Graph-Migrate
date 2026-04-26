@@ -311,6 +311,49 @@ function Get-RedemptionSession {
 # UNSENT during the new-message save.  If the line shows UNSENT=False
 # then the COPY path is working and the verify pass is wrong.
 $script:_diagShown = $false
+
+# PowerShell can NOT invoke a parameterized COM property via the
+# obvious `.Fields.Item($tag)` syntax -- it resolves `.Fields.Item`
+# to a PSParameterizedProperty wrapper and then complains that the
+# wrapper has no method named 'Item'.  The workaround is reflection
+# through System.__ComObject.InvokeMember, which dispatches via
+# IDispatch the way VBA / VBScript would.
+#
+# Both helpers accept either an int property tag (0x0E070003) OR a
+# DASL string ("http://schemas.microsoft.com/mapi/proptag/0x0E070003")
+# -- Redemption's RDOFields collection supports both.
+function Get-RdoMailField {
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]$Mail,
+        [Parameter(Mandatory)]$Key
+    )
+    $fields = $Mail.Fields
+    return $fields.GetType().InvokeMember(
+        'Item',
+        [System.Reflection.BindingFlags]::GetProperty,
+        $null,
+        $fields,
+        @([object]$Key)
+    )
+}
+
+function Set-RdoMailField {
+    param(
+        [Parameter(Mandatory)]$Mail,
+        [Parameter(Mandatory)]$Key,
+        [Parameter(Mandatory)]$Value
+    )
+    $fields = $Mail.Fields
+    [void]$fields.GetType().InvokeMember(
+        'Item',
+        [System.Reflection.BindingFlags]::SetProperty,
+        $null,
+        $fields,
+        @([object]$Key, [object]$Value)
+    )
+}
+
 function Format-MessageFlags {
     param([int]$Flags)
     $bits = New-Object 'System.Collections.Generic.List[string]'
@@ -402,7 +445,7 @@ function Clear-UnsentBitViaRedemptionCopy {
             Write-Host '==== DIAG: first copy-and-replace; logging every flag write ====' -ForegroundColor Yellow
             Write-Host ("DIAG src.MessageClass = '{0}'" -f $msgClass) -ForegroundColor Yellow
             try {
-                $f0 = [int]$src.Fields.Item($tagInt)
+                $f0 = [int](Get-RdoMailField -Mail $src -Key $tagInt)
                 Write-Host ("DIAG src.Fields[0x0E070003]   = 0x{0:X4}  ({1})" -f $f0, (Format-MessageFlags $f0)) -ForegroundColor Yellow
             } catch {
                 Write-Host "DIAG src.Fields read failed: $($_.Exception.Message)" -ForegroundColor Red
@@ -416,7 +459,7 @@ function Clear-UnsentBitViaRedemptionCopy {
         if (-not $dst) { return 'failed' }
         if ($diag) {
             try {
-                $f1 = [int]$dst.Fields.Item($tagInt)
+                $f1 = [int](Get-RdoMailField -Mail $dst -Key $tagInt)
                 Write-Host ("DIAG dst after Items.Add      = 0x{0:X4}  ({1})" -f $f1, (Format-MessageFlags $f1)) -ForegroundColor Yellow
             } catch {
                 Write-Host "DIAG dst.Fields read after Items.Add failed: $($_.Exception.Message)" -ForegroundColor Red
@@ -429,7 +472,7 @@ function Clear-UnsentBitViaRedemptionCopy {
         $src.CopyTo($dst)
         if ($diag) {
             try {
-                $f2 = [int]$dst.Fields.Item($tagInt)
+                $f2 = [int](Get-RdoMailField -Mail $dst -Key $tagInt)
                 Write-Host ("DIAG dst after CopyTo         = 0x{0:X4}  ({1})" -f $f2, (Format-MessageFlags $f2)) -ForegroundColor Yellow
             } catch { }
         }
@@ -450,21 +493,21 @@ function Clear-UnsentBitViaRedemptionCopy {
         }
         if ($diag) {
             try {
-                $f3 = [int]$dst.Fields.Item($tagInt)
+                $f3 = [int](Get-RdoMailField -Mail $dst -Key $tagInt)
                 Write-Host ("DIAG dst after Sent=`$true     = 0x{0:X4}  ({1})" -f $f3, (Format-MessageFlags $f3)) -ForegroundColor Yellow
             } catch { }
         }
 
         try {
-            $current = [int]$dst.Fields.Item($tagInt)
+            $current = [int](Get-RdoMailField -Mail $dst -Key $tagInt)
             $newVal  = $current -band (-bnot $script:MSGFLAG_UNSENT)
-            $dst.Fields.Item($tagInt) = $newVal
+            Set-RdoMailField -Mail $dst -Key $tagInt -Value $newVal
         } catch {
             if ($diag) { Write-Host "DIAG dst.Fields write threw: $($_.Exception.Message)" -ForegroundColor Red }
         }
         if ($diag) {
             try {
-                $f4 = [int]$dst.Fields.Item($tagInt)
+                $f4 = [int](Get-RdoMailField -Mail $dst -Key $tagInt)
                 Write-Host ("DIAG dst after Fields write   = 0x{0:X4}  ({1})" -f $f4, (Format-MessageFlags $f4)) -ForegroundColor Yellow
             } catch { }
         }
@@ -472,7 +515,7 @@ function Clear-UnsentBitViaRedemptionCopy {
         $dst.Save()
         if ($diag) {
             try {
-                $f5 = [int]$dst.Fields.Item($tagInt)
+                $f5 = [int](Get-RdoMailField -Mail $dst -Key $tagInt)
                 Write-Host ("DIAG dst after Save() inproc  = 0x{0:X4}  ({1})" -f $f5, (Format-MessageFlags $f5)) -ForegroundColor Yellow
             } catch { }
             # Re-open via EntryID so we read the SERVER's state, not the
@@ -482,7 +525,7 @@ function Clear-UnsentBitViaRedemptionCopy {
                 $newEid = $dst.EntryID
                 $reopen = $RdoSession.GetMessageFromID($newEid, $StoreId)
                 if ($reopen) {
-                    $f6 = [int]$reopen.Fields.Item($tagInt)
+                    $f6 = [int](Get-RdoMailField -Mail $reopen -Key $tagInt)
                     $color = if ($f6 -band $script:MSGFLAG_UNSENT) { 'Red' } else { 'Green' }
                     Write-Host ("DIAG dst RE-FETCH from store = 0x{0:X4}  ({1})  <-- ground truth" -f $f6, (Format-MessageFlags $f6)) -ForegroundColor $color
                 } else {
@@ -508,7 +551,7 @@ function Clear-UnsentBitViaRedemptionCopy {
         $newEid = $dst.EntryID
         $reopen = $RdoSession.GetMessageFromID($newEid, $StoreId)
         if ($reopen) {
-            $after = [int]$reopen.Fields.Item($tagInt)
+            $after = [int](Get-RdoMailField -Mail $reopen -Key $tagInt)
             if (($after -band $script:MSGFLAG_UNSENT) -eq 0) { $verified = $true }
         }
     } catch {
