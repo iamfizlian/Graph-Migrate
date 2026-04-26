@@ -175,21 +175,43 @@ $script:SKIP_FOLDER_NAMES = @(
 function Get-OutlookApplication {
     <#
     .SYNOPSIS  Attach to a running Outlook session if there is one,
-    otherwise cold-launch one.  Returns a hashtable so the caller can
-    tell whether MAPI needs a moment to settle before issuing
-    GetSharedDefaultFolder calls.
+    otherwise cold-launch one.
+
+    Strategy:
+      - Detect 'Outlook already running' via Get-Process, NOT via
+        GetActiveObject.  GetActiveObject relies on COM's Running
+        Object Table, which is unreliable across session boundaries
+        (RDP, service-launched Outlook, etc.) and can fail even when
+        the user and integrity level match.
+      - Always attach via New-Object -ComObject Outlook.Application.
+        Outlook is registered as a single-instance LocalServer32 COM
+        component, so CoCreateInstance routes the call to the running
+        instance instead of starting a new one.
+      - Fall back to GetActiveObject only as a fast-path optimisation;
+        if it works we save a bit of process startup, but we don't
+        depend on it.
     #>
     [OutputType([hashtable])]
     param()
+    $running = @(Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue).Count -gt 0
+
     try {
         $existing = [System.Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')
-        Write-Verbose "Attached to a running Outlook session."
+        Write-Verbose "Attached to a running Outlook session via GetActiveObject."
         return @{ App = $existing; FreshLaunch = $false }
     } catch {
-        Write-Host "Starting Outlook..." -ForegroundColor DarkGray
-        $new = New-Object -ComObject Outlook.Application
-        return @{ App = $new; FreshLaunch = $true }
+        # GetActiveObject failed; that's OK -- New-Object below will
+        # attach to the running Outlook (single-instance COM server)
+        # if there is one, or cold-launch otherwise.
     }
+
+    if ($running) {
+        Write-Verbose "OUTLOOK.EXE is running; attaching via CoCreateInstance."
+    } else {
+        Write-Host "Starting Outlook..." -ForegroundColor DarkGray
+    }
+    $new = New-Object -ComObject Outlook.Application
+    return @{ App = $new; FreshLaunch = (-not $running) }
 }
 
 function Wait-NamespaceReady {
@@ -556,52 +578,15 @@ function Main {
         # Already logged on -> Logon throws "namespace already logged on".  Ignore.
     }
 
-    # Detect "we launched a fresh Outlook even though one was already
-    # running" -- the classic symptom of a PowerShell/Outlook integrity-
-    # level mismatch (e.g. PowerShell elevated, Outlook not).  COM's ROT
-    # is per integrity level, so GetActiveObject() returns "Operation
-    # unavailable" and we fall through to New-Object, which produces a
-    # second, profile-less Outlook proxy.
-    $admin = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-    $isElevated = $admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
     if ($launch.FreshLaunch) {
-        $existingOutlook = @(Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue)
-        if ($existingOutlook.Count -gt 0) {
-            Write-Warning ""
-            Write-Warning "OUTLOOK.EXE is already running, but this PowerShell session"
-            Write-Warning "could NOT attach to it via COM.  This almost always means"
-            Write-Warning "the integrity level / user differs between the two:"
-            Write-Warning ""
-            if ($isElevated) {
-                Write-Warning "  - You are in an *elevated* (Run as administrator) PowerShell."
-                Write-Warning "  - Outlook is most likely running non-elevated."
-                Write-Warning "  - Fix: close this PowerShell, open a normal (non-admin)"
-                Write-Warning "    PowerShell window, and re-run the script."
-            } else {
-                Write-Warning "  - This PowerShell is non-elevated."
-                Write-Warning "  - Outlook may be running under a different Windows user,"
-                Write-Warning "    or was started 'as administrator'."
-                Write-Warning "  - Fix: make sure both Outlook and PowerShell run as the"
-                Write-Warning "    same user, at the same integrity level."
-            }
-            Write-Warning ""
-            Write-Warning "Aborting before we drive a profile-less second Outlook instance."
-            try { $outlook.Quit() } catch { }
-            return
-        }
         Write-Warning ""
-        Write-Warning "Outlook was not running; the script started it for you."
-        Write-Warning "If a 'Programmatic access' or 'Allow access' dialog appeared,"
-        Write-Warning "click Allow / Yes -- the script is paused waiting for MAPI."
-        Write-Warning ""
-        Write-Warning "For best results, open Outlook BEFORE running this script,"
-        Write-Warning "let it finish syncing, then re-run. Cold-launch can leave"
-        Write-Warning "delegated mailboxes only partially attached."
+        Write-Warning "Outlook was not already running; the script started it."
+        Write-Warning "If a 'Programmatic access' / 'Allow access' dialog appears,"
+        Write-Warning "click Allow / Yes -- the script is waiting for MAPI."
         Write-Warning ""
         # Wait for the namespace + give the user time to dismiss the trust prompt.
-        if (-not (Wait-NamespaceReady -Namespace $ns -TimeoutSeconds 60)) {
-            Write-Warning "Outlook namespace did not become ready within 60s; proceeding anyway."
+        if (-not (Wait-NamespaceReady -Namespace $ns -TimeoutSeconds 90)) {
+            Write-Warning "Outlook namespace did not become ready within 90s; proceeding anyway."
         }
     }
 
@@ -609,24 +594,24 @@ function Main {
     # is attached and every shared-folder call will return null.  Bail
     # with a useful message rather than letting that surface as a confusing
     # 'Inbox.Parent was null' deep in the per-mailbox loop.
-    try {
-        if ($ns.Stores.Count -eq 0) {
-            Write-Error ""
-            Write-Error "Outlook is reporting zero MAPI stores in this session."
-            Write-Error "That means the COM proxy we attached to has no profile loaded."
-            Write-Error ""
-            if ($isElevated) {
-                Write-Error "You are running PowerShell as Administrator.  Try a normal"
-                Write-Error "(non-admin) PowerShell window with Outlook already open."
-            } else {
-                Write-Error "Make sure Outlook is open, signed in to your admin profile,"
-                Write-Error "and finished syncing, then re-run."
-            }
-            return
-        }
-    } catch {
-        Write-Warning "Could not enumerate Namespace.Stores: $($_.Exception.Message)"
+    $storeCount = -1
+    try { $storeCount = $ns.Stores.Count } catch { }
+    if ($storeCount -le 0) {
+        Write-Error ""
+        Write-Error "Outlook is reporting $storeCount MAPI stores in this session."
+        Write-Error "That means no Outlook profile is attached to the COM session"
+        Write-Error "we're driving.  Common causes:"
+        Write-Error ""
+        Write-Error "  - Outlook is open under a different Windows user (e.g. a"
+        Write-Error "    different RDP session or service account)."
+        Write-Error "  - Outlook hasn't finished launching/signing in yet."
+        Write-Error "  - The Outlook profile is corrupted or asks for credentials."
+        Write-Error ""
+        Write-Error "Open Outlook in this same login session, sign in to the admin"
+        Write-Error "profile, wait for the 'Connected' status, then re-run."
+        return
     }
+    Write-Verbose ("Namespace ready: {0} store(s) attached." -f $storeCount)
 
     $results = New-Object 'System.Collections.Generic.List[pscustomobject]'
     foreach ($upn in $script:Mailbox) {
