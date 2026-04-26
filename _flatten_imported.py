@@ -18,17 +18,30 @@ Idempotent: if the script is interrupted, re-running picks up wherever
 it left off. Already-moved messages and folders are simply absent from
 the imported tree on the next pass.
 
+When --skip-duplicates is set, the script first scans the destination
+mailbox (everything except 'Imported PST') and builds a fuzzy-key index
+of (normalized subject, sent-minute, from address). Any source message
+whose key is already present in that index is LEFT in 'Imported PST'
+instead of being moved. This prevents re-introducing duplicates when
+some of the mailbox content was placed there by a separate importer
+that may have rewritten Message-IDs (run _audit_duplicates.py first to
+diagnose). With this flag, wholesale folder-moves are disabled - every
+source message gets an individual duplicate check.
+
 Run from Graph-Migrate/:
 
   .\.venv\Scripts\python.exe _flatten_imported.py -c config.toml -m mapping.csv
   .\.venv\Scripts\python.exe _flatten_imported.py -c config.toml --mailbox johnd@jteatono365.onmicrosoft.com
   .\.venv\Scripts\python.exe _flatten_imported.py -c config.toml -m mapping.csv --dry-run
+  .\.venv\Scripts\python.exe _flatten_imported.py -c config.toml --mailbox johnd@... --skip-duplicates --dry-run
 """
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
 
@@ -41,6 +54,60 @@ from jtet_pstmigrate.orchestrator import load_mapping
 
 ROOT_FOLDER_NAME = "Imported PST"
 PAGE_SIZE = 100
+
+# ----------------------------------------------------------- duplicate detection
+# We dedupe by a "fuzzy key": (normalized subject, sent-minute, from address).
+# This catches duplicates even when the SMTP Message-ID was rewritten by
+# whatever tool did the prior import (Exchange Online minted server IDs of
+# the form <by3pr...@by3pr....prod.outlook.com> instead of preserving the
+# original PST headers). See _audit_duplicates.py for the diagnosis.
+
+FuzzyKey = tuple[str, str, str]  # (subject_norm, sent_at_minute, from_addr_lower)
+
+_REPLY_PREFIX_RE = re.compile(r"^\s*(?:re|fw|fwd|aw|sv|tr|wg|antwort|antw)\s*[:\[\(]?\s*", re.IGNORECASE)
+
+
+def _norm_subject(s: str) -> str:
+    s = (s or "").strip()
+    while True:
+        new = _REPLY_PREFIX_RE.sub("", s, count=1)
+        if new == s:
+            break
+        s = new
+    return " ".join(s.split()).lower()
+
+
+def _from_addr(msg: dict) -> str:
+    f = msg.get("from") or {}
+    eb = f.get("emailAddress") or {}
+    return (eb.get("address") or eb.get("name") or "").lower()
+
+
+def fuzzy_key(msg: dict) -> FuzzyKey | None:
+    """Build the dedup key for a message dict, or None if there isn't enough
+    signal to compare (no sent timestamp, or both subject + from missing)."""
+    subj = _norm_subject(msg.get("subject") or "")
+    sent_minute = (msg.get("sentDateTime") or "")[:16]
+    addr = _from_addr(msg)
+    if not sent_minute:
+        return None
+    if not subj and not addr:
+        return None
+    return (subj, sent_minute, addr)
+
+
+@dataclass(slots=True)
+class DedupIndex:
+    """Set of fuzzy keys already present in the destination mailbox."""
+    keys: set[FuzzyKey] = field(default_factory=set)
+    skipped: int = 0  # running count of source messages skipped as duplicates
+
+    def has(self, k: FuzzyKey | None) -> bool:
+        return k is not None and k in self.keys
+
+    def add(self, k: FuzzyKey | None) -> None:
+        if k is not None:
+            self.keys.add(k)
 
 # Top-level Imported PST folders whose displayName matches one of these
 # predicates get merged into the corresponding Graph well-known folder
@@ -90,14 +157,41 @@ def list_child_folders(graph: GraphClient, mailbox: str, parent_id: str) -> list
     return out
 
 
-def list_message_page(graph: GraphClient, mailbox: str, folder_id: str) -> list[dict]:
-    """Return one page of messages from a folder."""
+def list_message_page(
+    graph: GraphClient,
+    mailbox: str,
+    folder_id: str,
+    *,
+    with_dedup_fields: bool = False,
+) -> list[dict]:
+    """Return one page of messages from a folder.
+
+    `with_dedup_fields` controls whether subject/from/sentDateTime are
+    fetched too. Off by default to keep response sizes small in the
+    common (no-dedup) path.
+    """
+    select = "id,subject,sentDateTime,from" if with_dedup_fields else "id"
     path = (
         f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"
-        f"?$top={PAGE_SIZE}&$select=id"
+        f"?$top={PAGE_SIZE}&$select={select}"
     )
     resp = graph.get(path, expect_status=(200,))
     return resp.json().get("value", [])
+
+
+def iter_all_messages(graph: GraphClient, mailbox: str, folder_id: str):
+    """Yield every message in a folder (paged), with dedup fields populated."""
+    path = (
+        f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"
+        f"?$top=999&$select=id,subject,sentDateTime,from"
+    )
+    while path:
+        resp = graph.get(path, expect_status=(200,))
+        body = resp.json()
+        for m in body.get("value", []):
+            yield m
+        next_link = body.get("@odata.nextLink")
+        path = _strip_base(next_link) if next_link else None
 
 
 def move_message(graph: GraphClient, mailbox: str, msg_id: str, dest_id: str) -> None:
@@ -108,6 +202,53 @@ def move_message(graph: GraphClient, mailbox: str, msg_id: str, dest_id: str) ->
 def move_folder(graph: GraphClient, mailbox: str, folder_id: str, dest_parent_id: str) -> None:
     path = f"/users/{quote(mailbox)}/mailFolders/{folder_id}/move"
     graph.post(path, json={"destinationId": dest_parent_id}, expect_status=(200, 201))
+
+
+def create_subfolder(graph: GraphClient, mailbox: str, parent_id: str, name: str) -> dict:
+    """Create a child folder under `parent_id`. Returns the new folder dict.
+
+    Used in --skip-duplicates mode where we can't fall back to wholesale
+    folder-moves (we need to walk every message). If a sibling with the
+    same name already exists, returns it instead of creating a duplicate.
+    """
+    existing = find_child_named(graph, mailbox, parent_id, name)
+    if existing:
+        return existing
+    path = f"/users/{quote(mailbox)}/mailFolders/{parent_id}/childFolders"
+    resp = graph.post(path, json={"displayName": name}, expect_status=(201,))
+    return resp.json()
+
+
+def build_dedup_index(graph: GraphClient, mailbox: str, *, skip_root_id: str, log) -> DedupIndex:
+    """Walk every folder under `msgFolderRoot` except `skip_root_id` and
+    collect fuzzy keys for every message. Returns a DedupIndex.
+    """
+    idx = DedupIndex()
+    folders_walked = 0
+    msgs_indexed = 0
+
+    def _walk(folder: dict) -> None:
+        nonlocal folders_walked, msgs_indexed
+        folders_walked += 1
+        for m in iter_all_messages(graph, mailbox, folder["id"]):
+            k = fuzzy_key(m)
+            if k:
+                idx.keys.add(k)
+                msgs_indexed += 1
+        if int(folder.get("childFolderCount") or 0) > 0:
+            for sub in list_child_folders(graph, mailbox, folder["id"]):
+                _walk(sub)
+
+    for top in list_child_folders(graph, mailbox, "msgFolderRoot"):
+        if top["id"] == skip_root_id:
+            continue
+        _walk(top)
+
+    log.info(
+        "Dedup index: {} fuzzy keys from {} folders ({} messages indexed).",
+        len(idx.keys), folders_walked, msgs_indexed,
+    )
+    return idx
 
 
 def get_folder(graph: GraphClient, mailbox: str, folder_id: str) -> dict:
@@ -276,39 +417,83 @@ def execute_merge(
     src_path: str,
     log,
     depth: int,
+    dedup: DedupIndex | None = None,
 ) -> tuple[int, int]:
     """Actually move messages + subfolders from src into dst, recursively.
 
-    Pre: dst exists. Post: src is empty (caller deletes it).
+    Pre: dst exists. Post: src is empty IF every message was moved (the
+    caller decides whether to delete it).
+
     `src_path` is the human-readable source path (e.g. 'Imported PST/Inbox')
     used only for progress logging so the user can see which merge each
     progress tick belongs to.
 
-    Returns (messages_moved_individually, subfolders_processed). Subfolders
-    that get folder-moved wholesale count in `subfolders_processed` but NOT
-    in `messages_moved_individually`, since those are one Graph call apiece.
+    `dedup`, if provided, is checked for every message before moving. Any
+    source message whose fuzzy key already exists in the destination is
+    skipped (left in `src`). Skipped count goes into dedup.skipped.
+
+    With dedup enabled, wholesale folder-moves are disabled: we create a
+    matching folder under dst when one doesn't exist, then merge into it
+    item-by-item, so every message gets a duplicate check.
+
+    Returns (messages_moved_individually, subfolders_processed).
     """
     indent = "  " * depth
     src_id = src["id"]
     moved = 0
+
+    # ------ messages directly in `src` ------
     while True:
-        msgs = list_message_page(graph, mailbox, src_id)
+        msgs = list_message_page(graph, mailbox, src_id, with_dedup_fields=dedup is not None)
         if not msgs:
             break
+        # Track messages we *visit* this page; if dedup leaves them all in
+        # place, listing the same page again would loop forever, so when
+        # dedup is on we page using $skip-style by tracking processed ids.
+        all_skipped_this_page = True
         for m in msgs:
-            move_message(graph, mailbox, m["id"], dst_id)
-            moved += 1
-            if moved % 200 == 0:
+            if dedup is not None:
+                k = fuzzy_key(m)
+                if dedup.has(k):
+                    dedup.skipped += 1
+                    continue
+                # Move it, and remember its key so duplicates among the
+                # imported messages themselves don't all flood through.
+                move_message(graph, mailbox, m["id"], dst_id)
+                dedup.add(k)
+                moved += 1
+                all_skipped_this_page = False
+            else:
+                move_message(graph, mailbox, m["id"], dst_id)
+                moved += 1
+            if moved and moved % 200 == 0:
                 log.info("{}{!r}: moved {} messages so far", indent, src_path, moved)
+        if dedup is not None and all_skipped_this_page:
+            # Every message in this page is staying put. Re-listing would
+            # return the same items forever; break out and let them stay
+            # in the source folder for the user to review.
+            break
 
+    # ------ subfolders ------
     subs = 0
     for sub in list_child_folders(graph, mailbox, src_id):
         existing = find_child_named(graph, mailbox, dst_id, sub["displayName"])
+        sub_path = f"{src_path}/{sub['displayName']}"
         if existing:
-            sub_path = f"{src_path}/{sub['displayName']}"
             sm, ss = execute_merge(
                 graph, mailbox, sub, existing["id"],
-                src_path=sub_path, log=log, depth=depth + 1,
+                src_path=sub_path, log=log, depth=depth + 1, dedup=dedup,
+            )
+            delete_folder_if_empty(graph, mailbox, sub["id"])
+            moved += sm
+            subs += ss + 1
+        elif dedup is not None:
+            # Can't wholesale-move when dedup is on: create the folder and
+            # merge into it so each message is checked.
+            new_dst = create_subfolder(graph, mailbox, dst_id, sub["displayName"])
+            sm, ss = execute_merge(
+                graph, mailbox, sub, new_dst["id"],
+                src_path=sub_path, log=log, depth=depth + 1, dedup=dedup,
             )
             delete_folder_if_empty(graph, mailbox, sub["id"])
             moved += sm
@@ -320,15 +505,52 @@ def execute_merge(
     return moved, subs
 
 
-def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
+def preview_dedup_skips(
+    graph: GraphClient,
+    mailbox: str,
+    folder: dict,
+    dedup: DedupIndex,
+) -> int:
+    """Walk `folder` and all descendants, count how many messages would be
+    skipped by dedup. Pure GETs, no writes. Used in dry-run mode."""
+    skipped = 0
+    for m in iter_all_messages(graph, mailbox, folder["id"]):
+        if dedup.has(fuzzy_key(m)):
+            skipped += 1
+    if int(folder.get("childFolderCount") or 0) > 0:
+        for sub in list_child_folders(graph, mailbox, folder["id"]):
+            skipped += preview_dedup_skips(graph, mailbox, sub, dedup)
+    return skipped
+
+
+def flatten_mailbox(
+    graph: GraphClient,
+    mailbox: str,
+    *,
+    dry_run: bool,
+    skip_duplicates: bool = False,
+) -> dict:
     log = logger.bind(ctx=f"flatten[{mailbox}]")
-    stats = {"mailbox": mailbox, "messages_moved": 0, "folders_processed": 0, "skipped": False}
+    stats = {
+        "mailbox": mailbox,
+        "messages_moved": 0,
+        "folders_processed": 0,
+        "duplicates_skipped": 0,
+        "skipped": False,
+    }
 
     imported = find_imported_root(graph, mailbox)
     if imported is None:
         log.info("No '{}' folder found; nothing to do.", ROOT_FOLDER_NAME)
         stats["skipped"] = True
         return stats
+
+    # Build dedup index up front. Done before any moves so we capture the
+    # destination state before we start modifying it.
+    dedup: DedupIndex | None = None
+    if skip_duplicates:
+        log.info("Building dedup index (walking destination mailbox)...")
+        dedup = build_dedup_index(graph, mailbox, skip_root_id=imported["id"], log=log)
 
     root_direct_items = int(imported.get("totalItemCount") or 0)
     log.info(
@@ -403,6 +625,23 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
         plan_msgs, plan_folders,
     )
 
+    if dedup is not None:
+        # In dedup mode we always go item-by-item -- no wholesale moves --
+        # so the user shouldn't see "[move] (single folder-move)" promises.
+        log.info(
+            "--skip-duplicates is on: wholesale folder-moves above will instead be created+merged "
+            "item-by-item so every message is checked against the dedup index ({} keys).",
+            len(dedup.keys),
+        )
+        # Dry-run estimate: how many messages would be skipped as duplicates?
+        if dry_run:
+            log.info("Counting how many source messages match the dedup index...")
+            est_skipped = preview_dedup_skips(graph, mailbox, imported, dedup)
+            log.info(
+                "Estimated duplicates that would be SKIPPED: {} of ~{} source messages.",
+                est_skipped, plan_msgs,
+            )
+
     if dry_run:
         log.info("DRY RUN - no changes made.")
         return stats
@@ -417,14 +656,29 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
         log.info("moving {} direct items from {!r} -> Inbox", root_direct_items, ROOT_FOLDER_NAME)
         moved_loose = 0
         while True:
-            msgs = list_message_page(graph, mailbox, imported["id"])
+            msgs = list_message_page(
+                graph, mailbox, imported["id"],
+                with_dedup_fields=dedup is not None,
+            )
             if not msgs:
                 break
+            all_skipped = True
             for m in msgs:
-                move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
+                if dedup is not None:
+                    k = fuzzy_key(m)
+                    if dedup.has(k):
+                        dedup.skipped += 1
+                        continue
+                    move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
+                    dedup.add(k)
+                else:
+                    move_message(graph, mailbox, m["id"], inbox_for_loose["id"])
                 moved_loose += 1
+                all_skipped = False
                 if moved_loose % 200 == 0:
                     log.info("  '{}' (loose root items): moved {} so far", ROOT_FOLDER_NAME, moved_loose)
+            if dedup is not None and all_skipped:
+                break
         item_moves += moved_loose
 
     for action in actions:
@@ -436,7 +690,7 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
             log.info("merge {!r} -> {!r}", src_path, dst_name)
             m, s = execute_merge(
                 graph, mailbox, src, dst["id"],
-                src_path=src_path, log=log, depth=2,
+                src_path=src_path, log=log, depth=2, dedup=dedup,
             )
             delete_folder_if_empty(graph, mailbox, src["id"])
             item_moves += m
@@ -446,9 +700,30 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
             folder_moves += s  # subfolder ops (mostly folder-moves)
             merges_done += 1
         else:
-            log.info("move {!r} -> mailbox root", src["displayName"])
-            move_folder(graph, mailbox, src["id"], "msgFolderRoot")
-            folder_moves += 1
+            # move-root: hoist a top-level folder under Imported PST to the
+            # mailbox root.
+            if dedup is None:
+                log.info("move {!r} -> mailbox root", src["displayName"])
+                move_folder(graph, mailbox, src["id"], "msgFolderRoot")
+                folder_moves += 1
+            else:
+                # With dedup on we can't wholesale-move (no per-message check).
+                # Create the folder at root and merge into it item-by-item.
+                src_path = f"{ROOT_FOLDER_NAME}/{src['displayName']}"
+                log.info(
+                    "move {!r} -> mailbox root (item-by-item due to --skip-duplicates)",
+                    src["displayName"],
+                )
+                new_root = create_subfolder(
+                    graph, mailbox, "msgFolderRoot", src["displayName"],
+                )
+                m, s = execute_merge(
+                    graph, mailbox, src, new_root["id"],
+                    src_path=src_path, log=log, depth=2, dedup=dedup,
+                )
+                delete_folder_if_empty(graph, mailbox, src["id"])
+                item_moves += m
+                folder_moves += s + 1
 
     # Only delete Imported PST if every prior step actually cleared it.
     # delete_folder_if_empty refuses to delete a folder that still has
@@ -458,11 +733,19 @@ def flatten_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> dict:
 
     stats["messages_moved"] = item_moves
     stats["folders_processed"] = folder_moves + merges_done
-    log.info(
-        "Done. {} messages moved individually, {} top-level merges, {} folder-move ops "
-        "(each carrying an entire subtree). Plan estimated ~{} total messages affected.",
-        item_moves, merges_done, folder_moves, plan_msgs,
-    )
+    if dedup is not None:
+        stats["duplicates_skipped"] = dedup.skipped
+        log.info(
+            "Done. {} messages moved individually, {} duplicates skipped, "
+            "{} top-level merges, {} folder ops. Plan estimated ~{} total messages affected.",
+            item_moves, dedup.skipped, merges_done, folder_moves, plan_msgs,
+        )
+    else:
+        log.info(
+            "Done. {} messages moved individually, {} top-level merges, {} folder-move ops "
+            "(each carrying an entire subtree). Plan estimated ~{} total messages affected.",
+            item_moves, merges_done, folder_moves, plan_msgs,
+        )
     return stats
 
 
@@ -479,6 +762,18 @@ def main() -> int:
         help="UPN of a single mailbox to process (repeatable). Overrides -m.",
     )
     ap.add_argument("--dry-run", action="store_true", help="Walk the tree and log what WOULD happen, no writes.")
+    ap.add_argument(
+        "--skip-duplicates",
+        action="store_true",
+        help=(
+            "Before flattening, scan the destination mailbox and build a fuzzy-key "
+            "index (subject + sent-minute + from). Any source message whose key is "
+            "already present is left in 'Imported PST' instead of being moved. "
+            "Disables wholesale folder-moves (every message is checked individually). "
+            "Use this when an earlier import populated the mailbox and may overlap "
+            "with the PST contents -- see _audit_duplicates.py output."
+        ),
+    )
     ns = ap.parse_args()
 
     cfg = expand_user_paths(AppConfig.load(Path(ns.config)))
@@ -498,6 +793,11 @@ def main() -> int:
 
     if ns.dry_run:
         logger.bind(ctx="flatten").warning("DRY RUN — no folder/message moves or deletes will happen.")
+    if ns.skip_duplicates:
+        logger.bind(ctx="flatten").info(
+            "--skip-duplicates ON: messages whose (subject, sent-minute, from) match an "
+            "existing destination message will be left in Imported PST."
+        )
 
     pool = AppPool(cfg.apps)
     parallelism = min(cfg.migration.max_parallel_mailboxes, len(mailboxes)) or 1
@@ -511,7 +811,10 @@ def main() -> int:
     with GraphClient(pool, cfg.throttle) as graph:
         with ThreadPoolExecutor(max_workers=parallelism, thread_name_prefix="flatten") as ex:
             futures = {
-                ex.submit(flatten_mailbox, graph, m, dry_run=ns.dry_run): m
+                ex.submit(
+                    flatten_mailbox, graph, m,
+                    dry_run=ns.dry_run, skip_duplicates=ns.skip_duplicates,
+                ): m
                 for m in mailboxes
             }
             for fut in as_completed(futures):
@@ -524,15 +827,20 @@ def main() -> int:
 
     # Summary
     print()
-    print(f"{'mailbox':<46} {'messages':>10} {'folders':>8}  status")
-    print("-" * 80)
+    hdr = f"{'mailbox':<46} {'messages':>10} {'dup_skip':>9} {'folders':>8}  status"
+    print(hdr)
+    print("-" * len(hdr))
     for s in sorted(all_stats, key=lambda x: x["mailbox"]):
         if "error" in s:
-            print(f"{s['mailbox']:<46} {'-':>10} {'-':>8}  ERROR: {s['error'][:40]}")
+            print(f"{s['mailbox']:<46} {'-':>10} {'-':>9} {'-':>8}  ERROR: {s['error'][:40]}")
         elif s.get("skipped"):
-            print(f"{s['mailbox']:<46} {'-':>10} {'-':>8}  no Imported PST folder")
+            print(f"{s['mailbox']:<46} {'-':>10} {'-':>9} {'-':>8}  no Imported PST folder")
         else:
-            print(f"{s['mailbox']:<46} {s['messages_moved']:>10} {s['folders_processed']:>8}  ok")
+            dup = s.get("duplicates_skipped", 0)
+            print(
+                f"{s['mailbox']:<46} {s['messages_moved']:>10} "
+                f"{dup if ns.skip_duplicates else '-':>9} {s['folders_processed']:>8}  ok"
+            )
     return 0
 
 
