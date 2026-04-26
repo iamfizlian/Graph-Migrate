@@ -1,18 +1,24 @@
-r"""Read-only audit: find Message-ID overlap between 'Imported PST' and the
-rest of a mailbox, before running _flatten_imported.py.
+r"""Read-only audit: detect duplicate messages between 'Imported PST' and
+the rest of a mailbox, before running _flatten_imported.py.
 
-For each mailbox processed, walks two subtrees and collects every message
-with an internetMessageId:
+For each mailbox processed, walks two subtrees:
 
   - SOURCE: 'Imported PST' and all its descendants
   - DESTINATION: every other folder in the mailbox (Inbox, Sent Items,
     Drafts, custom folders, etc., recursively)
 
-Reports the size of each set, their intersection, and a sample of the
-overlapping messages so you can decide whether to:
-  - just run _flatten_imported.py (no overlap, no dup risk)
-  - run with --skip-duplicates (overlap exists; not implemented here yet)
-  - investigate further before flattening
+Two overlap checks are run:
+
+  1. Message-ID match (strict): same internetMessageId on both sides.
+     Catches duplicates when the other importer preserved SMTP headers.
+
+  2. Fuzzy match (subject + sent-minute + from address): catches
+     duplicates even when the other importer rewrote Message-IDs (Outlook
+     drag/drop and some MAPI-based tools do this).
+
+A non-zero "fuzzy_only" column indicates messages that look like the same
+logical email but have different or missing Message-IDs - which means
+--skip-duplicates would need to dedupe by the fuzzy key, not the Message-ID.
 
 This script makes NO changes - all GET requests, no POST/PATCH/DELETE.
 
@@ -24,6 +30,7 @@ Usage from Graph-Migrate/ (Windows):
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -41,14 +48,32 @@ ROOT_FOLDER_NAME = "Imported PST"
 PAGE_SIZE = 999  # Graph max for /messages collection
 
 
+FuzzyKey = tuple[str, str, str]  # (subject_norm, sent_at_minute, from_addr_lower)
+
+# Strip RFC-style reply/forward prefixes that some clients add when
+# importing or replying. Repeated to peel "RE: FW: RE:" chains.
+_REPLY_PREFIX_RE = re.compile(r"^\s*(?:re|fw|fwd|aw|sv|tr|wg|antwort|antw)\s*[:\[\(]?\s*", re.IGNORECASE)
+
+
+def _norm_subject(s: str) -> str:
+    s = (s or "").strip()
+    while True:
+        new = _REPLY_PREFIX_RE.sub("", s, count=1)
+        if new == s:
+            break
+        s = new
+    return " ".join(s.split()).lower()
+
+
 @dataclass(slots=True)
 class Msg:
     """Lightweight record of a message for the audit."""
-    message_id: str           # internetMessageId, lowercased
+    message_id: str           # internetMessageId, lowercased ("" if missing)
     folder_path: str          # human-readable folder breadcrumb
     subject: str
     from_addr: str
     sent_at: str              # ISO string from sentDateTime; "" if missing
+    fuzzy: FuzzyKey           # (subject_norm, sent_at_minute, from_addr_lower)
 
 
 @dataclass(slots=True)
@@ -58,7 +83,8 @@ class Side:
     folders_walked: int = 0
     messages_with_id: int = 0
     messages_without_id: int = 0
-    by_id: dict[str, list[Msg]] = field(default_factory=dict)  # id -> messages with that id
+    by_id: dict[str, list[Msg]] = field(default_factory=dict)        # internet msg id -> messages
+    by_fuzzy: dict[FuzzyKey, list[Msg]] = field(default_factory=dict)  # fuzzy key -> messages
 
 
 def _strip_base(url: str) -> str:
@@ -105,19 +131,32 @@ def _from_addr(msg: dict) -> str:
 def _record_messages(side: Side, graph: GraphClient, mailbox: str, folder_id: str, folder_path: str) -> None:
     side.folders_walked += 1
     for m in iter_messages(graph, mailbox, folder_id):
-        mid = m.get("internetMessageId") or ""
-        if not mid:
-            side.messages_without_id += 1
-            continue
+        mid_raw = (m.get("internetMessageId") or "").strip()
+        sent_at = (m.get("sentDateTime") or "")[:19]
+        from_addr = _from_addr(msg=m)
+        subject = (m.get("subject") or "")[:120]
+        # Minute-precision timestamp tolerates the few-second drift some
+        # importers introduce when re-serializing dates.
+        sent_minute = sent_at[:16]
+        fuzzy: FuzzyKey = (_norm_subject(subject), sent_minute, from_addr.lower())
+
         rec = Msg(
-            message_id=mid.strip().lower(),
+            message_id=mid_raw.lower(),
             folder_path=folder_path,
-            subject=(m.get("subject") or "")[:120],
-            from_addr=_from_addr(msg=m),
-            sent_at=(m.get("sentDateTime") or "")[:19],
+            subject=subject,
+            from_addr=from_addr,
+            sent_at=sent_at,
+            fuzzy=fuzzy,
         )
-        side.messages_with_id += 1
-        side.by_id.setdefault(rec.message_id, []).append(rec)
+        if mid_raw:
+            side.messages_with_id += 1
+            side.by_id.setdefault(rec.message_id, []).append(rec)
+        else:
+            side.messages_without_id += 1
+        # Only index for fuzzy matching when we have at least subject+sender or
+        # subject+sent time; otherwise it produces noisy ("", "", "") collisions.
+        if (fuzzy[0] or fuzzy[2]) and fuzzy[1]:
+            side.by_fuzzy.setdefault(fuzzy, []).append(rec)
 
 
 def walk_subtree(graph: GraphClient, mailbox: str, root_folder: dict, root_path: str, side: Side) -> None:
@@ -167,9 +206,25 @@ def audit_mailbox(graph: GraphClient, mailbox: str, *, sample_size: int) -> dict
         dst.folders_walked, dst.messages_with_id, dst.messages_without_id,
     )
 
+    # ---- Message-ID overlap ----
     overlap_ids = set(src.by_id.keys()) & set(dst.by_id.keys())
     src_msgs_in_overlap = sum(len(src.by_id[i]) for i in overlap_ids)
     dst_msgs_in_overlap = sum(len(dst.by_id[i]) for i in overlap_ids)
+
+    # ---- Fuzzy overlap (subject + sent-minute + from) ----
+    overlap_fuzzy = set(src.by_fuzzy.keys()) & set(dst.by_fuzzy.keys())
+    src_msgs_in_fuzzy = sum(len(src.by_fuzzy[k]) for k in overlap_fuzzy)
+    dst_msgs_in_fuzzy = sum(len(dst.by_fuzzy[k]) for k in overlap_fuzzy)
+
+    # Fuzzy hits where Message-IDs disagree -> evidence the other importer
+    # rewrote IDs. Pick one representative pair per fuzzy key for sampling.
+    fuzzy_only_pairs: list[tuple[Msg, Msg]] = []
+    for k in overlap_fuzzy:
+        s_rec = src.by_fuzzy[k][0]
+        d_rec = dst.by_fuzzy[k][0]
+        # If either side has no id, or the ids differ, this is "fuzzy-only".
+        if not s_rec.message_id or not d_rec.message_id or s_rec.message_id != d_rec.message_id:
+            fuzzy_only_pairs.append((s_rec, d_rec))
 
     result.update({
         "src_folders": src.folders_walked,
@@ -181,31 +236,63 @@ def audit_mailbox(graph: GraphClient, mailbox: str, *, sample_size: int) -> dict
         "overlap_ids": len(overlap_ids),
         "src_msgs_in_overlap": src_msgs_in_overlap,
         "dst_msgs_in_overlap": dst_msgs_in_overlap,
+        "overlap_fuzzy": len(overlap_fuzzy),
+        "src_msgs_in_fuzzy": src_msgs_in_fuzzy,
+        "dst_msgs_in_fuzzy": dst_msgs_in_fuzzy,
+        "fuzzy_only_pairs": len(fuzzy_only_pairs),
     })
 
     log.info(
-        "Overlap: {} unique Message-IDs - {} source messages, {} dest messages collide.",
+        "Message-ID overlap: {} unique IDs - {} src / {} dst messages collide.",
         len(overlap_ids), src_msgs_in_overlap, dst_msgs_in_overlap,
     )
+    log.info(
+        "Fuzzy overlap   : {} unique (subject+sent+from) keys - {} src / {} dst messages collide.",
+        len(overlap_fuzzy), src_msgs_in_fuzzy, dst_msgs_in_fuzzy,
+    )
+    if fuzzy_only_pairs:
+        log.warning(
+            "{} fuzzy matches have differing/missing Message-IDs -> the other importer "
+            "likely rewrote IDs; --skip-duplicates would need to use the fuzzy key.",
+            len(fuzzy_only_pairs),
+        )
 
-    # Print a sample so the user can sanity-check the matches.
+    # ---- Sample: Message-ID matches (full duplicates) ----
     if overlap_ids and sample_size > 0:
-        log.info("Sample (up to {} duplicate Message-IDs):", sample_size)
+        log.info("Sample (up to {} Message-ID matches):", sample_size)
         for i, mid in enumerate(sorted(overlap_ids)):
             if i >= sample_size:
                 break
-            src_list = src.by_id[mid]
-            dst_list = dst.by_id[mid]
-            sample_src = src_list[0]
-            sample_dst = dst_list[0]
+            sample_src = src.by_id[mid][0]
+            sample_dst = dst.by_id[mid][0]
             subj = sample_src.subject or sample_dst.subject or "(no subject)"
             log.info(
-                "  {} | from {!r} | sent {} | src={!r} ({}x) | dst={!r} ({}x) | subject: {}",
+                "  ID  {} | from {!r} | sent {} | src={!r} ({}x) | dst={!r} ({}x) | subject: {}",
                 mid, sample_src.from_addr or sample_dst.from_addr,
                 sample_src.sent_at or sample_dst.sent_at,
-                sample_src.folder_path, len(src_list),
-                sample_dst.folder_path, len(dst_list),
+                sample_src.folder_path, len(src.by_id[mid]),
+                sample_dst.folder_path, len(dst.by_id[mid]),
                 subj,
+            )
+
+    # ---- Sample: fuzzy matches with different/missing Message-IDs ----
+    if fuzzy_only_pairs and sample_size > 0:
+        log.info("Sample (up to {} fuzzy matches w/ differing Message-IDs):", sample_size)
+        for i, (s_rec, d_rec) in enumerate(fuzzy_only_pairs):
+            if i >= sample_size:
+                break
+            log.info(
+                "  FUZ from {!r} | sent {} | src={!r} | dst={!r} | subject: {}",
+                s_rec.from_addr or d_rec.from_addr,
+                s_rec.sent_at or d_rec.sent_at,
+                s_rec.folder_path,
+                d_rec.folder_path,
+                s_rec.subject or d_rec.subject or "(no subject)",
+            )
+            log.info(
+                "      src-id={!r}  dst-id={!r}",
+                s_rec.message_id or "(missing)",
+                d_rec.message_id or "(missing)",
             )
     return result
 
@@ -261,19 +348,38 @@ def main() -> int:
 
     # Summary table
     print()
-    hdr = f"{'mailbox':<46} {'src_msgs':>10} {'dst_msgs':>10} {'overlap_ids':>12} {'src_dups':>10} {'dst_dups':>10}  status"
+    hdr = (
+        f"{'mailbox':<46} {'src_msgs':>10} {'dst_msgs':>10} "
+        f"{'id_match':>10} {'fuzzy':>10} {'fuzzy_only':>11}  status"
+    )
     print(hdr)
     print("-" * len(hdr))
     for r in sorted(results, key=lambda x: x["mailbox"]):
         if "error" in r:
-            print(f"{r['mailbox']:<46} {'-':>10} {'-':>10} {'-':>12} {'-':>10} {'-':>10}  ERROR: {r['error'][:30]}")
+            print(
+                f"{r['mailbox']:<46} {'-':>10} {'-':>10} {'-':>10} {'-':>10} {'-':>11}  "
+                f"ERROR: {r['error'][:30]}"
+            )
         elif r.get("skipped"):
-            print(f"{r['mailbox']:<46} {'-':>10} {'-':>10} {'-':>12} {'-':>10} {'-':>10}  no Imported PST")
+            print(
+                f"{r['mailbox']:<46} {'-':>10} {'-':>10} {'-':>10} {'-':>10} {'-':>11}  "
+                f"no Imported PST"
+            )
         else:
             print(
-                f"{r['mailbox']:<46} {r['src_msgs_with_id']:>10} {r['dst_msgs_with_id']:>10} "
-                f"{r['overlap_ids']:>12} {r['src_msgs_in_overlap']:>10} {r['dst_msgs_in_overlap']:>10}  ok"
+                f"{r['mailbox']:<46} "
+                f"{r['src_msgs_with_id'] + r['src_msgs_no_id']:>10} "
+                f"{r['dst_msgs_with_id'] + r['dst_msgs_no_id']:>10} "
+                f"{r['src_msgs_in_overlap']:>10} "
+                f"{r['src_msgs_in_fuzzy']:>10} "
+                f"{r['fuzzy_only_pairs']:>11}  ok"
             )
+    print()
+    print("Columns: src_msgs/dst_msgs = total messages in each subtree;")
+    print("         id_match  = src messages whose internetMessageId is also present in the live mailbox;")
+    print("         fuzzy     = src messages whose (subject, sent-minute, from) is also present in the live mailbox;")
+    print("         fuzzy_only= matches found by fuzzy key but with differing/missing Message-IDs")
+    print("                     (high values here suggest the other importer rewrote IDs).")
     return 0
 
 
