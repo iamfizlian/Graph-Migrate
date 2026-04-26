@@ -95,33 +95,56 @@ def fetch_messages(graph: GraphClient, mailbox: str, folder_id: str, top: int) -
     )
     # $expand pulls back PR_MESSAGE_FLAGS (0x0E07) and PR_SUBMIT_FLAGS (0x0E14)
     # alongside the message so we can compare what Graph stores in MAPI to
-    # what it reports via the high-level isDraft / isRead properties. If
-    # those disagree we know the bug is in Graph's derivation, not in our
-    # writes.
-    expand = (
-        "singleValueExtendedProperties("
-        "$filter=id eq 'Integer 0x0E07' or id eq 'Integer 0x0E14')"
-    )
-    path = (
-        f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"
-        f"?$top={top}&$select={select}&$expand={expand}"
-        f"&$orderby=receivedDateTime desc"
-    )
-    resp = graph.get(path, expect_status=(200,))
+    # what it reports via the high-level isDraft / isRead properties.
+    #
+    # We pass the query via params= rather than baking it into the path so
+    # httpx URL-encodes the embedded single quotes / spaces.  An earlier
+    # version embedded the whole thing in the path and Graph silently
+    # dropped singleValueExtendedProperties from the response (parser
+    # confused by the unencoded quotes / '=' inside $filter()).
+    path = f"/users/{quote(mailbox)}/mailFolders/{folder_id}/messages"
+    params = {
+        "$top": str(top),
+        "$select": select,
+        "$orderby": "receivedDateTime desc",
+        "$expand": (
+            "singleValueExtendedProperties("
+            "$filter=id eq 'Integer 0x0E07' or id eq 'Integer 0x0E14')"
+        ),
+    }
+    resp = graph.get(path, params=params, expect_status=(200,))
     return resp.json().get("value", [])
 
 
 def _ext_prop_int(msg: dict, prop_id: str) -> int | None:
     """Pull the integer value of a single extended property out of the
-    expanded singleValueExtendedProperties array on a message."""
+    expanded singleValueExtendedProperties array on a message.
+
+    Graph normalises the stored ID -- e.g. ``Integer 0x0E07`` may come
+    back as ``Integer 0xE07`` (no leading zero in the tag).  Compare on
+    a normalised form so we don't miss matches.
+    """
+    want = _norm_prop_id(prop_id)
     for ep in msg.get("singleValueExtendedProperties") or []:
-        if ep.get("id") == prop_id:
+        if _norm_prop_id(ep.get("id") or "") == want:
             v = ep.get("value")
             try:
                 return int(v) if v is not None else None
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def _norm_prop_id(pid: str) -> str:
+    """Normalise an extended-property id like 'Integer 0x0E07' -> 'integer 0xe07'.
+    Strips leading zeros from the hex tag so Graph's quirky echo of the
+    same property under a slightly different spelling still matches."""
+    pid = pid.strip().lower()
+    if " 0x" in pid:
+        head, tag = pid.split(" 0x", 1)
+        tag = tag.lstrip("0") or "0"
+        return f"{head} 0x{tag}"
+    return pid
 
 
 def fetch_smtp_date_header(graph: GraphClient, mailbox: str, msg_id: str) -> str | None:
