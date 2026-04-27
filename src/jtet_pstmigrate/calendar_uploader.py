@@ -1,12 +1,13 @@
 """Upload one .ics appointment to a Graph mailbox as a calendar event.
 
 We POST a single JSON event document to ``/users/{upn}/calendar/events``
-(the user's default calendar). Recurring events from the source PST
-become individual single-occurrence events in the destination calendar
-for v1 -- the original RRULE text is preserved in the event body so no
-data is lost, but the destination calendar doesn't recreate the
-recurrence pattern. Building a full RRULE -> Graph ``recurrence``
-mapping is a follow-up.
+(the user's default calendar). Recurring events are mapped to Graph's
+``recurrence`` object for the patterns Graph supports natively (daily,
+weekly, monthly absolute/relative, yearly absolute/relative, with
+COUNT/UNTIL/no-end ranges). Anything Graph can't express -- BYSETPOS,
+multi-day BYDAY in monthly/yearly, hourly/minutely frequencies -- falls
+back to a single-occurrence event with the raw RRULE text appended to
+the body so the data is still visible to the user.
 
 Times are normalised to UTC. All-day events use ``isAllDay=true`` so
 they render correctly across viewers' time zones regardless of the UTC
@@ -16,6 +17,7 @@ offset stored on the date.
 from __future__ import annotations
 
 import datetime as _dt
+import re
 from urllib.parse import quote
 
 from icalendar import Calendar
@@ -123,8 +125,13 @@ def _ics_to_graph_event(raw: bytes) -> dict | None:
             start_tz = end_tz = "UTC"
 
     rrule = event.get("RRULE")
+    recurrence: dict | None = None
     if rrule is not None:
-        description = _append_rrule_note(description, rrule)
+        recurrence = _rrule_to_graph_recurrence(rrule, dtstart)
+        if recurrence is None:
+            # Pattern we don't know how to map (e.g., complex BYSETPOS).
+            # Stash the raw rule in the body so the data isn't silently lost.
+            description = _append_rrule_note(description, rrule)
 
     doc: dict = {
         "subject": summary,
@@ -154,7 +161,194 @@ def _ics_to_graph_event(raw: bytes) -> dict | None:
     if attendees:
         doc["attendees"] = attendees
 
+    if recurrence is not None:
+        doc["recurrence"] = recurrence
+
     return doc
+
+
+# -- RRULE -> Graph recurrence -------------------------------------------
+
+# iCal day codes -> Graph dayOfWeek strings.
+_GRAPH_DAY = {
+    "SU": "sunday", "MO": "monday", "TU": "tuesday", "WE": "wednesday",
+    "TH": "thursday", "FR": "friday", "SA": "saturday",
+}
+# BYDAY ordinal -> Graph relative-monthly index. Graph only supports the
+# first four positions and "last"; anything else falls back to single-event.
+_GRAPH_INDEX = {
+    1: "first", 2: "second", 3: "third", 4: "fourth",
+    -1: "last", 5: "last",
+}
+_BYDAY_RE = re.compile(r"^(-?\d+)?([A-Z]{2})$")
+
+
+def _rrule_to_graph_recurrence(rrule, dtstart) -> dict | None:
+    """Convert an iCalendar RRULE to a Graph ``recurrence`` object, or None.
+
+    Returns None when the rule uses a feature Graph's pattern doesn't
+    express (BYSETPOS, multi-day BYDAY in monthly/yearly, hourly/minutely
+    frequencies, etc.). The caller falls back to a single-event upload
+    with the raw rule text dropped into the body, which keeps the data
+    visible in OWA even if we can't recreate the exact recurrence.
+
+    icalendar exposes RRULE values as lists; we extract scalars
+    defensively because individual versions sometimes return bare values.
+    """
+    def _scalar(v):
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+
+    def _list(v):
+        if v is None:
+            return []
+        return list(v) if isinstance(v, list) else [v]
+
+    freq_raw = _scalar(rrule.get("FREQ"))
+    if not freq_raw:
+        return None
+    freq = str(freq_raw).upper()
+    interval = int(_scalar(rrule.get("INTERVAL")) or 1)
+    if interval < 1:
+        return None
+
+    pattern: dict = {"interval": interval}
+    start_d = _dtstart_date(dtstart)
+
+    if freq == "DAILY":
+        pattern["type"] = "daily"
+
+    elif freq == "WEEKLY":
+        byday_raw = _list(rrule.get("BYDAY"))
+        days: list[str] = []
+        for d in byday_raw:
+            ds = str(d).upper().strip()
+            mapped = _GRAPH_DAY.get(ds[-2:])
+            if mapped is None:
+                return None
+            days.append(mapped)
+        if not days:
+            # iCal spec: WEEKLY with no BYDAY recurs on the same weekday
+            # as DTSTART. Mirror that so Graph doesn't reject the request.
+            days = [_weekday_name(start_d)]
+        pattern["type"] = "weekly"
+        pattern["daysOfWeek"] = days
+        pattern["firstDayOfWeek"] = "sunday"
+
+    elif freq == "MONTHLY":
+        bymonthday = _list(rrule.get("BYMONTHDAY"))
+        byday = _list(rrule.get("BYDAY"))
+        if bymonthday:
+            if len(bymonthday) != 1:
+                return None
+            day_of_month = int(_scalar(bymonthday))
+            if not 1 <= day_of_month <= 31:
+                return None
+            pattern["type"] = "absoluteMonthly"
+            pattern["dayOfMonth"] = day_of_month
+        elif byday:
+            if len(byday) != 1:
+                return None
+            m = _BYDAY_RE.match(str(_scalar(byday)).upper())
+            if not m or not m.group(1):
+                return None
+            ordinal = int(m.group(1))
+            if ordinal not in _GRAPH_INDEX:
+                return None
+            pattern["type"] = "relativeMonthly"
+            pattern["index"] = _GRAPH_INDEX[ordinal]
+            pattern["daysOfWeek"] = [_GRAPH_DAY[m.group(2)]]
+        else:
+            # MONTHLY with no BYDAY/BYMONTHDAY -> recurs on the same
+            # day-of-month as DTSTART.
+            pattern["type"] = "absoluteMonthly"
+            pattern["dayOfMonth"] = start_d.day
+
+    elif freq == "YEARLY":
+        bymonth = _list(rrule.get("BYMONTH"))
+        bymonthday = _list(rrule.get("BYMONTHDAY"))
+        byday = _list(rrule.get("BYDAY"))
+        month = int(_scalar(bymonth)) if bymonth else start_d.month
+        if not 1 <= month <= 12:
+            return None
+        if bymonthday:
+            if len(bymonthday) != 1:
+                return None
+            dom = int(_scalar(bymonthday))
+            if not 1 <= dom <= 31:
+                return None
+            pattern["type"] = "absoluteYearly"
+            pattern["month"] = month
+            pattern["dayOfMonth"] = dom
+        elif byday:
+            if len(byday) != 1:
+                return None
+            m = _BYDAY_RE.match(str(_scalar(byday)).upper())
+            if not m or not m.group(1):
+                return None
+            ordinal = int(m.group(1))
+            if ordinal not in _GRAPH_INDEX:
+                return None
+            pattern["type"] = "relativeYearly"
+            pattern["month"] = month
+            pattern["index"] = _GRAPH_INDEX[ordinal]
+            pattern["daysOfWeek"] = [_GRAPH_DAY[m.group(2)]]
+        else:
+            pattern["type"] = "absoluteYearly"
+            pattern["month"] = month
+            pattern["dayOfMonth"] = start_d.day
+
+    else:
+        # HOURLY, MINUTELY, SECONDLY -- Graph has no equivalent.
+        return None
+
+    # Range: COUNT wins over UNTIL when both are set (per RFC 5545 they're
+    # mutually exclusive; we just pick a sane order if a generator emitted
+    # both). Without either, the series has no end.
+    until = _scalar(rrule.get("UNTIL"))
+    count = _scalar(rrule.get("COUNT"))
+    rng: dict = {
+        "startDate": f"{start_d:%Y-%m-%d}",
+        "recurrenceTimeZone": "UTC",
+    }
+    if count is not None:
+        try:
+            rng["type"] = "numbered"
+            rng["numberOfOccurrences"] = int(count)
+        except (TypeError, ValueError):
+            return None
+    elif until is not None:
+        if isinstance(until, _dt.datetime):
+            until_d = (
+                until.astimezone(_dt.timezone.utc).date()
+                if until.tzinfo else until.date()
+            )
+        elif isinstance(until, _dt.date):
+            until_d = until
+        else:
+            return None
+        rng["type"] = "endDate"
+        rng["endDate"] = f"{until_d:%Y-%m-%d}"
+    else:
+        rng["type"] = "noEnd"
+
+    return {"pattern": pattern, "range": rng}
+
+
+def _dtstart_date(prop) -> _dt.date:
+    """Calendar-date of DTSTART, normalised to UTC for tz-aware datetimes."""
+    d = prop.dt if hasattr(prop, "dt") else prop
+    if isinstance(d, _dt.datetime):
+        if d.tzinfo:
+            d = d.astimezone(_dt.timezone.utc)
+        return d.date()
+    return d
+
+
+def _weekday_name(d: _dt.date) -> str:
+    return ("monday", "tuesday", "wednesday", "thursday",
+            "friday", "saturday", "sunday")[d.weekday()]
 
 
 def _to_graph_date(prop) -> tuple[str, str, bool]:
