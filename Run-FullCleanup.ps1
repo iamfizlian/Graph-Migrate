@@ -398,6 +398,11 @@ $results = @()
 # --- Step 1: Flatten -------------------------------------------------------
 
 if (-not $SkipFlatten) {
+    Write-Host ''
+    Write-Host ">>> STEP 1 of $($plan.Count): Flatten (_flatten_imported.py) — Microsoft Graph, mailboxes run in PARALLEL." -ForegroundColor Yellow
+    Write-Host ">>> Log: $RunDir\step1-flatten.log  |  Search for:  PROGRESS:  to see how many of $($SelectedMailboxes.Count) mailboxes have FINISHED (each line = one mailbox done)." -ForegroundColor Yellow
+    Write-Host ">>> While a large Inbox merge runs, you also get  moved N messages  every 200 msgs. Graph 500 + backoff is throttling; usually succeeds after retries." -ForegroundColor DarkGray
+    Write-Host ''
     $results += Invoke-Step `
         -Name    'Step 1: Flatten Imported PST' `
         -LogFile 'step1-flatten.log' `
@@ -411,6 +416,9 @@ if (-not $SkipFlatten) {
 # --- Step 2: Consolidate Sent ---------------------------------------------
 
 if (-not $SkipConsolidate) {
+    Write-Host ''
+    Write-Host ">>> STEP 2 of $($plan.Count): Consolidate Sent (_consolidate_sent.py) — parallel mailboxes, same PROGRESS: k/N idea in step2-consolidate.log." -ForegroundColor Yellow
+    Write-Host ''
     $results += Invoke-Step `
         -Name    'Step 2: Consolidate Sent Items' `
         -LogFile 'step2-consolidate.log' `

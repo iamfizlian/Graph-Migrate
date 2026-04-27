@@ -942,9 +942,15 @@ def main() -> int:
     pool = AppPool(cfg.apps)
     parallelism = min(cfg.migration.max_parallel_mailboxes, len(mailboxes)) or 1
 
+    n_mb = len(mailboxes)
     logger.bind(ctx="flatten").info(
         "Processing {} mailbox(es) with {} parallel workers and {} app(s).",
-        len(mailboxes), parallelism, len(cfg.apps),
+        n_mb, parallelism, len(cfg.apps),
+    )
+    logger.bind(ctx="flatten").info(
+        "STEP 1 PROGRESS: watch for lines like  PROGRESS: k/{} mailboxes complete  "
+        "(each line fires when one mailbox finishes — order is completion order, not CSV order).",
+        n_mb,
     )
 
     all_stats: list[dict] = []
@@ -957,13 +963,24 @@ def main() -> int:
                 ): m
                 for m in mailboxes
             }
+            done = 0
             for fut in as_completed(futures):
                 m = futures[fut]
                 try:
                     all_stats.append(fut.result())
+                    done += 1
+                    logger.bind(ctx="flatten").info(
+                        "PROGRESS: {}/{} mailboxes complete (finished: {}, ok).",
+                        done, n_mb, m,
+                    )
                 except Exception as e:
                     logger.bind(ctx=f"flatten[{m}]").exception("Crashed: {}", e)
                     all_stats.append({"mailbox": m, "error": str(e)})
+                    done += 1
+                    logger.bind(ctx="flatten").warning(
+                        "PROGRESS: {}/{} mailboxes complete (finished: {}, ERROR — see traceback above).",
+                        done, n_mb, m,
+                    )
 
     # Summary
     print()

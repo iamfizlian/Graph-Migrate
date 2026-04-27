@@ -371,9 +371,14 @@ def main() -> int:
     pool = AppPool(cfg.apps)
     parallelism = min(cfg.migration.max_parallel_mailboxes, len(mailboxes)) or 1
 
+    n_mb = len(mailboxes)
     logger.bind(ctx="sent").info(
         "Processing {} mailbox(es) with {} parallel workers, {} app(s).",
-        len(mailboxes), parallelism, len(cfg.apps),
+        n_mb, parallelism, len(cfg.apps),
+    )
+    logger.bind(ctx="sent").info(
+        "STEP 2 PROGRESS: watch for  PROGRESS: k/{} mailboxes complete  (fires when each mailbox's consolidate finishes).",
+        n_mb,
     )
 
     results: list[dict] = []
@@ -383,16 +388,32 @@ def main() -> int:
                 ex.submit(consolidate_mailbox, graph, m, dry_run=ns.dry_run): m
                 for m in mailboxes
             }
+            done = 0
             for fut in as_completed(futs):
                 m = futs[fut]
                 try:
                     results.append(fut.result())
+                    done += 1
+                    logger.bind(ctx="sent").info(
+                        "PROGRESS: {}/{} mailboxes complete (finished: {}, ok).",
+                        done, n_mb, m,
+                    )
                 except GraphError as e:
                     logger.bind(ctx=f"sent[{m}]").error("Graph error: {}", e)
                     results.append({"mailbox": m, "error": str(e)})
+                    done += 1
+                    logger.bind(ctx="sent").warning(
+                        "PROGRESS: {}/{} mailboxes complete (finished: {}, Graph error).",
+                        done, n_mb, m,
+                    )
                 except Exception as e:
                     logger.bind(ctx=f"sent[{m}]").exception("Crashed: {}", e)
                     results.append({"mailbox": m, "error": str(e)})
+                    done += 1
+                    logger.bind(ctx="sent").warning(
+                        "PROGRESS: {}/{} mailboxes complete (finished: {}, ERROR).",
+                        done, n_mb, m,
+                    )
 
     print()
     hdr = f"{'mailbox':<46} {'folders':>8} {'messages':>10}  status"
