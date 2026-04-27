@@ -215,13 +215,23 @@ class MessageUploader:
             if part.is_multipart():
                 continue
             payload = part.get_payload(decode=True) or b""
-            if not payload or part.get_content_disposition() not in ("attachment", "inline"):
+            disp = part.get_content_disposition()
+            content_id = (part.get("Content-ID") or "").strip("<> \t")
+            # An inline image can be marked either with Content-Disposition:
+            # inline OR by simply having a Content-ID that the HTML body
+            # references via cid:. Treat both as inline so OWA links the
+            # <img src="cid:..."> to the attachment instead of showing a
+            # broken-image placeholder beside a separate downloadable copy.
+            is_inline = disp == "inline" or bool(content_id)
+            if not payload or (disp not in ("attachment", "inline") and not content_id):
                 continue
             attached_bytes += self._upload_attachment(
                 msg_id,
-                filename=part.get_filename() or "attachment.bin",
+                filename=part.get_filename() or ("image.bin" if is_inline else "attachment.bin"),
                 content_bytes=payload,
                 content_type=part.get_content_type(),
+                content_id=content_id or None,
+                is_inline=is_inline,
                 app_id=app_id,
             )
 
@@ -232,18 +242,32 @@ class MessageUploader:
         )
 
     def _upload_attachment(
-        self, msg_id: str, filename: str, content_bytes: bytes, content_type: str, *, app_id: str
+        self,
+        msg_id: str,
+        filename: str,
+        content_bytes: bytes,
+        content_type: str,
+        *,
+        content_id: str | None = None,
+        is_inline: bool = False,
+        app_id: str,
     ) -> int:
         if len(content_bytes) <= self._threshold:
+            attachment: dict[str, object] = {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": filename[:255],
+                "contentType": content_type,
+                "contentBytes": base64.b64encode(content_bytes).decode("ascii"),
+                "isInline": is_inline,
+            }
+            if content_id:
+                # Graph stores contentId as the bare token (no <>); the
+                # parser already stripped angle brackets above.
+                attachment["contentId"] = content_id
             path = f"/users/{quote(self._mailbox)}/messages/{msg_id}/attachments"
             self._graph.post(
                 path,
-                json={
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": filename[:255],
-                    "contentType": content_type,
-                    "contentBytes": base64.b64encode(content_bytes).decode("ascii"),
-                },
+                json=attachment,
                 expect_status=(201,),
                 app_id=app_id,
             )
@@ -251,16 +275,18 @@ class MessageUploader:
 
         # Large attachment: open upload session, chunk-upload via PUT.
         session_path = f"/users/{quote(self._mailbox)}/messages/{msg_id}/attachments/createUploadSession"
+        attachment_item: dict[str, object] = {
+            "attachmentType": "file",
+            "name": filename[:255],
+            "size": len(content_bytes),
+            "contentType": content_type,
+            "isInline": is_inline,
+        }
+        if content_id:
+            attachment_item["contentId"] = content_id
         resp = self._graph.post(
             session_path,
-            json={
-                "AttachmentItem": {
-                    "attachmentType": "file",
-                    "name": filename[:255],
-                    "size": len(content_bytes),
-                    "contentType": content_type,
-                }
-            },
+            json={"AttachmentItem": attachment_item},
             expect_status=(201, 200),
             app_id=app_id,
         )
