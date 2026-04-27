@@ -646,6 +646,115 @@ def run_purge_contacts(
     raise typer.Exit(1 if errors else 0)
 
 
+@app.command("import-all")
+def run_import_all(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    limit: LimitOpt = None,
+    list_only: ListOnlyOpt = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Run mail + calendar + contacts back-to-back for the selected mailboxes.
+
+    Equivalent to running ``import`` then ``import-calendar`` then
+    ``import-contacts`` with the same mapping and filters, but with one
+    confirmation prompt and one consolidated exit code.
+
+    The three phases share state but run independently: a mail failure on
+    one mailbox does not skip that mailbox's calendar or contacts. Each
+    phase is also idempotent against the existing dedup tables, so running
+    this against a partly-imported mailbox safely no-ops the parts that
+    already finished.
+
+    Use this for production/bulk runs once the per-pass commands have
+    been verified on a pilot mailbox. For iterative debugging keep using
+    the dedicated subcommands -- those produce the same state, just with
+    smaller blast radius if something goes wrong.
+    """
+    cfg = _load(config)
+    run_id = f"import-all_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=limit)
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    if list_only or len(rows) != len(all_rows):
+        _print_selection(
+            rows,
+            heading=("Dry-run selection (mail + calendar + contacts)"
+                     if list_only else
+                     "Selected rows (mail + calendar + contacts, filtered)"),
+        )
+    if list_only:
+        raise typer.Exit(0)
+
+    pool = AppPool(cfg.apps)
+    filter_note = (
+        f"  selection = {len(rows)}/{len(all_rows)} rows (filtered)\n"
+        if len(rows) != len(all_rows) else ""
+    )
+    console.print(
+        f"\n[bold]About to import MAIL + CALENDAR + CONTACTS[/] "
+        f"from {len(rows)} PSTs into "
+        f"{len({r.target_mailbox for r in rows})} mailbox(es).\n"
+        f"{filter_note}"
+        f"  app pool = {len(pool)} ({', '.join(pool.names)})\n"
+        f"  workers/mailbox = {cfg.migration.workers_per_mailbox}\n"
+        f"  parallel mailboxes = {cfg.migration.max_parallel_mailboxes}\n"
+        f"  state dir = {cfg.paths.state_dir}\n"
+        f"\n"
+        f"Required Graph Application permissions on every app in the pool:\n"
+        f"  - Mail.ReadWrite      (mail phase)\n"
+        f"  - Calendars.ReadWrite (calendar phase)\n"
+        f"  - Contacts.ReadWrite  (contacts phase)\n"
+        f"A 403 in any phase usually means a worker app is missing the\n"
+        f"corresponding grant. The other phases will still run.\n"
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+    orch = Orchestrator(cfg, state, pool)
+
+    # Phases run sequentially because each builds its own GraphClient and
+    # ThreadPoolExecutor; running them concurrently would just multiply
+    # per-mailbox throttling pressure without finishing any faster on a
+    # single tenant. We deliberately do NOT short-circuit the next phase
+    # when the previous one has failures -- mail and calendar/contacts
+    # are independent in the source PST, and if one phase has bad data
+    # we still want the others to land.
+    console.print("\n[bold cyan]Phase 1/3 -- mail[/]")
+    mail_reports = orch.run(rows)
+
+    console.print("\n[bold cyan]Phase 2/3 -- calendar[/]")
+    cal_reports = orch.run_calendar(rows)
+
+    console.print("\n[bold cyan]Phase 3/3 -- contacts[/]")
+    con_reports = orch.run_contacts(rows)
+
+    def _failed(reports: list) -> int:
+        return sum(1 for r in reports if r.status != "done" or r.items_failed)
+
+    failed = _failed(mail_reports) + _failed(cal_reports) + _failed(con_reports)
+
+    console.print(
+        f"\n[bold]All phases complete.[/]  "
+        f"mail-failed=[red]{_failed(mail_reports)}[/]  "
+        f"calendar-failed=[red]{_failed(cal_reports)}[/]  "
+        f"contacts-failed=[red]{_failed(con_reports)}[/]"
+    )
+    raise typer.Exit(1 if failed else 0)
+
+
 @app.command()
 def status(
     config: ConfigOpt = None,
