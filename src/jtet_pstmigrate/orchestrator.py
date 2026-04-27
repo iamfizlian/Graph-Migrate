@@ -552,30 +552,50 @@ class Orchestrator:
     # Mail purge
     # ------------------------------------------------------------------
     #
-    # Enumerate every mail message in each selected mailbox via Graph and
-    # DELETE it. Messages whose parentFolderId matches the mailbox's
-    # Deleted Items folder are skipped (one fewer round-trip per message
-    # and the user explicitly doesn't care about those). We deliberately
-    # do NOT consult the local `messages` state table: that table is
-    # cleared whenever the user runs `reset-state`, and even when it
-    # isn't, what we want here is "kill every visible mail in the
-    # mailbox," not "kill only what we previously imported."
+    # Folder-aware mailbox wipe. For every selected mailbox we walk the
+    # mailFolders tree top-down. For each folder we encounter:
     #
-    # A regular DELETE soft-deletes (moves the message to Deleted
-    # Items). That's fine -- we're not trying to permanently purge,
-    # just to make the mailbox look empty for re-import.
+    #   1. Try DELETE /users/{upn}/mailFolders/{id}. On success Graph
+    #      cascades the entire subtree (every message and child folder
+    #      goes too) in a single round-trip, which is dramatically
+    #      faster than per-message DELETE.
+    #   2. If Graph rejects the DELETE with 400 / 403 / 405 -- the
+    #      folder is a "distinguished" / well-known folder that
+    #      Exchange refuses to remove (Inbox, Sent Items, Drafts,
+    #      Outbox, Junk Email, Conversation History, ...) -- we
+    #      fall back to: enumerate the folder's child folders and
+    #      _walk into each (their subtrees might be deletable),
+    #      then drain the folder's own messages with parallel DELETE.
+    #
+    # Deleted Items is resolved up front by well-known name and skipped
+    # entirely. The user has been clear that what's there doesn't
+    # matter; we don't enter that subtree at all. Deleted folders /
+    # messages may end up there as a side effect of the regular
+    # DELETE-soft-delete semantics, which is also fine.
+    #
+    # We deliberately do NOT consult the local `messages` state table.
+    # That table is cleared by `reset-state`, and even when it isn't,
+    # what we want here is "make the mailbox look empty for re-import,"
+    # not "remove the specific items I previously uploaded."
     #
     # Throughput: parallel mailboxes (max_parallel_mailboxes) x
-    # workers_per_mailbox x app pool. ~200-400 deletes/sec per mailbox
-    # in steady state.
+    # workers_per_mailbox x app pool. Folder-DELETE cascades make this
+    # near-instant for mailboxes that are mostly custom folders;
+    # mailboxes with everything in Inbox/Sent Items run at the
+    # per-message rate (~200-400 deletes/sec/mailbox).
 
     def purge_mail(self, mapping: list[MappingRow]) -> tuple[int, int, int]:
-        """DELETE every message outside Deleted Items for the selected mailboxes.
+        """Wipe every mail folder + message (except Deleted Items) for selected mailboxes.
 
-        Returns ``(deleted, missing, errors)``. ``missing`` counts 404s on
-        DELETE (messages that disappeared mid-run, e.g. from another worker).
-        Does not touch the local state DB -- the destination mailbox is the
-        sole source of truth for which messages exist.
+        Returns ``(deleted, missing, errors)`` where ``deleted`` is the
+        approximate number of messages removed (folder-DELETE cascades
+        are counted by the folder's reported ``totalItemCount`` at
+        enumeration time). ``missing`` counts 404s on per-message
+        DELETE (e.g. another worker won the race). ``errors`` counts
+        anything else.
+
+        Does not touch the local state DB -- the destination mailbox
+        is the sole source of truth.
         """
         if not mapping:
             return (0, 0, 0)
@@ -625,73 +645,51 @@ class Orchestrator:
     ) -> tuple[int, int, int]:
         upn = quote(mailbox)
         log = logger.bind(ctx=f"purge-mail[{mailbox}]")
+        workers = max(1, self._cfg.migration.workers_per_mailbox)
 
-        # 1. Resolve the Deleted Items folder id so we can skip messages in
-        #    it. The well-known name 'deleteditems' is locale-stable.
-        del_folder_id: str | None = None
+        # Folder ids whose subtree we never enter. The well-known name
+        # 'deleteditems' is locale-stable across tenants.
+        skip_folder_ids: set[str] = set()
         try:
             resp = graph.get(
                 f"/users/{upn}/mailFolders/deleteditems",
                 expect_status=(200,),
             )
-            del_folder_id = resp.json().get("id")
+            skip_folder_ids.add(resp.json()["id"])
         except Exception as e:
-            log.warning("could not resolve deleteditems folder id: {}", e)
-            # Continue without filtering; worst case we delete from Deleted
-            # Items too, which the user already said doesn't matter.
-
-        # 2. Page /users/{upn}/messages, collecting ids to delete. The
-        #    /messages collection returns mail across ALL mail folders
-        #    (Inbox, Sent Items, sub-folders, custom folders, ...) but
-        #    excludes hidden Recoverable Items. parentFolderId is
-        #    returned via $select so we can filter Deleted Items.
-        ids_to_delete: list[str] = []
-        next_url: str | None = (
-            f"/users/{upn}/messages"
-            f"?$top=999&$select=id,parentFolderId"
-        )
-        pages = 0
-        list_errors = 0
-        while next_url:
-            try:
-                resp = graph.get(next_url, expect_status=(200,))
-            except Exception as e:
-                log.warning("paging GET failed: {}", e)
-                list_errors += 1
-                break
-            body = resp.json()
-            for msg in body.get("value", []):
-                if del_folder_id and msg.get("parentFolderId") == del_folder_id:
-                    continue
-                ids_to_delete.append(msg["id"])
-            next_url = body.get("@odata.nextLink")
-            # @odata.nextLink is absolute; strip the v1.0 host so the
-            # request rides our existing base_url + auth/throttle wiring.
-            if next_url and next_url.startswith(
-                "https://graph.microsoft.com/v1.0"
-            ):
-                next_url = next_url[len("https://graph.microsoft.com/v1.0"):]
-            pages += 1
-
-        if not ids_to_delete:
-            log.info(
-                "Nothing to purge ({} pages enumerated, all empty or in "
-                "Deleted Items)", pages,
+            log.warning(
+                "could not resolve deleteditems folder id: {} -- "
+                "continuing without skip", e,
             )
-            return (0, 0, list_errors)
 
-        log.info(
-            "Deleting {} message(s) across {} folder(s)",
-            len(ids_to_delete),
-            "(unknown — not enumerated)",
-        )
+        # Aggregated counters (closure-mutated by helpers below).
+        msg_deleted = 0
+        msg_missing = 0
+        msg_errors = 0
+        folder_deleted = 0
 
-        deleted = 0
-        missing = 0
-        errors = list_errors
-        workers = max(1, self._cfg.migration.workers_per_mailbox)
+        def _strip_host(url: str | None) -> str | None:
+            if url and url.startswith("https://graph.microsoft.com/v1.0"):
+                return url[len("https://graph.microsoft.com/v1.0"):]
+            return url
 
-        def _delete_one(mid: str) -> str:
+        def _enum(path: str) -> list[dict]:
+            """Page through a Graph collection, returning all values."""
+            out: list[dict] = []
+            next_url: str | None = path
+            while next_url:
+                try:
+                    body = graph.get(
+                        next_url, expect_status=(200,)
+                    ).json()
+                except Exception as e:
+                    log.warning("enum GET failed at {}: {}", next_url, e)
+                    return out
+                out.extend(body.get("value", []))
+                next_url = _strip_host(body.get("@odata.nextLink"))
+            return out
+
+        def _delete_message(mid: str) -> str:
             try:
                 graph.delete(
                     f"/users/{upn}/messages/{quote(mid)}",
@@ -702,29 +700,107 @@ class Orchestrator:
                 if e.status == 404:
                     return "missing"
                 log.warning(
-                    "DELETE failed for {}: {} {}", mid, e.status, e.body
+                    "DELETE message {} failed: {} {}",
+                    mid, e.status, e.body,
                 )
                 return "error"
             except Exception as e:
-                log.warning("DELETE failed for {}: {}", mid, e)
+                log.warning("DELETE message {} crashed: {}", mid, e)
                 return "error"
 
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="purge-mail-del"
-        ) as p:
-            for outcome in p.map(_delete_one, ids_to_delete):
-                if outcome == "deleted":
-                    deleted += 1
-                elif outcome == "missing":
-                    missing += 1
-                else:
-                    errors += 1
+        def _drain_folder_messages(fid: str) -> None:
+            """Per-message DELETE for a folder we couldn't cascade-delete."""
+            nonlocal msg_deleted, msg_missing, msg_errors
+            ids = [
+                m["id"]
+                for m in _enum(
+                    f"/users/{upn}/mailFolders/{quote(fid)}/messages"
+                    f"?$top=999&$select=id"
+                )
+            ]
+            if not ids:
+                return
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="purge-mail-msg"
+            ) as p:
+                for outcome in p.map(_delete_message, ids):
+                    if outcome == "deleted":
+                        msg_deleted += 1
+                    elif outcome == "missing":
+                        msg_missing += 1
+                    else:
+                        msg_errors += 1
+
+        def _walk(folder: dict) -> None:
+            """Try to cascade-delete ``folder``; otherwise recurse + drain."""
+            nonlocal msg_deleted, msg_errors, folder_deleted
+            fid = folder["id"]
+            if fid in skip_folder_ids:
+                return
+            display = folder.get("displayName", "?")
+            total = folder.get("totalItemCount", 0) or 0
+            kids = folder.get("childFolderCount", 0) or 0
+
+            try:
+                graph.delete(
+                    f"/users/{upn}/mailFolders/{quote(fid)}",
+                    expect_status=(204, 200),
+                )
+                folder_deleted += 1
+                msg_deleted += total
+                log.info(
+                    "deleted folder {!r} (cascaded ~{} message(s), "
+                    "{} child folder(s))",
+                    display, total, kids,
+                )
+                return
+            except GraphError as e:
+                if e.status not in (400, 403, 405):
+                    log.warning(
+                        "DELETE folder {!r} ({}) failed: {} {}",
+                        display, fid, e.status, e.body,
+                    )
+                    msg_errors += 1
+                    return
+                # Distinguished / protected folder -- fall through.
+                log.debug(
+                    "folder {!r} is protected, draining contents in place",
+                    display,
+                )
+            except Exception as e:
+                log.warning(
+                    "DELETE folder {!r} ({}) crashed: {}", display, fid, e
+                )
+                msg_errors += 1
+                return
+
+            if kids > 0:
+                for child in _enum(
+                    f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
+                    f"?$top=100"
+                    f"&$select=id,displayName,totalItemCount,childFolderCount"
+                ):
+                    _walk(child)
+            if total > 0:
+                _drain_folder_messages(fid)
+
+        top = _enum(
+            f"/users/{upn}/mailFolders"
+            f"?$top=100"
+            f"&$select=id,displayName,totalItemCount,childFolderCount"
+        )
+        if not top:
+            log.info("Nothing to purge -- mailFolders enum returned 0 entries")
+            return (0, 0, 0)
+
+        for f in top:
+            _walk(f)
 
         log.info(
-            "Done. deleted={} missing={} errors={}",
-            deleted, missing, errors,
+            "Done. folders_deleted={} messages_deleted~={} missing={} errors={}",
+            folder_deleted, msg_deleted, msg_missing, msg_errors,
         )
-        return (deleted, missing, errors)
+        return (msg_deleted, msg_missing, msg_errors)
 
     # ------------------------------------------------------------------
     # Contacts (Stage C, second half)

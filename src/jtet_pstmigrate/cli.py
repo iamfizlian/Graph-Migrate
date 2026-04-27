@@ -763,24 +763,31 @@ def run_purge_mail(
     exclude_pst: ExcludePstFilterOpt = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
 ) -> None:
-    """Delete every mail message in the selected mailboxes, except Deleted Items.
+    """Wipe every mail folder + message in the selected mailboxes (except Deleted Items).
 
-    Enumerates ``/users/{upn}/messages`` for each target mailbox and
-    DELETEs every message whose parent folder is not Deleted Items.
-    A regular DELETE soft-deletes (moves the message to Deleted Items),
-    which is fine -- the goal is to make the visible folders look empty
-    so a subsequent ``import`` / ``import-all`` runs against a clean
-    destination.
+    Walks ``/users/{upn}/mailFolders`` top-down for each target
+    mailbox. For every folder it tries ``DELETE
+    /users/{upn}/mailFolders/{id}``: on success Graph cascades the
+    entire subtree -- every message and every child folder beneath
+    that folder -- in a single round-trip. For "distinguished" folders
+    that Exchange refuses to delete (Inbox, Sent Items, Drafts,
+    Outbox, Junk Email, Conversation History, ...), it falls back to
+    recursing into their children and draining their own messages
+    with parallel per-message DELETE.
 
-    Does NOT consult the local state database. Whatever the
-    ``messages`` table currently holds is irrelevant: the destination
-    mailbox itself is enumerated, so this works equally well after
-    ``reset-state``, after a botched run, or against a mailbox you
-    never imported into with this tool. Calendar and contact state and
+    Net result: after this command runs, the only folders left are
+    the ones Exchange protects (and Deleted Items), and they are all
+    empty. The mailbox is ready for a clean re-import that recreates
+    whatever folder structure your PST had.
+
+    Does NOT consult the local state database. The destination
+    mailbox is the sole source of truth, so this works equally well
+    after ``reset-state``, after a botched run, or against a mailbox
+    you never imported into with this tool. Calendar and contact
     items are untouched.
 
-    Mailboxes are de-duplicated, so multiple PST rows for the same UPN
-    only wipe the mailbox once.
+    Mailboxes are de-duplicated, so multiple PST rows for the same
+    UPN only wipe the mailbox once.
 
     Required Graph permission: ``Mail.ReadWrite`` (Application) on
     every app in the pool -- already required by ``import``, so this
@@ -827,13 +834,19 @@ def run_purge_mail(
             unique_mailboxes.append(row.target_mailbox)
 
     console.print(
-        f"\n[bold red]About to DELETE all mail (except Deleted Items)[/] "
-        f"from {len(unique_mailboxes)} mailbox(es):"
+        f"\n[bold red]About to wipe all mail folders + messages[/] "
+        f"(except Deleted Items) from {len(unique_mailboxes)} "
+        f"mailbox(es):"
     )
     for mb in unique_mailboxes:
         console.print(f"  - {mb}")
     console.print(
-        f"\n  app pool = {len(pool)} ({', '.join(pool.names)})\n"
+        f"\n  Custom folders are cascade-deleted (folder + all "
+        f"contents in one round-trip).\n"
+        f"  Distinguished folders (Inbox / Sent Items / Drafts / "
+        f"Outbox / Junk Email / etc.) cannot be deleted; their "
+        f"messages are drained instead.\n"
+        f"  app pool = {len(pool)} ({', '.join(pool.names)})\n"
         f"  workers/mailbox = {cfg.migration.workers_per_mailbox}\n"
         f"  parallel mailboxes = {cfg.migration.max_parallel_mailboxes}\n"
     )
