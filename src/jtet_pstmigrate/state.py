@@ -375,6 +375,31 @@ class StateStore:
                 ),
             )
 
+    def list_done_items(
+        self, mailbox: str, pst_path: str, item_type: str
+    ) -> list[sqlite3.Row]:
+        """Items uploaded successfully, with the Graph id needed for deletion."""
+        with self._connect() as conn:
+            return list(conn.execute(
+                """
+                SELECT source_path, graph_id, app_id
+                FROM non_mail_items
+                WHERE target_mailbox=? AND pst_path=? AND item_type=?
+                  AND status='done' AND graph_id IS NOT NULL
+                """,
+                (mailbox, pst_path, item_type),
+            ))
+
+    def delete_item(
+        self, mailbox: str, pst_path: str, source_path: str, item_type: str
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM non_mail_items "
+                "WHERE target_mailbox=? AND pst_path=? AND source_path=? AND item_type=?",
+                (mailbox, pst_path, source_path, item_type),
+            )
+
     def counts_for_items(
         self, mailbox: str, pst_path: str, item_type: str
     ) -> dict[str, int]:

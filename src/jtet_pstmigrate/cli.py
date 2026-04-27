@@ -436,6 +436,78 @@ def run_import_calendar(
     raise typer.Exit(1 if failed else 0)
 
 
+@app.command("purge-calendar")
+def run_purge_calendar(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Delete previously-imported calendar events and clear their state.
+
+    Use this when a calendar-import bug needs to be re-run cleanly: after
+    purge, the next ``import-calendar`` re-uploads every event from
+    scratch with the corrected code path. Mail state is untouched.
+
+    The purge is keyed on (mailbox, pst_path) just like ``import-calendar``,
+    so you can scope to a single mailbox/PST while you iterate on a fix
+    and leave other mailboxes alone.
+    """
+    cfg = _load(config)
+    run_id = f"purge-calendar_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=None)
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+    pool = AppPool(cfg.apps)
+
+    # Show the user what we're about to wipe before doing it.
+    total = 0
+    for row in rows:
+        items = state.list_done_items(row.target_mailbox, str(row.pst_path), "event")
+        if items:
+            console.print(
+                f"  {row.target_mailbox} | {row.pst_path.name}: "
+                f"[yellow]{len(items)}[/] event(s) to purge"
+            )
+            total += len(items)
+
+    if total == 0:
+        console.print("[green]Nothing to purge.[/] No 'done' calendar rows for the selected scope.")
+        raise typer.Exit(0)
+
+    console.print(
+        f"\n[bold red]About to DELETE {total} calendar event(s) from Graph[/] "
+        f"and remove their state rows.\n"
+        f"This is irreversible -- the events will be gone from the destination "
+        f"mailbox and ``import-calendar`` will re-create them from the PST extract."
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    from jtet_pstmigrate.orchestrator import Orchestrator
+    orch = Orchestrator(cfg, state, pool)
+    deleted, missing, errors = orch.purge_calendar(rows)
+
+    console.print(
+        f"\n[bold]Purge complete:[/] "
+        f"deleted=[green]{deleted}[/]  "
+        f"already-gone=[yellow]{missing}[/]  "
+        f"errors=[red]{errors}[/]"
+    )
+    raise typer.Exit(1 if errors else 0)
+
+
 @app.command()
 def status(
     config: ConfigOpt = None,

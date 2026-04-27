@@ -97,6 +97,31 @@ def _ics_to_graph_event(raw: bytes) -> dict | None:
         else:
             end_dt, end_tz = _add_minutes(start_dt, 30), start_tz
 
+    # Pseudo-all-day detection.
+    #
+    # Outlook stores all-day events as a 24h DATE-TIME range at local
+    # midnight, and readpst preserves that representation: e.g., for a
+    # US Eastern user, an all-day event on March 26 lands as
+    # DTSTART:20190326T040000Z / DTEND:20190327T040000Z (04:00 UTC == 00:00
+    # EDT). Without this fix-up we'd post that as a 24-hour TIMED event,
+    # which OWA renders as "12am to 12am" rather than as a clean all-day
+    # banner.
+    #
+    # The heuristic: if the start/end delta is exactly 24h and both have
+    # the same time-of-day, treat as all-day and rewrite to date-only at
+    # 00:00 UTC. We use the UTC date of DTSTART; that matches the user's
+    # local date for any UTC-negative time zone (i.e. all of the Americas).
+    # For UTC-positive zones the local date can be one day later than the
+    # UTC date, and we'd guess wrong by a day -- left as a follow-up
+    # because it requires reading mailboxSettings.timeZone per mailbox.
+    if not is_all_day:
+        all_day_dt = _maybe_pseudo_all_day(dtstart, dtend)
+        if all_day_dt is not None:
+            is_all_day = True
+            start_dt = f"{all_day_dt:%Y-%m-%d}T00:00:00.0000000"
+            end_dt = f"{all_day_dt + _dt.timedelta(days=1):%Y-%m-%d}T00:00:00.0000000"
+            start_tz = end_tz = "UTC"
+
     rrule = event.get("RRULE")
     if rrule is not None:
         description = _append_rrule_note(description, rrule)
@@ -163,6 +188,41 @@ def _to_graph_date(prop) -> tuple[str, str, bool]:
         return (iso, "UTC", False)
     # Unknown type -- defensive fallthrough.
     return (str(dt)[:27], "UTC", False)
+
+
+def _maybe_pseudo_all_day(dtstart, dtend) -> _dt.date | None:
+    """Detect Outlook's 24h DATE-TIME representation of an all-day event.
+
+    Returns the calendar date the event falls on, or None if the start/end
+    pair doesn't look like a pseudo-all-day. Both ends of the interval
+    must be ``datetime`` (not ``date``), exactly 24 hours apart, and have
+    identical time-of-day -- that combination means "midnight to midnight
+    in some time zone", which is the canonical Outlook all-day shape.
+    """
+    if dtend is None:
+        return None
+    raw_start = getattr(dtstart, "dt", dtstart)
+    raw_end = getattr(dtend, "dt", dtend)
+    if not (isinstance(raw_start, _dt.datetime) and isinstance(raw_end, _dt.datetime)):
+        return None
+    delta = raw_end - raw_start
+    if int(delta.total_seconds()) != 86400:
+        return None
+    if raw_start.timetz() != raw_end.timetz():
+        return None
+    # Require the time-of-day to be on an exact hour with no fractional
+    # seconds. Every IANA time zone has an integer-hour offset from UTC
+    # (the half-hour zones like India and Newfoundland still produce a
+    # XX:30:00 time-of-day, which we accept), so any local-midnight
+    # converted to UTC produces XX:MM:00.000000. A 10:00:23.456 boundary
+    # is clearly not "midnight somewhere" -- almost certainly a real
+    # 24-hour timed event we shouldn't reshape.
+    t = raw_start.time()
+    if t.second != 0 or t.microsecond != 0:
+        return None
+    if raw_start.tzinfo is not None:
+        raw_start = raw_start.astimezone(_dt.timezone.utc)
+    return raw_start.date()
 
 
 def _add_days(iso: str, days: int) -> str:

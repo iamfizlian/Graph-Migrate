@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from loguru import logger
 from rich.console import Console
@@ -470,6 +471,74 @@ class Orchestrator:
                 last_error=f"{type(e).__name__}: {str(e)[:300]}",
             )
             return "failed"
+
+    # ------------------------------------------------------------------
+    # Calendar purge
+    # ------------------------------------------------------------------
+    #
+    # Used to undo a calendar import after a code-side bug fix. Walks the
+    # ``non_mail_items`` table for the selected (mailbox, PST) pairs,
+    # DELETEs each event from Graph by stored ``graph_id``, and removes
+    # the row so the next ``import-calendar`` re-uploads from scratch.
+    #
+    # 404s from Graph (already deleted in OWA) are treated as success --
+    # the purge's job is to reach a "no row, no event" state, however we
+    # got there. Other Graph errors are logged but don't stop the run; if
+    # half the purge succeeds and half fails, the user can re-run the
+    # purge to retry the leftover rows.
+
+    def purge_calendar(self, mapping: list[MappingRow]) -> tuple[int, int, int]:
+        """DELETE imported calendar events and clear their state rows.
+
+        Returns ``(deleted_in_graph, missing_in_graph, errors)``.
+        """
+        if not mapping:
+            return (0, 0, 0)
+
+        graph = GraphClient(self._pool, self._cfg.throttle)
+        deleted = 0
+        missing = 0
+        errors = 0
+
+        with graph:
+            for row in mapping:
+                items = self._state.list_done_items(
+                    row.target_mailbox, str(row.pst_path), "event"
+                )
+                if not items:
+                    continue
+                log = logger.bind(
+                    ctx=f"purge[{row.target_mailbox}|{row.pst_path.name}]"
+                )
+                log.info("Purging {} event(s) from Graph", len(items))
+                for item in items:
+                    graph_id = item["graph_id"]
+                    app_id = item["app_id"] or self._pool.names[0]
+                    try:
+                        graph.delete(
+                            f"/users/{quote(row.target_mailbox)}/events/{quote(graph_id)}",
+                            expect_status=(204, 200),
+                            app_id=app_id,
+                        )
+                        deleted += 1
+                    except GraphError as e:
+                        if e.status == 404:
+                            # Already gone -- still a success from our POV.
+                            missing += 1
+                        else:
+                            log.warning(
+                                "DELETE failed for {}: {} {}", graph_id, e.status, e.body
+                            )
+                            errors += 1
+                            continue
+                    except Exception as e:
+                        log.warning("DELETE failed for {}: {}", graph_id, e)
+                        errors += 1
+                        continue
+                    self._state.delete_item(
+                        row.target_mailbox, str(row.pst_path), item["source_path"], "event"
+                    )
+        return (deleted, missing, errors)
 
     def _render_summary(
         self,
