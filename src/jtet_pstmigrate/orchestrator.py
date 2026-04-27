@@ -39,15 +39,22 @@ from jtet_pstmigrate.calendar_uploader import (
     CalendarUploadError,
 )
 from jtet_pstmigrate.config import AppConfig, MappingRow
+from jtet_pstmigrate.contact_uploader import (
+    ContactUploader,
+    ContactUploadError,
+)
 from jtet_pstmigrate.folder_manager import FolderManager
 from jtet_pstmigrate.graph_client import GraphClient, GraphError
 from jtet_pstmigrate.pst_reader import (
     ExtractedAppointment,
+    ExtractedContact,
     ExtractedMessage,
     ReadpstError,
     extract_pst,
     extract_pst_calendar,
+    extract_pst_contacts,
     iter_appointments,
+    iter_contacts,
     iter_messages,
 )
 from jtet_pstmigrate.state import StateStore
@@ -537,6 +544,241 @@ class Orchestrator:
                         continue
                     self._state.delete_item(
                         row.target_mailbox, str(row.pst_path), item["source_path"], "event"
+                    )
+        return (deleted, missing, errors)
+
+    # ------------------------------------------------------------------
+    # Contacts (Stage C, second half)
+    # ------------------------------------------------------------------
+    #
+    # Same pattern as calendar: extract .vcf with ``readpst -t c`` into a
+    # sibling work dir, queue per-vcard, upload via Graph
+    # /users/{upn}/contacts. Contacts state lives in ``non_mail_items``
+    # with ``item_type='contact'`` and a UID/FN+email dedup key.
+
+    def run_contacts(self, mapping: list[MappingRow]) -> list[RunReport]:
+        if not mapping:
+            return []
+
+        graph = GraphClient(self._pool, self._cfg.throttle)
+        reports: list[RunReport] = []
+
+        with graph, ThreadPoolExecutor(
+            max_workers=self._cfg.migration.max_parallel_mailboxes,
+            thread_name_prefix="pst-con",
+        ) as pool:
+            futures: dict[Future, MappingRow] = {
+                pool.submit(self._run_contacts_one, graph, row): row for row in mapping
+            }
+
+            with self._make_progress() as progress:
+                task = progress.add_task("PST contacts jobs", total=len(futures))
+                for fut in as_completed(futures):
+                    row = futures[fut]
+                    try:
+                        rep = fut.result()
+                    except Exception as e:
+                        logger.bind(ctx=f"{row.target_mailbox}").exception("Contacts worker crashed")
+                        rep = RunReport(
+                            pst_path=row.pst_path,
+                            mailbox=row.target_mailbox,
+                            status="failed",
+                            last_error=str(e),
+                        )
+                    reports.append(rep)
+                    progress.advance(task)
+
+        self._render_summary(reports, graph, title_suffix=" (contacts)")
+        return reports
+
+    def _run_contacts_one(self, graph: GraphClient, row: MappingRow) -> RunReport:
+        log = logger.bind(ctx=f"conjob[{row.target_mailbox}|{row.pst_path.name}]")
+        report = RunReport(pst_path=row.pst_path, mailbox=row.target_mailbox)
+        started = time.time()
+
+        try:
+            extracted_dir = extract_pst_contacts(
+                row.pst_path,
+                self._cfg.paths.work_dir,
+                binary=self._cfg.paths.readpst_binary,
+            )
+        except ReadpstError as e:
+            log.error("Contacts extraction failed: {}", e)
+            report.status = "failed"
+            report.last_error = str(e)
+            report.elapsed_seconds = time.time() - started
+            return report
+
+        contacts = list(iter_contacts(extracted_dir))
+        report.items_total = len(contacts)
+        log.info("{} contacts to consider", len(contacts))
+
+        if not contacts:
+            report.status = "done"
+            report.elapsed_seconds = time.time() - started
+            return report
+
+        uploader = ContactUploader(graph, row.target_mailbox)
+
+        with ThreadPoolExecutor(
+            max_workers=self._cfg.migration.workers_per_mailbox,
+            thread_name_prefix=f"con-{row.target_mailbox.split('@')[0][:6]}",
+        ) as up_pool:
+            futures = {
+                up_pool.submit(self._upload_contact, c, row, uploader): c
+                for c in contacts
+            }
+            for fut in as_completed(futures):
+                outcome = fut.result()
+                if outcome == "uploaded":
+                    report.items_uploaded += 1
+                elif outcome == "skipped":
+                    report.items_skipped += 1
+                else:
+                    report.items_failed += 1
+
+        if report.items_failed and self._cfg.migration.fail_fast:
+            report.status = "failed"
+            report.last_error = f"{report.items_failed} item failures"
+        else:
+            report.status = "done"
+        report.elapsed_seconds = time.time() - started
+        return report
+
+    def _upload_contact(
+        self,
+        contact: ExtractedContact,
+        row: MappingRow,
+        uploader: ContactUploader,
+    ) -> str:
+        pst_str = str(row.pst_path)
+        src = str(contact.file_path)
+        # Same dedup discipline as messages/events: per-row done check
+        # first, then per-mailbox dedup on UID or FN+email.
+        if self._state.is_item_row_done(row.target_mailbox, pst_str, src, "contact"):
+            return "skipped"
+        if self._state.is_item_done(row.target_mailbox, "contact", contact.dedupe_key):
+            self._state.upsert_item(
+                mailbox=row.target_mailbox,
+                pst_path=pst_str,
+                source_path=src,
+                item_type="contact",
+                dedupe_key=contact.dedupe_key,
+                status="skipped",
+                bytes_=contact.bytes_,
+            )
+            return "skipped"
+
+        chosen_app = self._pool.pick()
+        try:
+            result = uploader.upload(contact, app_id=chosen_app)
+            self._state.upsert_item(
+                mailbox=row.target_mailbox,
+                pst_path=pst_str,
+                source_path=src,
+                item_type="contact",
+                dedupe_key=contact.dedupe_key,
+                graph_id=result.graph_contact_id,
+                app_id=chosen_app,
+                status="done",
+                bytes_=result.bytes_uploaded,
+            )
+            return "uploaded"
+        except ContactUploadError as e:
+            # Empty/garbage vCard -- terminal, mark skipped so we don't
+            # retry on the next run.
+            self._state.upsert_item(
+                mailbox=row.target_mailbox,
+                pst_path=pst_str,
+                source_path=src,
+                item_type="contact",
+                dedupe_key=contact.dedupe_key,
+                app_id=chosen_app,
+                status="skipped",
+                bytes_=contact.bytes_,
+                last_error=str(e)[:300],
+            )
+            return "skipped"
+        except GraphError as e:
+            body_str = str(e.body) if e.body is not None else ""
+            self._state.upsert_item(
+                mailbox=row.target_mailbox,
+                pst_path=pst_str,
+                source_path=src,
+                item_type="contact",
+                dedupe_key=contact.dedupe_key,
+                app_id=chosen_app,
+                status="failed",
+                bytes_=contact.bytes_,
+                last_error=f"graph {e.status}: {body_str[:300]}",
+            )
+            return "failed"
+        except Exception as e:
+            self._state.upsert_item(
+                mailbox=row.target_mailbox,
+                pst_path=pst_str,
+                source_path=src,
+                item_type="contact",
+                dedupe_key=contact.dedupe_key,
+                app_id=chosen_app,
+                status="failed",
+                bytes_=contact.bytes_,
+                last_error=f"{type(e).__name__}: {str(e)[:300]}",
+            )
+            return "failed"
+
+    def purge_contacts(self, mapping: list[MappingRow]) -> tuple[int, int, int]:
+        """DELETE imported contacts and clear their state rows.
+
+        Mirrors :meth:`purge_calendar`. Returns
+        ``(deleted_in_graph, missing_in_graph, errors)``. 404s are
+        treated as success ("already gone"); any other Graph error is
+        logged and counted but doesn't abort the rest of the purge.
+        """
+        if not mapping:
+            return (0, 0, 0)
+
+        graph = GraphClient(self._pool, self._cfg.throttle)
+        deleted = 0
+        missing = 0
+        errors = 0
+
+        with graph:
+            for row in mapping:
+                items = self._state.list_done_items(
+                    row.target_mailbox, str(row.pst_path), "contact"
+                )
+                if not items:
+                    continue
+                log = logger.bind(
+                    ctx=f"purge[{row.target_mailbox}|{row.pst_path.name}]"
+                )
+                log.info("Purging {} contact(s) from Graph", len(items))
+                for item in items:
+                    graph_id = item["graph_id"]
+                    app_id = item["app_id"] or self._pool.names[0]
+                    try:
+                        graph.delete(
+                            f"/users/{quote(row.target_mailbox)}/contacts/{quote(graph_id)}",
+                            expect_status=(204, 200),
+                            app_id=app_id,
+                        )
+                        deleted += 1
+                    except GraphError as e:
+                        if e.status == 404:
+                            missing += 1
+                        else:
+                            log.warning(
+                                "DELETE failed for {}: {} {}", graph_id, e.status, e.body
+                            )
+                            errors += 1
+                            continue
+                    except Exception as e:
+                        log.warning("DELETE failed for {}: {}", graph_id, e)
+                        errors += 1
+                        continue
+                    self._state.delete_item(
+                        row.target_mailbox, str(row.pst_path), item["source_path"], "contact"
                     )
         return (deleted, missing, errors)
 

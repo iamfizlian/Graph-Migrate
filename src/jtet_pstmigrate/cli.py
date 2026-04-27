@@ -508,6 +508,144 @@ def run_purge_calendar(
     raise typer.Exit(1 if errors else 0)
 
 
+@app.command("import-contacts")
+def run_import_contacts(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    limit: LimitOpt = None,
+    list_only: ListOnlyOpt = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Import contacts from PSTs into each mailbox's default contact folder.
+
+    Separate pass from ``import`` (mail) and ``import-calendar``. Uses the
+    same mapping CSV but extracts only contacts via ``readpst -t c`` into a
+    sibling work directory (``__contacts``), so re-running it doesn't
+    invalidate or trigger the mail/calendar extractions. State for contact
+    items lives in the ``non_mail_items`` table with ``item_type='contact'``,
+    keyed by vCard UID (or FN+email when no UID is present).
+
+    All contacts go into the user's default contact folder; sub-folder
+    structure inside the PST is flattened. Required Graph permission:
+    ``Contacts.ReadWrite`` (Application) on every app in the pool, with
+    admin consent. A 403 here means a worker app is missing that grant.
+    """
+    cfg = _load(config)
+    run_id = f"import-contacts_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=limit)
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    if list_only or len(rows) != len(all_rows):
+        _print_selection(
+            rows,
+            heading=("Dry-run selection (contacts)" if list_only else "Selected rows (contacts, filtered)"),
+        )
+    if list_only:
+        raise typer.Exit(0)
+
+    pool = AppPool(cfg.apps)
+    filter_note = (
+        f"  selection = {len(rows)}/{len(all_rows)} rows (filtered)\n"
+        if len(rows) != len(all_rows) else ""
+    )
+    console.print(
+        f"\n[bold]About to import contacts[/] from {len(rows)} PSTs "
+        f"into {len({r.target_mailbox for r in rows})} mailbox contact folder(s).\n"
+        f"{filter_note}"
+        f"  app pool = {len(pool)} ({', '.join(pool.names)})\n"
+        f"  workers/mailbox = {cfg.migration.workers_per_mailbox}\n"
+        f"  parallel mailboxes = {cfg.migration.max_parallel_mailboxes}\n"
+        f"  state dir = {cfg.paths.state_dir}\n"
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+    orch = Orchestrator(cfg, state, pool)
+    reports = orch.run_contacts(rows)
+
+    failed = sum(1 for r in reports if r.status != "done" or r.items_failed)
+    raise typer.Exit(1 if failed else 0)
+
+
+@app.command("purge-contacts")
+def run_purge_contacts(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Delete previously-imported contacts and clear their state.
+
+    Use this when a contacts-import bug needs a clean re-run: after purge,
+    the next ``import-contacts`` re-uploads every contact from scratch with
+    the corrected code path. Mail and calendar state are untouched.
+    """
+    cfg = _load(config)
+    run_id = f"purge-contacts_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=None)
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+    pool = AppPool(cfg.apps)
+
+    total = 0
+    for row in rows:
+        items = state.list_done_items(row.target_mailbox, str(row.pst_path), "contact")
+        if items:
+            console.print(
+                f"  {row.target_mailbox} | {row.pst_path.name}: "
+                f"[yellow]{len(items)}[/] contact(s) to purge"
+            )
+            total += len(items)
+
+    if total == 0:
+        console.print("[green]Nothing to purge.[/] No 'done' contact rows for the selected scope.")
+        raise typer.Exit(0)
+
+    console.print(
+        f"\n[bold red]About to DELETE {total} contact(s) from Graph[/] "
+        f"and remove their state rows.\n"
+        f"This is irreversible -- the contacts will be gone from the destination "
+        f"mailbox and ``import-contacts`` will re-create them from the PST extract."
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    from jtet_pstmigrate.orchestrator import Orchestrator
+    orch = Orchestrator(cfg, state, pool)
+    deleted, missing, errors = orch.purge_contacts(rows)
+
+    console.print(
+        f"\n[bold]Purge complete:[/] "
+        f"deleted=[green]{deleted}[/]  "
+        f"already-gone=[yellow]{missing}[/]  "
+        f"errors=[red]{errors}[/]"
+    )
+    raise typer.Exit(1 if errors else 0)
+
+
 @app.command()
 def status(
     config: ConfigOpt = None,

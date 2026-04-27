@@ -63,6 +63,18 @@ class ExtractedAppointment:
     start: str | None               # raw DTSTART text, for logging only
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class ExtractedContact:
+    """One .vcf file produced by ``readpst -t c``."""
+
+    file_path: Path
+    folder_path: tuple[str, ...]
+    bytes_: int
+    dedupe_key: str                 # 'uid:<...>', 'fn-email:<...>', or 'sha256:<hex>'
+    display_name: str               # FN field, truncated, for logs
+    primary_email: str | None       # first EMAIL value, used in dedup fallback
+
+
 def check_readpst(binary: Path) -> str:
     """Return the readpst version string, or raise."""
     exe = shutil.which(str(binary)) or str(binary)
@@ -413,6 +425,84 @@ def _build_appointment(ics: Path, pst_dir: Path) -> ExtractedAppointment:
         summary=(summary or "(no subject)")[:500],
         uid=uid,
         start=start,
+    )
+
+
+def iter_contacts(extracted_root: Path) -> Iterator[ExtractedContact]:
+    """Walk the contacts-extracted tree, yield one contact per .vcf file.
+
+    readpst -t c -e lays out:
+        <out_dir>/<pst_stem>/Contacts/12345.vcf
+
+    Files that don't parse as vCard are logged and skipped rather than
+    aborting the whole run.
+    """
+    if not extracted_root.exists():
+        return
+
+    pst_dirs = [p for p in extracted_root.iterdir() if p.is_dir()]
+    if not pst_dirs:
+        return
+
+    for pst_dir in pst_dirs:
+        for vcf in sorted(pst_dir.rglob("*.vcf")):
+            try:
+                yield _build_contact(vcf, pst_dir)
+            except Exception as e:
+                logger.bind(ctx="pst").warning("Skipping unreadable {}: {}", vcf, e)
+
+
+def _build_contact(vcf: Path, pst_dir: Path) -> ExtractedContact:
+    rel = vcf.relative_to(pst_dir).parts[:-1]
+    file_size = vcf.stat().st_size
+
+    raw = vcf.read_bytes()
+    fn = ""
+    uid: str | None = None
+    primary_email: str | None = None
+    # Cheap line-scan for dedup metadata; the proper vCard parse happens
+    # at upload time. vCard line folding (continuation = leading SP/TAB)
+    # affects only NOTE and ADR in practice; the short fields we read
+    # below are unfolded in readpst's output.
+    for line in raw.splitlines():
+        try:
+            decoded = line.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        # Property name can have parameters: "EMAIL;TYPE=INTERNET:x@y".
+        if ":" not in decoded:
+            continue
+        head, value = decoded.split(":", 1)
+        name = head.split(";", 1)[0].strip().upper()
+        value = value.strip()
+        if not value:
+            continue
+        if not fn and name == "FN":
+            fn = value
+        elif not uid and name == "UID":
+            uid = value
+        elif not primary_email and name == "EMAIL":
+            primary_email = value
+        if fn and uid and primary_email:
+            break
+
+    if uid:
+        dedupe_key = f"uid:{uid.lower()}"
+    elif fn or primary_email:
+        # FN+email is unique enough in practice -- two contacts named
+        # "John Smith" with the same primary email are almost certainly
+        # the same person exported twice.
+        dedupe_key = f"fn-email:{fn.lower()}|{(primary_email or '').lower()}"
+    else:
+        dedupe_key = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+    return ExtractedContact(
+        file_path=vcf,
+        folder_path=tuple(_clean_folder(p) for p in rel),
+        bytes_=file_size,
+        dedupe_key=dedupe_key,
+        display_name=(fn or primary_email or "(no name)")[:500],
+        primary_email=primary_email,
     )
 
 
