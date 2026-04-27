@@ -49,6 +49,20 @@
 
         .\Run-FullCleanup.ps1 -MappingFile .\mapping.csv -Config .\config.toml
 
+.PARAMETER ExcludeMailbox
+    UPN of a mailbox to exclude from the run.  Repeatable.  Useful
+    for resuming after a partial failure or running only the mailboxes
+    that haven't been cleaned up yet, without editing mapping.csv:
+
+        # Allyson is already done -- run the other 12.
+        .\Run-FullCleanup.ps1 `
+            -MappingFile .\mapping.csv `
+            -Config .\config.toml `
+            -ExcludeMailbox allysonp@jteatono365.onmicrosoft.com
+
+    Comparison is case-insensitive on full UPN.  Excluding a mailbox
+    that isn't in the selection is a no-op (logged but not fatal).
+
 .PARAMETER Config
     Path to config.toml (consumed by the Python steps).
 
@@ -144,6 +158,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Config,
 
+    [string[]]$ExcludeMailbox,
+
     [switch]$DryRun,
     [switch]$SkipFlatten,
     [switch]$SkipConsolidate,
@@ -175,13 +191,62 @@ if (-not (Test-Path -LiteralPath $PythonExe)) {
 # stable path regardless of cwd.
 $ConfigPath = (Resolve-Path -LiteralPath $Config).Path
 $SelectionMode = $PSCmdlet.ParameterSetName   # 'ByMailbox' or 'ByMapping'
-if ($SelectionMode -eq 'ByMapping') {
+
+# Resolve the selected list of UPNs.  Whether the user passed -Mailbox
+# or -MappingFile, downstream we always pass an explicit list of
+# --mailbox / -Mailbox args so the wrapper has full control over what
+# each step sees (including -ExcludeMailbox filtering).
+if ($SelectionMode -eq 'ByMailbox') {
+    $SelectedMailboxes = @($Mailbox)
+    $MappingPath = $null
+} else {
     if (-not (Test-Path -LiteralPath $MappingFile)) {
         throw "Mapping file not found: $MappingFile"
     }
     $MappingPath = (Resolve-Path -LiteralPath $MappingFile).Path
-} else {
-    $MappingPath = $null
+
+    # Pull TargetMailbox column from CSV preserving file order.  We do
+    # NOT pass mapping.csv directly to child scripts -- the wrapper's
+    # selection (with -ExcludeMailbox applied) is the source of truth.
+    $rows = Import-Csv -LiteralPath $MappingPath
+    $missingCol = $rows | Where-Object { -not $_.PSObject.Properties['TargetMailbox'] } | Select-Object -First 1
+    if ($missingCol) {
+        throw "Mapping file '$MappingPath' is missing the TargetMailbox column."
+    }
+    $SelectedMailboxes = @($rows | ForEach-Object { $_.TargetMailbox } | Where-Object { $_ })
+}
+
+# Apply -ExcludeMailbox.  Comparison is case-insensitive UPN match.
+if ($ExcludeMailbox) {
+    $excludeSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($x in $ExcludeMailbox) {
+        if ($x) { [void]$excludeSet.Add($x.Trim()) }
+    }
+
+    $beforeCount = $SelectedMailboxes.Count
+    $SelectedMailboxes = @($SelectedMailboxes | Where-Object { -not $excludeSet.Contains($_) })
+    $removedCount = $beforeCount - $SelectedMailboxes.Count
+
+    # Warn (not fatal) on any -ExcludeMailbox value that didn't match
+    # anything in the source list -- almost always a typo.
+    if ($SelectionMode -eq 'ByMapping') {
+        $sourceUpns = @($rows | ForEach-Object { $_.TargetMailbox } | Where-Object { $_ })
+    } else {
+        $sourceUpns = @($Mailbox)
+    }
+    $sourceSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($u in $sourceUpns) { [void]$sourceSet.Add($u) }
+    foreach ($x in $excludeSet) {
+        if (-not $sourceSet.Contains($x)) {
+            Write-Warning "ExcludeMailbox '$x' did not match any selected mailbox -- typo?"
+        }
+    }
+
+    Write-Host ("ExcludeMailbox: removed {0} of {1} mailbox(es) from selection." -f $removedCount, $beforeCount) -ForegroundColor Yellow
+}
+
+if (-not $SelectedMailboxes -or $SelectedMailboxes.Count -eq 0) {
+    throw 'Empty mailbox selection after filtering. Nothing to do.'
 }
 
 # Per-run log directory.
@@ -216,17 +281,17 @@ function Get-MailboxArgs {
     <#
         Build the --mailbox / -Mailbox pieces for the active selection.
         Returns @{ PythonArgs = @(...); PSArgs = @{...} }.
-        Reads $SelectionMode / $Mailbox / $MappingPath from script scope.
+
+        We always materialise an explicit --mailbox list rather than
+        passing mapping.csv straight through, so that -ExcludeMailbox
+        filtering applies uniformly to every step (Python and PS).
+        Reads $SelectedMailboxes from script scope.
     #>
-    if ($SelectionMode -eq 'ByMailbox') {
-        $py = @()
-        foreach ($m in $Mailbox) { $py += @('--mailbox', $m) }
-        return @{ PythonArgs = $py; PSArgs = @{ Mailbox = $Mailbox } }
-    } else {
-        return @{
-            PythonArgs = @('-m', $MappingPath)
-            PSArgs     = @{ MappingFile = $MappingPath }
-        }
+    $py = @()
+    foreach ($m in $SelectedMailboxes) { $py += @('--mailbox', $m) }
+    return @{
+        PythonArgs = $py
+        PSArgs     = @{ Mailbox = [string[]]$SelectedMailboxes }
     }
 }
 
@@ -289,11 +354,14 @@ function Invoke-Step {
 Write-Banner 'JTET full mailbox cleanup'
 
 $selection = Get-MailboxArgs
-if ($SelectionMode -eq 'ByMailbox') {
-    $selectStr = ($Mailbox -join ', ')
+if ($SelectionMode -eq 'ByMapping') {
+    $sourceStr = " (from $MappingPath"
+    if ($ExcludeMailbox) { $sourceStr += ", minus -ExcludeMailbox" }
+    $sourceStr += ")"
 } else {
-    $selectStr = "$MappingPath (every TargetMailbox row)"
+    $sourceStr = ' (from -Mailbox args)'
 }
+$selectStr = ("{0} mailbox(es){1}:" -f $SelectedMailboxes.Count, $sourceStr)
 
 $plan = @()
 if (-not $SkipFlatten)     { $plan += '1. Flatten "Imported PST" -> root  (_flatten_imported.py)' }
@@ -306,6 +374,7 @@ if ($plan.Count -eq 0) {
 
 Write-Host ''
 Write-Host "Selection : $selectStr"
+foreach ($m in $SelectedMailboxes) { Write-Host "              - $m" }
 Write-Host "Config    : $ConfigPath"
 Write-Host "Python    : $PythonExe"
 Write-Host "Logs      : $RunDir"
@@ -317,6 +386,7 @@ Write-Host ''
 
 Add-Summary "JTET full cleanup run @ $RunStamp"
 Add-Summary "Selection : $selectStr"
+foreach ($m in $SelectedMailboxes) { Add-Summary "              - $m" }
 Add-Summary "Config    : $ConfigPath"
 Add-Summary "DryRun    : $DryRun"
 Add-Summary ''
