@@ -428,6 +428,9 @@ if (-not $SkipDrafts) {
         -Name    'Step 3: Clear MSGFLAG_UNSENT' `
         -LogFile 'step3-drafts.log' `
         -Action  {
+            Write-Host ""
+            Write-Host ("========== RUN-FULL-CLEANUP: pipeline step {0} of {0} (Outlook / MAPI — usually the slowest) ==========" -f $plan.Count) -ForegroundColor Cyan
+            Write-Host "Mailboxes: $($SelectedMailboxes.Count) (numbered list in Selection above).`n" -ForegroundColor Cyan
             $childScript = Join-Path $ScriptRoot 'Fix-DraftsViaOutlook.ps1'
             $params = @{} + $selection.PSArgs
             if ($DryRun) { $params['DryRun'] = $true }

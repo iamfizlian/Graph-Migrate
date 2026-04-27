@@ -1309,15 +1309,40 @@ function Main {
 
     $script:MaxItemsCap = [int]$MaxItems
 
-    $results = New-Object 'System.Collections.Generic.List[pscustomobject]'
     $mbTotal = $script:Mailbox.Count
+    if ($mbTotal -eq 0) { throw "Internal error: no mailboxes in list." }
+
+    # Overall run context — the per-folder "processed a/b" lines only make sense
+    # inside one folder.  This block answers: how many mailboxes, which one now,
+    # and how many items fixed in this process so far (monotonic for the run).
+    Write-Host ""
+    Write-Host "========== THIS RUN: $mbTotal mailbox(es) to process (one after another) ==========" -ForegroundColor Magenta
+    $n = 0
+    foreach ($m in $script:Mailbox) {
+        $n++
+        Write-Host ("  {0,3}. {1}" -f $n, $m) -ForegroundColor Magenta
+    }
+    Write-Host ""
+    Write-Host "Progress inside a big folder is still  processed x/y  for that folder only." -ForegroundColor DarkGray
+    Write-Host "After each mailbox finishes you get a  MAILBOX k/N END  line and a cumulative Fixed count for the whole run so far." -ForegroundColor DarkGray
+    Write-Host ""
+
+    $results = New-Object 'System.Collections.Generic.List[pscustomobject]'
+    $sessionFixed   = 0
     $mbIdx   = 0
     foreach ($upn in $script:Mailbox) {
         $mbIdx++
+        Write-Host ("---------- MAILBOX {0,3} / {1}  START: {2}  (cumulative Fixed before this box: {3})" -f $mbIdx, $mbTotal, $upn, $sessionFixed) -ForegroundColor Yellow
         $r = Fix-Mailbox -Namespace $ns -Upn $upn -IsDryRun:$DryRun.IsPresent `
             -FolderFilter $Folder -RdoSession $rdo `
             -MailboxIndex $mbIdx -MailboxTotal $mbTotal
         $results.Add($r)
+        $addFx = 0
+        if ($null -ne $r.Fixed) { $addFx = [int]$r.Fixed }
+        $sessionFixed += $addFx
+        Write-Host ("---------- MAILBOX {0,3} / {1}  END:   {2}  |  this box: Fixed={3} Drafts={4} Stuck={5} Failed={6}  |  run cumulative Fixed: {7}  |  {8} of {1} mailboxes done" -f `
+            $mbIdx, $mbTotal, $upn, $r.Fixed, $r.Drafts, $r.Stuck, $r.Failed, $sessionFixed, $mbIdx) -ForegroundColor Yellow
+        Write-Host ""
     }
 
     Write-Host ""
