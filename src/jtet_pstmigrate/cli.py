@@ -45,12 +45,22 @@ def _filter_mapping(
     *,
     mailboxes: list[str] | None,
     pst_names: list[str] | None,
+    exclude_mailboxes: list[str] | None = None,
+    exclude_pst_names: list[str] | None = None,
     limit: int | None,
 ) -> list[MappingRow]:
-    """Apply selection filters in order: mailbox match, PST filename match, then row-count limit.
+    """Apply selection filters in order:
 
-    UPN matching is case-insensitive (M365 UPNs aren't case-sensitive).
-    PST name matching uses substring on the file basename, also case-insensitive.
+      1. ``mailboxes``  -- include only these (UPN exact match, case-insensitive)
+      2. ``pst_names``  -- include only PSTs whose filename contains one of these
+                           (substring, case-insensitive)
+      3. ``exclude_mailboxes`` -- drop these UPNs (exact match, case-insensitive)
+      4. ``exclude_pst_names`` -- drop PSTs matching these substrings
+      5. ``limit`` -- after all filtering, take only the first N rows
+
+    Excludes win over includes: ``-M user@x -X user@x`` returns nothing.
+    Excludes work on their own too -- you don't have to pass any include
+    filter, just ``-X user@x`` to "everything except this user".
     """
     selected = list(rows)
 
@@ -68,6 +78,26 @@ def _filter_mapping(
         selected = [
             r for r in selected
             if any(n in r.pst_path.name.lower() for n in needles)
+        ]
+
+    if exclude_mailboxes:
+        unwanted = {m.strip().lower() for m in exclude_mailboxes if m and m.strip()}
+        before = {r.target_mailbox.lower() for r in selected}
+        selected = [r for r in selected if r.target_mailbox.lower() not in unwanted]
+        # Warn about excludes that didn't actually match anything in scope --
+        # usually means a typo in the UPN.
+        no_op_excludes = unwanted - before
+        if no_op_excludes:
+            console.print(
+                f"[yellow]Warning:[/] --exclude-mailbox had no effect for: "
+                f"{', '.join(sorted(no_op_excludes))}"
+            )
+
+    if exclude_pst_names:
+        needles = [p.strip().lower() for p in exclude_pst_names if p and p.strip()]
+        selected = [
+            r for r in selected
+            if not any(n in r.pst_path.name.lower() for n in needles)
         ]
 
     if limit is not None and limit > 0:
@@ -108,6 +138,27 @@ PstFilterOpt = Annotated[
     typer.Option(
         "--pst", "-P",
         help="Filter by substring of the PST filename. Repeat for multi-select.",
+    ),
+]
+ExcludeMailboxOpt = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--exclude-mailbox", "-X",
+        help=(
+            "Skip these target mailboxes (UPN). Repeat for multi-select. "
+            "Useful when bulk-running everyone EXCEPT users you've already "
+            "finished. Applied after --mailbox / --pst includes."
+        ),
+    ),
+]
+ExcludePstFilterOpt = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--exclude-pst",
+        help=(
+            "Skip PSTs whose filename contains any of these substrings. "
+            "Repeat for multi-select."
+        ),
     ),
 ]
 LimitOpt = Annotated[
@@ -207,12 +258,15 @@ def validate(
     mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
     mailbox: MailboxOpt = None,
     pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
     limit: LimitOpt = None,
 ) -> None:
     """Check prerequisites: readpst, config, mapping CSV, Graph token, mailboxes.
 
-    Selection flags (mailbox/pst/limit) restrict the resolvability check to only
-    the rows you intend to run, so you can pre-flight a single mailbox quickly.
+    Selection flags (mailbox/pst/exclude-mailbox/exclude-pst/limit) restrict the
+    resolvability check to only the rows you intend to run, so you can pre-flight
+    a single mailbox quickly or skip mailboxes you've already finished.
     """
     cfg = _load(config)
     configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=f"validate_{_run_id()}")
@@ -232,7 +286,14 @@ def validate(
     rows: list[MappingRow] = []
     try:
         all_rows = load_mapping(mapping)
-        rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=limit)
+        rows = _filter_mapping(
+            all_rows,
+            mailboxes=mailbox,
+            pst_names=pst,
+            exclude_mailboxes=exclude_mailbox,
+            exclude_pst_names=exclude_pst,
+            limit=limit,
+        )
         suffix = f" (filtered from {len(all_rows)})" if len(rows) != len(all_rows) else ""
         table.add_row("mapping CSV parses", f"[green]OK[/] {len(rows)} rows{suffix}")
     except Exception as e:
@@ -301,6 +362,8 @@ def run_import(
     mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
     mailbox: MailboxOpt = None,
     pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
     limit: LimitOpt = None,
     list_only: ListOnlyOpt = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
@@ -311,6 +374,7 @@ def run_import(
 
       Single mailbox:    pstmigrate import -c c.toml -m m.csv -M emmak@contoso.onmicrosoft.com
       Several mailboxes: pstmigrate import -c c.toml -m m.csv -M a@x -M b@x -M c@x
+      Skip finished:     pstmigrate import -c c.toml -m m.csv -X tinad@x -X allyson@x
       Just a canary:     pstmigrate import -c c.toml -m m.csv -n 1
       One PST file:      pstmigrate import -c c.toml -m m.csv -P jsmith.pst
       Preview selection: pstmigrate import -c c.toml -m m.csv -M a@x --list
@@ -324,7 +388,14 @@ def run_import(
         console.print("[red]Empty mapping CSV[/]")
         raise typer.Exit(1)
 
-    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=limit)
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=limit,
+    )
     if not rows:
         console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
         raise typer.Exit(1)
@@ -369,6 +440,8 @@ def run_import_calendar(
     mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
     mailbox: MailboxOpt = None,
     pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
     limit: LimitOpt = None,
     list_only: ListOnlyOpt = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
@@ -398,7 +471,14 @@ def run_import_calendar(
         console.print("[red]Empty mapping CSV[/]")
         raise typer.Exit(1)
 
-    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=limit)
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=limit,
+    )
     if not rows:
         console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
         raise typer.Exit(1)
@@ -442,6 +522,8 @@ def run_purge_calendar(
     mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
     mailbox: MailboxOpt = None,
     pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
 ) -> None:
     """Delete previously-imported calendar events and clear their state.
@@ -463,7 +545,14 @@ def run_purge_calendar(
         console.print("[red]Empty mapping CSV[/]")
         raise typer.Exit(1)
 
-    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=None)
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=None,
+    )
     if not rows:
         console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
         raise typer.Exit(1)
@@ -514,6 +603,8 @@ def run_import_contacts(
     mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
     mailbox: MailboxOpt = None,
     pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
     limit: LimitOpt = None,
     list_only: ListOnlyOpt = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
@@ -541,7 +632,14 @@ def run_import_contacts(
         console.print("[red]Empty mapping CSV[/]")
         raise typer.Exit(1)
 
-    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=limit)
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=limit,
+    )
     if not rows:
         console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
         raise typer.Exit(1)
@@ -585,6 +683,8 @@ def run_purge_contacts(
     mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
     mailbox: MailboxOpt = None,
     pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
 ) -> None:
     """Delete previously-imported contacts and clear their state.
@@ -602,7 +702,14 @@ def run_purge_contacts(
         console.print("[red]Empty mapping CSV[/]")
         raise typer.Exit(1)
 
-    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=None)
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=None,
+    )
     if not rows:
         console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
         raise typer.Exit(1)
@@ -652,6 +759,8 @@ def run_import_all(
     mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
     mailbox: MailboxOpt = None,
     pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
     limit: LimitOpt = None,
     list_only: ListOnlyOpt = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
@@ -672,6 +781,12 @@ def run_import_all(
     been verified on a pilot mailbox. For iterative debugging keep using
     the dedicated subcommands -- those produce the same state, just with
     smaller blast radius if something goes wrong.
+
+    Bulk-run example, skipping users that are already done:
+
+      pstmigrate import-all -c c.toml -m m.csv \
+          -X tinad@contoso.onmicrosoft.com \
+          -X allysonp@contoso.onmicrosoft.com -y
     """
     cfg = _load(config)
     run_id = f"import-all_{_run_id()}"
@@ -682,7 +797,14 @@ def run_import_all(
         console.print("[red]Empty mapping CSV[/]")
         raise typer.Exit(1)
 
-    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=limit)
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=limit,
+    )
     if not rows:
         console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
         raise typer.Exit(1)
@@ -761,6 +883,8 @@ def run_reset_state(
     mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
     mailbox: MailboxOpt = None,
     pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
 ) -> None:
     """Clear local dedup/run state for the selected scope. Does NOT touch Graph.
@@ -787,7 +911,10 @@ def run_reset_state(
     Exchange side and then run this to clear local tracking.
 
     Default scope is every row in the mapping CSV. Narrow with
-    ``--mailbox`` / ``--pst`` if you only want to reset specific users.
+    ``--mailbox`` / ``--pst`` to reset specific users, or use
+    ``--exclude-mailbox`` / ``--exclude-pst`` to reset everyone EXCEPT
+    a few -- handy when you've finished a couple of pilot users and
+    want to clear local state for the rest before a bulk re-run.
     """
     cfg = _load(config)
     run_id = f"reset-state_{_run_id()}"
@@ -798,7 +925,14 @@ def run_reset_state(
         console.print("[red]Empty mapping CSV[/]")
         raise typer.Exit(1)
 
-    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=None)
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=None,
+    )
     if not rows:
         console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
         raise typer.Exit(1)
