@@ -755,6 +755,128 @@ def run_import_all(
     raise typer.Exit(1 if failed else 0)
 
 
+@app.command("reset-state")
+def run_reset_state(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Clear local dedup/run state for the selected scope. Does NOT touch Graph.
+
+    Wipes the matching rows from these tables in ``state.sqlite``:
+      - ``messages``        (mail dedup keyed by Message-ID)
+      - ``non_mail_items``  (calendar/contacts dedup keyed by UID/FN+email)
+      - ``pst_runs``        (per-mailbox-per-PST run history)
+      - ``folder_map``      (cached Graph folder IDs per mailbox)
+
+    [bold red]DANGER:[/] this only clears LOCAL state. Items already
+    uploaded to Graph stay where they are. Running ``import`` /
+    ``import-calendar`` / ``import-contacts`` / ``import-all`` afterwards
+    WILL upload everything again, which means duplicate emails, calendar
+    events, and contacts in the destination mailbox -- the dedup tables
+    are how we prevent that, and you just emptied them.
+
+    Intended for: starting from scratch after manually clearing the
+    destination mailboxes (mailbox reset, delete-and-recreate, manual
+    purge in OWA, etc.). For a safe reset that also removes items from
+    Graph, use ``purge-calendar`` / ``purge-contacts`` instead -- there's
+    no equivalent for mail because mail-purge of large mailboxes is
+    expensive (one DELETE per message); if you need that, do it on the
+    Exchange side and then run this to clear local tracking.
+
+    Default scope is every row in the mapping CSV. Narrow with
+    ``--mailbox`` / ``--pst`` if you only want to reset specific users.
+    """
+    cfg = _load(config)
+    run_id = f"reset-state_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=None)
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+
+    # Show the user what we're about to wipe before doing it.
+    total = {"messages": 0, "non_mail_items": 0, "pst_runs": 0, "folder_map": 0}
+    affected_mailboxes: set[str] = set()
+    per_row_counts: list[tuple[str, str, dict[str, int]]] = []
+    for row in rows:
+        counts = state.count_scope(row.target_mailbox, str(row.pst_path))
+        if any(counts.values()):
+            per_row_counts.append((row.target_mailbox, row.pst_path.name, counts))
+        for k, v in counts.items():
+            total[k] += v
+        affected_mailboxes.add(row.target_mailbox)
+
+    folder_total = sum(state.count_folder_map(m) for m in affected_mailboxes)
+    total["folder_map"] = folder_total
+
+    if not any(total.values()):
+        console.print("[green]Nothing to reset.[/] No state rows for the selected scope.")
+        raise typer.Exit(0)
+
+    if per_row_counts:
+        table = Table(title="Rows to clear (per mapping row)")
+        table.add_column("Mailbox", overflow="fold")
+        table.add_column("PST", overflow="fold")
+        table.add_column("messages", justify="right")
+        table.add_column("non_mail_items", justify="right")
+        table.add_column("pst_runs", justify="right")
+        for mbx, pst_name, c in per_row_counts:
+            table.add_row(
+                mbx, pst_name,
+                str(c["messages"]), str(c["non_mail_items"]), str(c["pst_runs"]),
+            )
+        console.print(table)
+    if folder_total:
+        console.print(
+            f"\nfolder_map cache: [yellow]{folder_total}[/] row(s) "
+            f"across {len(affected_mailboxes)} mailbox(es) (safe to drop -- "
+            f"folder lookups will re-resolve via Graph on the next import)."
+        )
+
+    console.print(
+        f"\n[bold red]About to WIPE local state[/] for "
+        f"{len(rows)} mapping row(s) "
+        f"({len(affected_mailboxes)} mailbox(es)):\n"
+        f"  messages       = {total['messages']}\n"
+        f"  non_mail_items = {total['non_mail_items']}\n"
+        f"  pst_runs       = {total['pst_runs']}\n"
+        f"  folder_map     = {total['folder_map']}\n"
+        f"\n"
+        f"[red]Items already uploaded to Graph remain in the destination "
+        f"mailboxes.[/] Re-running an import after this WILL create "
+        f"duplicates unless you've separately cleared the destination side."
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    cleared = {"messages": 0, "non_mail_items": 0, "pst_runs": 0, "folder_map": 0}
+    for row in rows:
+        result = state.clear_scope(row.target_mailbox, str(row.pst_path))
+        for k, v in result.items():
+            cleared[k] += v
+    for m in affected_mailboxes:
+        cleared["folder_map"] += state.clear_folder_map(m)
+
+    console.print(
+        f"\n[bold]Reset complete:[/]  "
+        f"messages=[yellow]{cleared['messages']}[/]  "
+        f"non_mail_items=[yellow]{cleared['non_mail_items']}[/]  "
+        f"pst_runs=[yellow]{cleared['pst_runs']}[/]  "
+        f"folder_map=[yellow]{cleared['folder_map']}[/]"
+    )
+
+
 @app.command()
 def status(
     config: ConfigOpt = None,

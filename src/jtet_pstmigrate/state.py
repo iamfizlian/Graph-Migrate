@@ -420,3 +420,78 @@ class StateStore:
                 "failed":  out.get("failed", 0),
                 "skipped": out.get("skipped", 0),
             }
+
+    # Bulk reset --------------------------------------------------------
+    #
+    # Used by ``pstmigrate reset-state`` to wipe local dedup/run rows
+    # for a given (mailbox, pst) scope. Caller is responsible for any
+    # destination-side cleanup -- this only touches our SQLite.
+
+    def count_scope(self, mailbox: str, pst_path: str) -> dict[str, int]:
+        """Return row counts in each scoped table for the given mailbox+PST.
+
+        Used to show the user what they're about to wipe before
+        confirming. Folder-map count is per-mailbox only since that table
+        isn't keyed by PST.
+        """
+        with self._connect() as conn:
+            mail = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE target_mailbox=? AND pst_path=?",
+                (mailbox, pst_path),
+            ).fetchone()[0]
+            non_mail = conn.execute(
+                "SELECT COUNT(*) FROM non_mail_items "
+                "WHERE target_mailbox=? AND pst_path=?",
+                (mailbox, pst_path),
+            ).fetchone()[0]
+            runs = conn.execute(
+                "SELECT COUNT(*) FROM pst_runs WHERE target_mailbox=? AND pst_path=?",
+                (mailbox, pst_path),
+            ).fetchone()[0]
+        return {"messages": mail, "non_mail_items": non_mail, "pst_runs": runs}
+
+    def count_folder_map(self, mailbox: str) -> int:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM folder_map WHERE target_mailbox=?",
+                (mailbox,),
+            ).fetchone()[0]
+
+    def clear_scope(
+        self, mailbox: str, pst_path: str
+    ) -> dict[str, int]:
+        """Delete messages/non_mail_items/pst_runs rows for the scope.
+
+        Returns the number of rows deleted from each table so the caller
+        can report it. Does NOT touch folder_map (that table isn't
+        keyed by PST; clear it separately via :meth:`clear_folder_map`).
+        """
+        with self._connect() as conn:
+            mail = conn.execute(
+                "DELETE FROM messages WHERE target_mailbox=? AND pst_path=?",
+                (mailbox, pst_path),
+            ).rowcount
+            non_mail = conn.execute(
+                "DELETE FROM non_mail_items "
+                "WHERE target_mailbox=? AND pst_path=?",
+                (mailbox, pst_path),
+            ).rowcount
+            runs = conn.execute(
+                "DELETE FROM pst_runs WHERE target_mailbox=? AND pst_path=?",
+                (mailbox, pst_path),
+            ).rowcount
+        return {"messages": mail, "non_mail_items": non_mail, "pst_runs": runs}
+
+    def clear_folder_map(self, mailbox: str) -> int:
+        """Delete cached folder-id rows for a mailbox.
+
+        Safe to clear without touching Graph: the folder manager always
+        re-resolves cache misses via ``_create_or_find``, which queries
+        Graph for an existing folder by name before creating a new one,
+        so the worst case is a few extra GETs on the next import.
+        """
+        with self._connect() as conn:
+            return conn.execute(
+                "DELETE FROM folder_map WHERE target_mailbox=?",
+                (mailbox,),
+            ).rowcount
