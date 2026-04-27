@@ -154,7 +154,9 @@ class Orchestrator:
 
         folders = FolderManager(graph, self._state, row.target_mailbox)
         uploader = MessageUploader(graph, row.target_mailbox, self._cfg.migration.large_attachment_threshold_bytes)
-        root = row.target_root_folder or self._cfg.migration.target_root_folder or None
+        # `target_root_folder` is intentionally ignored. Mail is routed into
+        # the mailbox's real Outlook folder structure (Inbox / Sent Items /
+        # etc.) by FolderManager; there is no 'Imported PST' wrapper.
 
         # Upload in parallel within this mailbox
         with ThreadPoolExecutor(
@@ -162,7 +164,7 @@ class Orchestrator:
             thread_name_prefix=f"up-{row.target_mailbox.split('@')[0][:6]}",
         ) as up_pool:
             futures = {
-                up_pool.submit(self._upload_one, msg, row, folders, uploader, root): msg
+                up_pool.submit(self._upload_one, msg, row, folders, uploader): msg
                 for msg in messages
             }
             for fut in as_completed(futures):
@@ -189,7 +191,6 @@ class Orchestrator:
         row: MappingRow,
         folders: FolderManager,
         uploader: MessageUploader,
-        root: str | None,
     ) -> str:
         pst_str = str(row.pst_path)
         src = str(msg.file_path)
@@ -216,7 +217,7 @@ class Orchestrator:
         # and stats attribution.
         chosen_app = self._pool.pick()
         try:
-            folder_id = folders.ensure_path(msg.folder_path, root_folder=root)
+            folder_id = folders.ensure_path(msg.folder_path)
             result = uploader.upload(msg, folder_id, app_id=chosen_app)
             self._state.upsert_message(
                 mailbox=row.target_mailbox,
