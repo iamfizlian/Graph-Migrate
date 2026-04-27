@@ -738,8 +738,14 @@ function Fix-FolderItems {
     param(
         [Parameter(Mandatory)] $Folder,
         [Parameter(Mandatory)][bool]$IsDryRun,
-        [Parameter()] $RdoSession   # may be $null -> falls back to OOM
+        [Parameter()] $RdoSession,   # may be $null -> falls back to OOM
+        # Optional label for progress lines, e.g. "[Mailbox 2/12 | folder 4/18] "
+        # so tailing a log shows position across all mailboxes + folders.
+        [Parameter()][string]$ProgressPrefix = ''
     )
+    if ($ProgressPrefix -and -not $ProgressPrefix.EndsWith(' ')) {
+        $ProgressPrefix = $ProgressPrefix + ' '
+    }
     $found  = 0
     $fixed  = 0
     $failed = 0
@@ -801,7 +807,7 @@ function Fix-FolderItems {
             # Item couldn't be loaded -- skip.
         }
         if (($scanned % $scanProgressEvery) -eq 0) {
-            Write-Host ("    scanned {0}/{1} ({2} drafts so far, {3} clean twin(s) indexed)" `
+            Write-Host ($ProgressPrefix + "    scanned {0}/{1} ({2} drafts so far, {3} clean twin(s) indexed)" `
                 -f $scanned, $itemCount, $entryIds.Count, $cleanTwinMap.Count) -ForegroundColor DarkGray
         }
         try { $itm = $items.GetNext() } catch { $itm = $null }
@@ -845,7 +851,7 @@ function Fix-FolderItems {
     $cap = $script:MaxItemsCap
     foreach ($eid in $entryIds) {
         if ($cap -gt 0 -and $fixedSoFar -ge $cap) {
-            Write-Host ("    -MaxItems cap ({0}) reached; stopping early." -f $cap) -ForegroundColor Yellow
+            Write-Host ($ProgressPrefix + "    -MaxItems cap ({0}) reached; stopping early." -f $cap) -ForegroundColor Yellow
             break
         }
         $fixedSoFar++
@@ -885,7 +891,7 @@ function Fix-FolderItems {
                     Write-Verbose "  twin-delete failed for ${eid}: $($_.Exception.Message)"
                 }
                 if (($fixedSoFar % $fixProgressEvery) -eq 0) {
-                    Write-Host ("    processed {0}/{1} (verified-fixed {2}, twin-resolved {3}, silent-noop {4}, errored {5})" `
+                    Write-Host ($ProgressPrefix + "    processed {0}/{1} (verified-fixed {2}, twin-resolved {3}, silent-noop {4}, errored {5})" `
                         -f $fixedSoFar, $found, $fixed, $resolvedByTwin, $silentNoop, $failed) -ForegroundColor DarkGray
                 }
                 continue
@@ -947,13 +953,13 @@ function Fix-FolderItems {
             Write-Verbose "  item $eid failed: $($_.Exception.Message)"
         }
         if (($fixedSoFar % $fixProgressEvery) -eq 0) {
-            Write-Host ("    processed {0}/{1} (verified-fixed {2}, twin-resolved {3}, silent-noop {4}, errored {5})" `
+            Write-Host ($ProgressPrefix + "    processed {0}/{1} (verified-fixed {2}, twin-resolved {3}, silent-noop {4}, errored {5})" `
                 -f $fixedSoFar, $found, $fixed, $resolvedByTwin, $silentNoop, $failed) -ForegroundColor DarkGray
         }
     }
 
     if ($resolvedByTwin -gt 0) {
-        Write-Host ("    twin-resolved {0}/{1} item(s) by deleting dirty originals against pre-existing clean copies." `
+        Write-Host ($ProgressPrefix + "    twin-resolved {0}/{1} item(s) by deleting dirty originals against pre-existing clean copies." `
             -f $resolvedByTwin, $found) -ForegroundColor DarkGreen
     }
 
@@ -1040,7 +1046,10 @@ function Fix-Mailbox {
         [Parameter(Mandatory)][string]$Upn,
         [Parameter(Mandatory)][bool]$IsDryRun,
         [Parameter()][string]$FolderFilter,
-        [Parameter()] $RdoSession   # may be $null -> OOM fallback
+        [Parameter()] $RdoSession,   # may be $null -> OOM fallback
+        # For multi-mailbox runs: print "[Mailbox i/n | folder j/m]" on progress lines.
+        [Parameter()][int]$MailboxIndex = 0,
+        [Parameter()][int]$MailboxTotal = 0
     )
 
     $stats = [ordered]@{
@@ -1156,13 +1165,23 @@ function Fix-Mailbox {
             $Upn, $candidates.Count,
             $(if ($IsDryRun) { ' (DRY RUN)' } else { '' })) -ForegroundColor Cyan
 
+        if ($MailboxTotal -gt 0) {
+            Write-Host ("========== Mailbox {0} of {1}: {2} ==========" -f $MailboxIndex, $MailboxTotal, $Upn) -ForegroundColor Cyan
+        }
+
+        $folderNum = 0
         foreach ($folder in $candidates) {
+            $folderNum++
+            $mbPart = ''
+            if ($MailboxTotal -gt 0) {
+                $mbPart = "[Mailbox {0}/{1} | folder {2}/{3}] " -f $MailboxIndex, $MailboxTotal, $folderNum, $candidates.Count
+            }
             $display = Get-FolderDisplayPath $folder
             $itemCount = -1
             try { $itemCount = $folder.Items.Count } catch { }
-            Write-Host ("  scanning '{0}' ({1} item(s))..." -f $display, $itemCount) -ForegroundColor DarkGray
-            $r = Fix-FolderItems -Folder $folder -IsDryRun $IsDryRun -RdoSession $RdoSession
-            $msg = "  '{0}': {1} draft(s)" -f $display, $r.Found
+            Write-Host ($mbPart + "  scanning '{0}' ({1} item(s))..." -f $display, $itemCount) -ForegroundColor DarkGray
+            $r = Fix-FolderItems -Folder $folder -IsDryRun $IsDryRun -RdoSession $RdoSession -ProgressPrefix $mbPart
+            $msg = $mbPart + "  '{0}': {1} draft(s)" -f $display, $r.Found
             if (-not $IsDryRun -and $r.Found -gt 0) {
                 $stuckPart = ''
                 if ($r.SilentNoop -gt 0) {
@@ -1291,9 +1310,13 @@ function Main {
     $script:MaxItemsCap = [int]$MaxItems
 
     $results = New-Object 'System.Collections.Generic.List[pscustomobject]'
+    $mbTotal = $script:Mailbox.Count
+    $mbIdx   = 0
     foreach ($upn in $script:Mailbox) {
+        $mbIdx++
         $r = Fix-Mailbox -Namespace $ns -Upn $upn -IsDryRun:$DryRun.IsPresent `
-            -FolderFilter $Folder -RdoSession $rdo
+            -FolderFilter $Folder -RdoSession $rdo `
+            -MailboxIndex $mbIdx -MailboxTotal $mbTotal
         $results.Add($r)
     }
 
