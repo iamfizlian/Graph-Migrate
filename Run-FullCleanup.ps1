@@ -418,7 +418,7 @@ if (-not $SkipFlatten) {
         -Name    'Step 1: Flatten Imported PST' `
         -LogFile 'step1-flatten.log' `
         -Action  {
-            $env:JTET_LIVE_STATUS_FILE = $using:LiveStatusFile
+            $env:JTET_LIVE_STATUS_FILE = $LiveStatusFile
             $pyArgs = @('_flatten_imported.py', '-c', $ConfigPath) + $selection.PythonArgs
             if ($DryRun) { $pyArgs += '--dry-run' }
             & $PythonExe @pyArgs
@@ -435,7 +435,7 @@ if (-not $SkipConsolidate) {
         -Name    'Step 2: Consolidate Sent Items' `
         -LogFile 'step2-consolidate.log' `
         -Action  {
-            $env:JTET_LIVE_STATUS_FILE = $using:LiveStatusFile
+            $env:JTET_LIVE_STATUS_FILE = $LiveStatusFile
             $pyArgs = @('_consolidate_sent.py', '-c', $ConfigPath) + $selection.PythonArgs
             if ($DryRun) { $pyArgs += '--dry-run' }
             & $PythonExe @pyArgs
@@ -449,12 +449,12 @@ if (-not $SkipDrafts) {
         -Name    'Step 3: Clear MSGFLAG_UNSENT' `
         -LogFile 'step3-drafts.log' `
         -Action  {
-            $env:JTET_LIVE_STATUS_FILE = $using:LiveStatusFile
-            $pCount = $using:plan.Count
+            $env:JTET_LIVE_STATUS_FILE = $LiveStatusFile
+            $pCount = $plan.Count
             $env:JTET_LIVE_PIPELINE_LABEL = "$pCount of $pCount (Outlook — last step in this plan)"
             Write-Host ""
             Write-Host ("========== RUN-FULL-CLEANUP: pipeline step {0} of {0} (Outlook / MAPI — usually the slowest) ==========" -f $plan.Count) -ForegroundColor Cyan
-            Write-Host "LIVE-STATUS: $using:LiveStatusFile (updated per mailbox in this step)`n" -ForegroundColor Cyan
+            Write-Host "LIVE-STATUS: $LiveStatusFile (updated per mailbox in this step)`n" -ForegroundColor Cyan
             $childScript = Join-Path $ScriptRoot 'Fix-DraftsViaOutlook.ps1'
             $params = @{} + $selection.PSArgs
             if ($DryRun) { $params['DryRun'] = $true }
