@@ -408,7 +408,7 @@ $results = @()
 Write-Host ''
 Write-Host "LIVE STATUS FILE (open in Notepad; refreshes as the run works):" -ForegroundColor Green
 Write-Host "  $LiveStatusFile" -ForegroundColor Green
-Write-Host "  overall_run_approx = rough %% through the whole run (equal weight per pipeline step, then mailboxes in that step). Not time-based." -ForegroundColor DarkGray
+Write-Host '  overall_run_approx: rough % through the full run (in LIVE-STATUS.txt; equal weight per step, not wall-clock).' -ForegroundColor DarkGray
 Write-Host ""
 
 # --- Step 1: Flatten -------------------------------------------------------

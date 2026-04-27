@@ -233,6 +233,25 @@ def move_folder(graph: GraphClient, mailbox: str, folder_id: str, dest_parent_id
     graph.post(path, json={"destinationId": dest_parent_id}, expect_status=(200, 201))
 
 
+def _graph_odata_code(body: object) -> str | None:
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            c = err.get("code")
+            if isinstance(c, str) and c:
+                return c
+    return None
+
+
+def _is_move_copy_failed(e: GraphError) -> bool:
+    """True when Graph rejects a wholesale folder /mailFolders/.../move (often 500 + ErrorMoveCopyFailed)."""
+    c = _graph_odata_code(e.body)
+    if c == "ErrorMoveCopyFailed":
+        return True
+    s = str(e.body)
+    return "ErrorMoveCopyFailed" in s or "MoveCopyFailed" in s
+
+
 def create_subfolder(graph: GraphClient, mailbox: str, parent_id: str, name: str) -> dict:
     """Create a child folder under `parent_id`. Returns the new folder dict.
 
@@ -633,8 +652,26 @@ def execute_merge(
             moved += sm
             subs += ss + 1
         else:
-            move_folder(graph, mailbox, sub["id"], dst_id)
-            subs += 1
+            try:
+                move_folder(graph, mailbox, sub["id"], dst_id)
+                subs += 1
+            except GraphError as e:
+                if not _is_move_copy_failed(e):
+                    raise
+                log.warning(
+                    "{}{!r}: wholesale folder-move failed ({}), merging item-by-item under destination instead.",
+                    indent, sub_path, _graph_odata_code(e.body) or e.status,
+                )
+                new_dst = find_child_named(
+                    graph, mailbox, dst_id, sub["displayName"]
+                ) or create_subfolder(graph, mailbox, dst_id, sub["displayName"])
+                sm, ss = execute_merge(
+                    graph, mailbox, sub, new_dst["id"],
+                    src_path=sub_path, log=log, depth=depth + 1, dedup=dedup,
+                )
+                delete_folder_if_empty(graph, mailbox, sub["id"])
+                moved += sm
+                subs += ss + 1
 
     return moved, subs
 
@@ -846,8 +883,29 @@ def flatten_mailbox(
             # mailbox root.
             if dedup is None:
                 log.info("move {!r} -> mailbox root", src["displayName"])
-                move_folder(graph, mailbox, src["id"], "msgFolderRoot")
-                folder_moves += 1
+                try:
+                    move_folder(graph, mailbox, src["id"], "msgFolderRoot")
+                    folder_moves += 1
+                except GraphError as e:
+                    if not _is_move_copy_failed(e):
+                        raise
+                    log.warning(
+                        "Wholesale move to mailbox root failed for {!r} ({}). "
+                        "Falling back to create-at-root + item merge (slower, same as --skip-duplicates without dedup).",
+                        src["displayName"],
+                        _graph_odata_code(e.body) or e.status,
+                    )
+                    src_path = f"{ROOT_FOLDER_NAME}/{src['displayName']}"
+                    new_root = create_subfolder(
+                        graph, mailbox, "msgFolderRoot", src["displayName"]
+                    )
+                    m, s = execute_merge(
+                        graph, mailbox, src, new_root["id"],
+                        src_path=src_path, log=log, depth=2, dedup=None,
+                    )
+                    delete_folder_if_empty(graph, mailbox, src["id"])
+                    item_moves += m
+                    folder_moves += s
             else:
                 # With dedup on we can't wholesale-move (no per-message check).
                 # Create the folder at root and merge into it item-by-item.
