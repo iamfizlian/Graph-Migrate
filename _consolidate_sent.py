@@ -36,10 +36,8 @@ Run from Graph-Migrate/:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -345,42 +343,6 @@ def consolidate_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> d
     return stats
 
 
-def _write_jtet_live_status(**fields: str) -> None:
-    path = os.environ.get("JTET_LIVE_STATUS_FILE")
-    if not path:
-        return
-    lines = [f"{k}: {v}" for k, v in fields.items()]
-    lines.append(
-        f"updated_utc: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}"
-    )
-    try:
-        Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
-    except OSError:
-        pass
-
-
-def _live_pipeline_meta() -> tuple[str, int, int]:
-    try:
-        t = int(os.environ.get("JTET_LIVE_PIPELINE_TOTAL_STEPS", "3") or 3)
-    except ValueError:
-        t = 3
-    try:
-        s = int(os.environ.get("JTET_LIVE_PIPELINE_STEP_INDEX", "1") or 1)
-    except ValueError:
-        s = 1
-    if t < 1:
-        t = 3
-    s = max(1, min(s, t))
-    return f"{s} of {t}", s, t
-
-
-def _live_overall_pct(fraction_in_step: float) -> str:
-    _, s, t = _live_pipeline_meta()
-    f = max(0.0, min(1.0, float(fraction_in_step)))
-    pct = 100.0 * (s - 1 + f) / t
-    return f"{pct:.1f}%"
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Move misplaced 'Sent'-named folders into the actual Sent Items.",
@@ -409,24 +371,9 @@ def main() -> int:
     pool = AppPool(cfg.apps)
     parallelism = min(cfg.migration.max_parallel_mailboxes, len(mailboxes)) or 1
 
-    n_mb = len(mailboxes)
     logger.bind(ctx="sent").info(
         "Processing {} mailbox(es) with {} parallel workers, {} app(s).",
-        n_mb, parallelism, len(cfg.apps),
-    )
-    logger.bind(ctx="sent").info(
-        "STEP 2 PROGRESS: watch for  PROGRESS: k/{} mailboxes complete  (fires when each mailbox's consolidate finishes).",
-        n_mb,
-    )
-
-    pl, _, _ = _live_pipeline_meta()
-    _write_jtet_live_status(
-        overall_run_approx=_live_overall_pct(0.0),
-        what_this_run_means="Percent = full pipeline. This step = consolidate Sent Items only.",
-        pipeline_step=pl,
-        run_step="consolidate Sent Items (Graph)",
-        mailboxes_total=str(n_mb),
-        mailboxes_finished_in_this_step=f"0/{n_mb}",
+        len(mailboxes), parallelism, len(cfg.apps),
     )
 
     results: list[dict] = []
@@ -436,68 +383,16 @@ def main() -> int:
                 ex.submit(consolidate_mailbox, graph, m, dry_run=ns.dry_run): m
                 for m in mailboxes
             }
-            done = 0
             for fut in as_completed(futs):
                 m = futs[fut]
                 try:
                     results.append(fut.result())
-                    done += 1
-                    logger.bind(ctx="sent").info(
-                        "PROGRESS: {}/{} mailboxes complete (finished: {}, ok).",
-                        done, n_mb, m,
-                    )
-                    pl, _, _ = _live_pipeline_meta()
-                    _write_jtet_live_status(
-                        overall_run_approx=_live_overall_pct(done / n_mb if n_mb else 0.0),
-                        pipeline_step=pl,
-                        run_step="consolidate Sent Items (Graph)",
-                        mailboxes_total=str(n_mb),
-                        mailboxes_finished_in_this_step=f"{done}/{n_mb}",
-                        last_mailbox_just_completed=m,
-                        not_finished_yet_in_this_step=str(n_mb - done),
-                    )
                 except GraphError as e:
                     logger.bind(ctx=f"sent[{m}]").error("Graph error: {}", e)
                     results.append({"mailbox": m, "error": str(e)})
-                    done += 1
-                    logger.bind(ctx="sent").warning(
-                        "PROGRESS: {}/{} mailboxes complete (finished: {}, Graph error).",
-                        done, n_mb, m,
-                    )
-                    pl, _, _ = _live_pipeline_meta()
-                    _write_jtet_live_status(
-                        overall_run_approx=_live_overall_pct(done / n_mb if n_mb else 0.0),
-                        pipeline_step=pl,
-                        run_step="consolidate Sent Items",
-                        mailboxes_finished_in_this_step=f"{done}/{n_mb}",
-                        last_mailbox_just_completed=m,
-                        last_result="Graph error",
-                    )
                 except Exception as e:
                     logger.bind(ctx=f"sent[{m}]").exception("Crashed: {}", e)
                     results.append({"mailbox": m, "error": str(e)})
-                    done += 1
-                    logger.bind(ctx="sent").warning(
-                        "PROGRESS: {}/{} mailboxes complete (finished: {}, ERROR).",
-                        done, n_mb, m,
-                    )
-                    pl, _, _ = _live_pipeline_meta()
-                    _write_jtet_live_status(
-                        overall_run_approx=_live_overall_pct(done / n_mb if n_mb else 0.0),
-                        pipeline_step=pl,
-                        run_step="consolidate Sent Items",
-                        mailboxes_finished_in_this_step=f"{done}/{n_mb}",
-                        last_mailbox_just_completed=m,
-                        last_result="ERROR",
-                    )
-
-    pl, _, _ = _live_pipeline_meta()
-    _write_jtet_live_status(
-        overall_run_approx=_live_overall_pct(1.0),
-        pipeline_step=f"{pl} (this step done)",
-        run_step="consolidate Sent Items",
-        status="Consolidate finished — next pipeline step (if any) runs next.",
-    )
 
     print()
     hdr = f"{'mailbox':<46} {'folders':>8} {'messages':>10}  status"

@@ -38,11 +38,9 @@ Run from Graph-Migrate/:
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
@@ -231,25 +229,6 @@ def move_message(graph: GraphClient, mailbox: str, msg_id: str, dest_id: str) ->
 def move_folder(graph: GraphClient, mailbox: str, folder_id: str, dest_parent_id: str) -> None:
     path = f"/users/{quote(mailbox)}/mailFolders/{folder_id}/move"
     graph.post(path, json={"destinationId": dest_parent_id}, expect_status=(200, 201))
-
-
-def _graph_odata_code(body: object) -> str | None:
-    if isinstance(body, dict):
-        err = body.get("error")
-        if isinstance(err, dict):
-            c = err.get("code")
-            if isinstance(c, str) and c:
-                return c
-    return None
-
-
-def _is_move_copy_failed(e: GraphError) -> bool:
-    """True when Graph rejects a wholesale folder /mailFolders/.../move (often 500 + ErrorMoveCopyFailed)."""
-    c = _graph_odata_code(e.body)
-    if c == "ErrorMoveCopyFailed":
-        return True
-    s = str(e.body)
-    return "ErrorMoveCopyFailed" in s or "MoveCopyFailed" in s
 
 
 def create_subfolder(graph: GraphClient, mailbox: str, parent_id: str, name: str) -> dict:
@@ -652,26 +631,8 @@ def execute_merge(
             moved += sm
             subs += ss + 1
         else:
-            try:
-                move_folder(graph, mailbox, sub["id"], dst_id)
-                subs += 1
-            except GraphError as e:
-                if not _is_move_copy_failed(e):
-                    raise
-                log.warning(
-                    "{}{!r}: wholesale folder-move failed ({}), merging item-by-item under destination instead.",
-                    indent, sub_path, _graph_odata_code(e.body) or e.status,
-                )
-                new_dst = find_child_named(
-                    graph, mailbox, dst_id, sub["displayName"]
-                ) or create_subfolder(graph, mailbox, dst_id, sub["displayName"])
-                sm, ss = execute_merge(
-                    graph, mailbox, sub, new_dst["id"],
-                    src_path=sub_path, log=log, depth=depth + 1, dedup=dedup,
-                )
-                delete_folder_if_empty(graph, mailbox, sub["id"])
-                moved += sm
-                subs += ss + 1
+            move_folder(graph, mailbox, sub["id"], dst_id)
+            subs += 1
 
     return moved, subs
 
@@ -883,29 +844,8 @@ def flatten_mailbox(
             # mailbox root.
             if dedup is None:
                 log.info("move {!r} -> mailbox root", src["displayName"])
-                try:
-                    move_folder(graph, mailbox, src["id"], "msgFolderRoot")
-                    folder_moves += 1
-                except GraphError as e:
-                    if not _is_move_copy_failed(e):
-                        raise
-                    log.warning(
-                        "Wholesale move to mailbox root failed for {!r} ({}). "
-                        "Falling back to create-at-root + item merge (slower, same as --skip-duplicates without dedup).",
-                        src["displayName"],
-                        _graph_odata_code(e.body) or e.status,
-                    )
-                    src_path = f"{ROOT_FOLDER_NAME}/{src['displayName']}"
-                    new_root = create_subfolder(
-                        graph, mailbox, "msgFolderRoot", src["displayName"]
-                    )
-                    m, s = execute_merge(
-                        graph, mailbox, src, new_root["id"],
-                        src_path=src_path, log=log, depth=2, dedup=None,
-                    )
-                    delete_folder_if_empty(graph, mailbox, src["id"])
-                    item_moves += m
-                    folder_moves += s
+                move_folder(graph, mailbox, src["id"], "msgFolderRoot")
+                folder_moves += 1
             else:
                 # With dedup on we can't wholesale-move (no per-message check).
                 # Create the folder at root and merge into it item-by-item.
@@ -950,46 +890,6 @@ def flatten_mailbox(
 
 
 # ----------------------------------------------------------------------- driver
-
-
-def _write_jtet_live_status(**fields: str) -> None:
-    """If JTET_LIVE_STATUS_FILE is set (by Run-FullCleanup.ps1), refresh one file
-    the operator can open anytime for *current* position (not only at step end)."""
-    path = os.environ.get("JTET_LIVE_STATUS_FILE")
-    if not path:
-        return
-    lines = [f"{k}: {v}" for k, v in fields.items()]
-    lines.append(
-        f"updated_utc: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}"
-    )
-    try:
-        Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
-    except OSError:
-        pass
-
-
-def _live_pipeline_meta() -> tuple[str, int, int]:
-    """pipeline label and indices from env (set by Run-FullCleanup.ps1)."""
-    try:
-        t = int(os.environ.get("JTET_LIVE_PIPELINE_TOTAL_STEPS", "3") or 3)
-    except ValueError:
-        t = 3
-    try:
-        s = int(os.environ.get("JTET_LIVE_PIPELINE_STEP_INDEX", "1") or 1)
-    except ValueError:
-        s = 1
-    if t < 1:
-        t = 3
-    s = max(1, min(s, t))
-    return f"{s} of {t}", s, t
-
-
-def _live_overall_pct(fraction_in_step: float) -> str:
-    """Equal weight for each full pipeline step; within step, 0..1 (e.g. done/total)."""
-    _, s, t = _live_pipeline_meta()
-    f = max(0.0, min(1.0, float(fraction_in_step)))
-    pct = 100.0 * (s - 1 + f) / t
-    return f"{pct:.1f}%"
 
 
 def main() -> int:
@@ -1042,26 +942,9 @@ def main() -> int:
     pool = AppPool(cfg.apps)
     parallelism = min(cfg.migration.max_parallel_mailboxes, len(mailboxes)) or 1
 
-    n_mb = len(mailboxes)
     logger.bind(ctx="flatten").info(
         "Processing {} mailbox(es) with {} parallel workers and {} app(s).",
-        n_mb, parallelism, len(cfg.apps),
-    )
-    logger.bind(ctx="flatten").info(
-        "STEP 1 PROGRESS: watch for lines like  PROGRESS: k/{} mailboxes complete  "
-        "(each line fires when one mailbox finishes — order is completion order, not CSV order).",
-        n_mb,
-    )
-
-    pl, _, _ = _live_pipeline_meta()
-    _write_jtet_live_status(
-        overall_run_approx=_live_overall_pct(0.0),
-        what_this_run_means="Percent = whole pipeline, not one step. This step = flatten; later steps = consolidate, then Outlook.",
-        pipeline_step=pl,
-        run_step="flatten (Graph / Imported PST)",
-        mailboxes_total=str(n_mb),
-        mailboxes_finished_in_this_step=f"0/{n_mb}",
-        what_this_step_means="k/N here is only for flatten. overall_run_approx includes step position.",
+        len(mailboxes), parallelism, len(cfg.apps),
     )
 
     all_stats: list[dict] = []
@@ -1074,53 +957,13 @@ def main() -> int:
                 ): m
                 for m in mailboxes
             }
-            done = 0
             for fut in as_completed(futures):
                 m = futures[fut]
                 try:
                     all_stats.append(fut.result())
-                    done += 1
-                    logger.bind(ctx="flatten").info(
-                        "PROGRESS: {}/{} mailboxes complete (finished: {}, ok).",
-                        done, n_mb, m,
-                    )
-                    pl, _, _ = _live_pipeline_meta()
-                    _write_jtet_live_status(
-                        overall_run_approx=_live_overall_pct(done / n_mb if n_mb else 0.0),
-                        pipeline_step=pl,
-                        run_step="flatten (Graph / Imported PST)",
-                        mailboxes_total=str(n_mb),
-                        mailboxes_finished_in_this_step=f"{done}/{n_mb}",
-                        last_mailbox_just_completed=m,
-                        not_finished_yet_in_this_step=str(n_mb - done),
-                        what_this_step_means="k/N = flatten only. overall_run_approx = whole run (equal weight per pipeline step).",
-                    )
                 except Exception as e:
                     logger.bind(ctx=f"flatten[{m}]").exception("Crashed: {}", e)
                     all_stats.append({"mailbox": m, "error": str(e)})
-                    done += 1
-                    logger.bind(ctx="flatten").warning(
-                        "PROGRESS: {}/{} mailboxes complete (finished: {}, ERROR — see traceback above).",
-                        done, n_mb, m,
-                    )
-                    pl, _, _ = _live_pipeline_meta()
-                    _write_jtet_live_status(
-                        overall_run_approx=_live_overall_pct(done / n_mb if n_mb else 0.0),
-                        pipeline_step=pl,
-                        run_step="flatten (Graph / Imported PST)",
-                        mailboxes_total=str(n_mb),
-                        mailboxes_finished_in_this_step=f"{done}/{n_mb}",
-                        last_mailbox_just_completed=m,
-                        last_result="ERROR (see step1-flatten.log)",
-                    )
-
-    pl, _, _ = _live_pipeline_meta()
-    _write_jtet_live_status(
-        overall_run_approx=_live_overall_pct(1.0),
-        pipeline_step=f"{pl} (this step done)",
-        run_step="flatten",
-        status="Flatten finished — next pipeline step (if any) runs next.",
-    )
 
     # Summary
     print()

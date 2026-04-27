@@ -257,12 +257,7 @@ $RunStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $RunDir   = Join-Path $LogDir $RunStamp
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 
-$SummaryPath     = Join-Path $RunDir 'summary.txt'
-$LiveStatusFile  = Join-Path $RunDir 'LIVE-STATUS.txt'
-# Child processes (_flatten, _consolidate) read this path from the environment
-# and rewrite the file on every milestone so the operator can open one file
-# for *current* state mid-run.
-$env:JTET_LIVE_STATUS_FILE = $LiveStatusFile
+$SummaryPath = Join-Path $RunDir 'summary.txt'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -377,11 +372,6 @@ if ($plan.Count -eq 0) {
     throw 'All three steps were skipped via -SkipFlatten / -SkipConsolidate / -SkipDrafts. Nothing to do.'
 }
 
-# Children (_flatten, _consolidate, Fix-DraftsViaOutlook) read these for LIVE-STATUS.txt
-# overall_run_approx: equal weight per enabled step + mailbox progress within the step.
-$env:JTET_LIVE_PIPELINE_TOTAL_STEPS = "$($plan.Count)"
-$pipelineStepNum = 0
-
 Write-Host ''
 Write-Host "Selection : $selectStr"
 foreach ($m in $SelectedMailboxes) { Write-Host "              - $m" }
@@ -405,27 +395,13 @@ Add-Summary ('{0,-32} {1,-12} {2,8} {3}' -f ('-' * 32), ('-' * 12), ('-' * 8), (
 
 $results = @()
 
-Write-Host ''
-Write-Host "LIVE STATUS FILE (open in Notepad; refreshes as the run works):" -ForegroundColor Green
-Write-Host "  $LiveStatusFile" -ForegroundColor Green
-Write-Host '  overall_run_approx: rough % through the full run (in LIVE-STATUS.txt; equal weight per step, not wall-clock).' -ForegroundColor DarkGray
-Write-Host ""
-
 # --- Step 1: Flatten -------------------------------------------------------
 
 if (-not $SkipFlatten) {
-    $pipelineStepNum++
-    $env:JTET_LIVE_PIPELINE_STEP_INDEX = "$pipelineStepNum"
-    Write-Host ''
-    Write-Host ">>> PIPELINE STEP $pipelineStepNum of $($plan.Count): Flatten (_flatten_imported.py) — Microsoft Graph, mailboxes run in PARALLEL." -ForegroundColor Yellow
-    Write-Host ">>> Log: $RunDir\step1-flatten.log  |  Search for:  PROGRESS:  to see how many of $($SelectedMailboxes.Count) mailboxes have FINISHED (each line = one mailbox done)." -ForegroundColor Yellow
-    Write-Host ">>> While a large Inbox merge runs, you also get  moved N messages  every 200 msgs. Graph 500 + backoff is throttling; usually succeeds after retries." -ForegroundColor DarkGray
-    Write-Host ''
     $results += Invoke-Step `
         -Name    'Step 1: Flatten Imported PST' `
         -LogFile 'step1-flatten.log' `
         -Action  {
-            $env:JTET_LIVE_STATUS_FILE = $LiveStatusFile
             $pyArgs = @('_flatten_imported.py', '-c', $ConfigPath) + $selection.PythonArgs
             if ($DryRun) { $pyArgs += '--dry-run' }
             & $PythonExe @pyArgs
@@ -435,16 +411,10 @@ if (-not $SkipFlatten) {
 # --- Step 2: Consolidate Sent ---------------------------------------------
 
 if (-not $SkipConsolidate) {
-    $pipelineStepNum++
-    $env:JTET_LIVE_PIPELINE_STEP_INDEX = "$pipelineStepNum"
-    Write-Host ''
-    Write-Host ">>> PIPELINE STEP $pipelineStepNum of $($plan.Count): Consolidate Sent (_consolidate_sent.py) — parallel mailboxes, same PROGRESS: k/N idea in step2-consolidate.log." -ForegroundColor Yellow
-    Write-Host ''
     $results += Invoke-Step `
         -Name    'Step 2: Consolidate Sent Items' `
         -LogFile 'step2-consolidate.log' `
         -Action  {
-            $env:JTET_LIVE_STATUS_FILE = $LiveStatusFile
             $pyArgs = @('_consolidate_sent.py', '-c', $ConfigPath) + $selection.PythonArgs
             if ($DryRun) { $pyArgs += '--dry-run' }
             & $PythonExe @pyArgs
@@ -454,19 +424,10 @@ if (-not $SkipConsolidate) {
 # --- Step 3: Fix drafts via Outlook ---------------------------------------
 
 if (-not $SkipDrafts) {
-    $pipelineStepNum++
-    $env:JTET_LIVE_PIPELINE_STEP_INDEX = "$pipelineStepNum"
     $results += Invoke-Step `
         -Name    'Step 3: Clear MSGFLAG_UNSENT' `
         -LogFile 'step3-drafts.log' `
         -Action  {
-            $env:JTET_LIVE_STATUS_FILE = $LiveStatusFile
-            $pIdx  = $env:JTET_LIVE_PIPELINE_STEP_INDEX
-            $pTot  = $env:JTET_LIVE_PIPELINE_TOTAL_STEPS
-            $env:JTET_LIVE_PIPELINE_LABEL = "Step $pIdx of $pTot (Outlook MAPI — usually slowest)"
-            Write-Host ""
-            Write-Host ("========== RUN-FULL-CLEANUP: pipeline step {0} of {1} (Outlook / MAPI) ==========" -f $pIdx, $pTot) -ForegroundColor Cyan
-            Write-Host "LIVE-STATUS: $LiveStatusFile (updated per mailbox in this step)`n" -ForegroundColor Cyan
             $childScript = Join-Path $ScriptRoot 'Fix-DraftsViaOutlook.ps1'
             $params = @{} + $selection.PSArgs
             if ($DryRun) { $params['DryRun'] = $true }
@@ -505,6 +466,4 @@ if ($failed) {
 
 Write-Host ''
 Write-Host 'All steps completed successfully.' -ForegroundColor Green
-Add-Summary ''
-Add-Summary ("Run complete. Live status was: $LiveStatusFile")
 exit 0

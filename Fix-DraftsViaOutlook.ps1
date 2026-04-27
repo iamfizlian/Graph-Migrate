@@ -738,14 +738,8 @@ function Fix-FolderItems {
     param(
         [Parameter(Mandatory)] $Folder,
         [Parameter(Mandatory)][bool]$IsDryRun,
-        [Parameter()] $RdoSession,   # may be $null -> falls back to OOM
-        # Optional label for progress lines, e.g. "[Mailbox 2/12 | folder 4/18] "
-        # so tailing a log shows position across all mailboxes + folders.
-        [Parameter()][string]$ProgressPrefix = ''
+        [Parameter()] $RdoSession   # may be $null -> falls back to OOM
     )
-    if ($ProgressPrefix -and -not $ProgressPrefix.EndsWith(' ')) {
-        $ProgressPrefix = $ProgressPrefix + ' '
-    }
     $found  = 0
     $fixed  = 0
     $failed = 0
@@ -807,7 +801,7 @@ function Fix-FolderItems {
             # Item couldn't be loaded -- skip.
         }
         if (($scanned % $scanProgressEvery) -eq 0) {
-            Write-Host ($ProgressPrefix + "    scanned {0}/{1} ({2} drafts so far, {3} clean twin(s) indexed)" `
+            Write-Host ("    scanned {0}/{1} ({2} drafts so far, {3} clean twin(s) indexed)" `
                 -f $scanned, $itemCount, $entryIds.Count, $cleanTwinMap.Count) -ForegroundColor DarkGray
         }
         try { $itm = $items.GetNext() } catch { $itm = $null }
@@ -851,7 +845,7 @@ function Fix-FolderItems {
     $cap = $script:MaxItemsCap
     foreach ($eid in $entryIds) {
         if ($cap -gt 0 -and $fixedSoFar -ge $cap) {
-            Write-Host ($ProgressPrefix + "    -MaxItems cap ({0}) reached; stopping early." -f $cap) -ForegroundColor Yellow
+            Write-Host ("    -MaxItems cap ({0}) reached; stopping early." -f $cap) -ForegroundColor Yellow
             break
         }
         $fixedSoFar++
@@ -891,7 +885,7 @@ function Fix-FolderItems {
                     Write-Verbose "  twin-delete failed for ${eid}: $($_.Exception.Message)"
                 }
                 if (($fixedSoFar % $fixProgressEvery) -eq 0) {
-                    Write-Host ($ProgressPrefix + "    processed {0}/{1} (verified-fixed {2}, twin-resolved {3}, silent-noop {4}, errored {5})" `
+                    Write-Host ("    processed {0}/{1} (verified-fixed {2}, twin-resolved {3}, silent-noop {4}, errored {5})" `
                         -f $fixedSoFar, $found, $fixed, $resolvedByTwin, $silentNoop, $failed) -ForegroundColor DarkGray
                 }
                 continue
@@ -953,13 +947,13 @@ function Fix-FolderItems {
             Write-Verbose "  item $eid failed: $($_.Exception.Message)"
         }
         if (($fixedSoFar % $fixProgressEvery) -eq 0) {
-            Write-Host ($ProgressPrefix + "    processed {0}/{1} (verified-fixed {2}, twin-resolved {3}, silent-noop {4}, errored {5})" `
+            Write-Host ("    processed {0}/{1} (verified-fixed {2}, twin-resolved {3}, silent-noop {4}, errored {5})" `
                 -f $fixedSoFar, $found, $fixed, $resolvedByTwin, $silentNoop, $failed) -ForegroundColor DarkGray
         }
     }
 
     if ($resolvedByTwin -gt 0) {
-        Write-Host ($ProgressPrefix + "    twin-resolved {0}/{1} item(s) by deleting dirty originals against pre-existing clean copies." `
+        Write-Host ("    twin-resolved {0}/{1} item(s) by deleting dirty originals against pre-existing clean copies." `
             -f $resolvedByTwin, $found) -ForegroundColor DarkGreen
     }
 
@@ -1046,10 +1040,7 @@ function Fix-Mailbox {
         [Parameter(Mandatory)][string]$Upn,
         [Parameter(Mandatory)][bool]$IsDryRun,
         [Parameter()][string]$FolderFilter,
-        [Parameter()] $RdoSession,   # may be $null -> OOM fallback
-        # For multi-mailbox runs: print "[Mailbox i/n | folder j/m]" on progress lines.
-        [Parameter()][int]$MailboxIndex = 0,
-        [Parameter()][int]$MailboxTotal = 0
+        [Parameter()] $RdoSession   # may be $null -> OOM fallback
     )
 
     $stats = [ordered]@{
@@ -1165,23 +1156,13 @@ function Fix-Mailbox {
             $Upn, $candidates.Count,
             $(if ($IsDryRun) { ' (DRY RUN)' } else { '' })) -ForegroundColor Cyan
 
-        if ($MailboxTotal -gt 0) {
-            Write-Host ("========== Mailbox {0} of {1}: {2} ==========" -f $MailboxIndex, $MailboxTotal, $Upn) -ForegroundColor Cyan
-        }
-
-        $folderNum = 0
         foreach ($folder in $candidates) {
-            $folderNum++
-            $mbPart = ''
-            if ($MailboxTotal -gt 0) {
-                $mbPart = "[Mailbox {0}/{1} | folder {2}/{3}] " -f $MailboxIndex, $MailboxTotal, $folderNum, $candidates.Count
-            }
             $display = Get-FolderDisplayPath $folder
             $itemCount = -1
             try { $itemCount = $folder.Items.Count } catch { }
-            Write-Host ($mbPart + "  scanning '{0}' ({1} item(s))..." -f $display, $itemCount) -ForegroundColor DarkGray
-            $r = Fix-FolderItems -Folder $folder -IsDryRun $IsDryRun -RdoSession $RdoSession -ProgressPrefix $mbPart
-            $msg = $mbPart + "  '{0}': {1} draft(s)" -f $display, $r.Found
+            Write-Host ("  scanning '{0}' ({1} item(s))..." -f $display, $itemCount) -ForegroundColor DarkGray
+            $r = Fix-FolderItems -Folder $folder -IsDryRun $IsDryRun -RdoSession $RdoSession
+            $msg = "  '{0}': {1} draft(s)" -f $display, $r.Found
             if (-not $IsDryRun -and $r.Found -gt 0) {
                 $stuckPart = ''
                 if ($r.SilentNoop -gt 0) {
@@ -1211,64 +1192,6 @@ function Fix-Mailbox {
     }
 
     return [pscustomobject]$stats
-}
-
-# ---------------------------------------------------------------------------
-# Live status file (set by Run-FullCleanup.ps1 via env)
-# ---------------------------------------------------------------------------
-
-function Get-JtetOverallRunApprox {
-    <#
-        Equal weight per full pipeline step; within Outlook step, use mailbox_index / total
-        (at START of each mailbox, MbIdx is the one we're about to run).
-    #>
-    param(
-        [int]$MbIdx,
-        [int]$MbTotal
-    )
-    $pS = 1
-    $pT = 1
-    try { $pS = [int][string]$env:JTET_LIVE_PIPELINE_STEP_INDEX } catch { }
-    try { $pT = [int][string]$env:JTET_LIVE_PIPELINE_TOTAL_STEPS } catch { }
-    if ($pT -lt 1) { $pT = 1 }
-    if ($pS -lt 1) { $pS = 1 }
-    if ($pS -gt $pT) { $pS = $pT }
-    if ($MbTotal -lt 1) { $MbTotal = 1 }
-    $f = [double]($MbIdx - 1) / [double]$MbTotal
-    if ($f -lt 0) { $f = 0 }
-    if ($f -gt 1) { $f = 1 }
-    $pct = 100.0 * (([double]($pS - 1)) + $f) / [double]$pT
-    return ('{0:n1}%' -f $pct)
-}
-
-function Write-JtetLiveStatusOutlook {
-    param(
-        [int]$MbIdx,
-        [int]$MbTotal,
-        [string]$Upn,
-        [int]$CumFixedBefore,
-        [string]$Note
-    )
-    $path = $env:JTET_LIVE_STATUS_FILE
-    if (-not $path) { return }
-    $pl = $env:JTET_LIVE_PIPELINE_LABEL
-    if (-not $pl) { $pl = 'Outlook (draft fix)' }
-    $u = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ssZ')
-    $overall = Get-JtetOverallRunApprox -MbIdx $MbIdx -MbTotal $MbTotal
-    $lines = @(
-        "overall_run_approx: $overall",
-        "what_this_run_means: Percent = full pipeline; mailbox k/N = Outlook MAPI pass only (slow step is normal).",
-        "pipeline_step: $pl",
-        "run_step: clear MSGFLAG_UNSENT (Outlook / MAPI)",
-        "mailbox_index: $MbIdx of $MbTotal",
-        "current_mailbox: $Upn",
-        "cumulative_fixed_before_this_mailbox: $CumFixedBefore",
-        "note: $Note",
-        "updated_utc: $u"
-    )
-    try {
-        Set-Content -LiteralPath $path -Value ($lines -join "`n") -Encoding utf8
-    } catch { }
 }
 
 # ---------------------------------------------------------------------------
@@ -1367,60 +1290,11 @@ function Main {
 
     $script:MaxItemsCap = [int]$MaxItems
 
-    $mbTotal = $script:Mailbox.Count
-    if ($mbTotal -eq 0) { throw "Internal error: no mailboxes in list." }
-
-    # Overall run context — the per-folder "processed a/b" lines only make sense
-    # inside one folder.  This block answers: how many mailboxes, which one now,
-    # and how many items fixed in this process so far (monotonic for the run).
-    Write-Host ""
-    Write-Host "========== THIS RUN: $mbTotal mailbox(es) to process (one after another) ==========" -ForegroundColor Magenta
-    $n = 0
-    foreach ($m in $script:Mailbox) {
-        $n++
-        Write-Host ("  {0,3}. {1}" -f $n, $m) -ForegroundColor Magenta
-    }
-    Write-Host ""
-    Write-Host "Progress inside a big folder is still  processed x/y  for that folder only." -ForegroundColor DarkGray
-    Write-Host "After each mailbox finishes you get a  MAILBOX k/N END  line and a cumulative Fixed count for the whole run so far." -ForegroundColor DarkGray
-    Write-Host ""
-
     $results = New-Object 'System.Collections.Generic.List[pscustomobject]'
-    $sessionFixed   = 0
-    $mbIdx   = 0
     foreach ($upn in $script:Mailbox) {
-        $mbIdx++
-        Write-JtetLiveStatusOutlook -MbIdx $mbIdx -MbTotal $mbTotal -Upn $upn `
-            -CumFixedBefore $sessionFixed -Note 'Processing this mailbox now (folders may take a long time).'
-        Write-Host ("---------- MAILBOX {0,3} / {1}  START: {2}  (cumulative Fixed before this box: {3})" -f $mbIdx, $mbTotal, $upn, $sessionFixed) -ForegroundColor Yellow
         $r = Fix-Mailbox -Namespace $ns -Upn $upn -IsDryRun:$DryRun.IsPresent `
-            -FolderFilter $Folder -RdoSession $rdo `
-            -MailboxIndex $mbIdx -MailboxTotal $mbTotal
+            -FolderFilter $Folder -RdoSession $rdo
         $results.Add($r)
-        $addFx = 0
-        if ($null -ne $r.Fixed) { $addFx = [int]$r.Fixed }
-        $sessionFixed += $addFx
-        Write-Host ("---------- MAILBOX {0,3} / {1}  END:   {2}  |  this box: Fixed={3} Drafts={4} Stuck={5} Failed={6}  |  run cumulative Fixed: {7}  |  {8} of {1} mailboxes done" -f `
-            $mbIdx, $mbTotal, $upn, $r.Fixed, $r.Drafts, $r.Stuck, $r.Failed, $sessionFixed, $mbIdx) -ForegroundColor Yellow
-        Write-Host ""
-    }
-
-    if ($env:JTET_LIVE_STATUS_FILE) {
-        $u = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ssZ')
-        $pS = 1; $pT = 1
-        try { $pS = [int][string]$env:JTET_LIVE_PIPELINE_STEP_INDEX } catch { }
-        try { $pT = [int][string]$env:JTET_LIVE_PIPELINE_TOTAL_STEPS } catch { }
-        if ($pT -lt 1) { $pT = 1 }
-        if ($pS -lt 1) { $pS = 1 }
-        if ($pS -gt $pT) { $pS = $pT }
-        $endPct = 100.0 * [double]($pS) / [double]$pT
-        $endApprox = ('{0:n1}%' -f $endPct)
-        @(
-            "overall_run_approx: $endApprox (outlook MAPI pass finished for all listed mailboxes)",
-            "pipeline_step: $($env:JTET_LIVE_PIPELINE_LABEL) (Outlook pass complete for all mailboxes in this invocation)",
-            "run_step: clear MSGFLAG_UNSENT — finished",
-            "updated_utc: $u"
-        ) | Set-Content -LiteralPath $env:JTET_LIVE_STATUS_FILE -Encoding utf8
     }
 
     Write-Host ""
