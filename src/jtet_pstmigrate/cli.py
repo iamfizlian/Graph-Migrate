@@ -363,6 +363,79 @@ def run_import(
     raise typer.Exit(1 if failed else 0)
 
 
+@app.command("import-calendar")
+def run_import_calendar(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    limit: LimitOpt = None,
+    list_only: ListOnlyOpt = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Import calendar appointments from PSTs into each mailbox's default calendar.
+
+    This is a separate pass from ``import`` (mail). It uses the same mapping
+    CSV but extracts only appointments via ``readpst -t a`` into a sibling
+    work directory, so re-running it doesn't invalidate or trigger a re-run
+    of the mail extraction. State for calendar items lives in the
+    ``non_mail_items`` table, which is independent of the ``messages``
+    dedupe table -- so a calendar UID and a mail Message-ID can never
+    collide and a 'done' calendar event won't be re-uploaded if you also
+    re-run ``import``.
+
+    All events go into the user's default calendar; sub-calendar structure
+    inside the PST (custom calendars the user kept) is flattened. Recurring
+    series become single-occurrence events for v1; the original RRULE text
+    is preserved in the event body so no data is silently dropped.
+    """
+    cfg = _load(config)
+    run_id = f"import-calendar_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=limit)
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    if list_only or len(rows) != len(all_rows):
+        _print_selection(
+            rows,
+            heading=("Dry-run selection (calendar)" if list_only else "Selected rows (calendar, filtered)"),
+        )
+    if list_only:
+        raise typer.Exit(0)
+
+    pool = AppPool(cfg.apps)
+    filter_note = (
+        f"  selection = {len(rows)}/{len(all_rows)} rows (filtered)\n"
+        if len(rows) != len(all_rows) else ""
+    )
+    console.print(
+        f"\n[bold]About to import calendar items[/] from {len(rows)} PSTs "
+        f"into {len({r.target_mailbox for r in rows})} mailbox calendar(s).\n"
+        f"{filter_note}"
+        f"  app pool = {len(pool)} ({', '.join(pool.names)})\n"
+        f"  workers/mailbox = {cfg.migration.workers_per_mailbox}\n"
+        f"  parallel mailboxes = {cfg.migration.max_parallel_mailboxes}\n"
+        f"  state dir = {cfg.paths.state_dir}\n"
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+    orch = Orchestrator(cfg, state, pool)
+    reports = orch.run_calendar(rows)
+
+    failed = sum(1 for r in reports if r.status != "done" or r.items_failed)
+    raise typer.Exit(1 if failed else 0)
+
+
 @app.command()
 def status(
     config: ConfigOpt = None,

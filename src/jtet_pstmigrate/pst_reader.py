@@ -50,6 +50,19 @@ class ExtractedMessage:
     message_id: str | None
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class ExtractedAppointment:
+    """One .ics file produced by ``readpst -t a``."""
+
+    file_path: Path
+    folder_path: tuple[str, ...]
+    bytes_: int
+    dedupe_key: str                 # 'uid:<...>' or 'sha256:<hex>'
+    summary: str                    # SUMMARY field, truncated
+    uid: str | None
+    start: str | None               # raw DTSTART text, for logging only
+
+
 def check_readpst(binary: Path) -> str:
     """Return the readpst version string, or raise."""
     exe = shutil.which(str(binary)) or str(binary)
@@ -64,38 +77,92 @@ def check_readpst(binary: Path) -> str:
 
 
 def extract_pst(pst_path: Path, work_dir: Path, *, binary: Path = Path("readpst"), include_deleted: bool = False) -> Path:
-    """Run readpst, return the directory it wrote into.
+    """Extract mail (.eml) from a PST. See ``_run_readpst`` for the contract."""
+    return _run_readpst(
+        pst_path, work_dir, binary=binary, include_deleted=include_deleted,
+        type_codes="e", subdir_suffix="",
+    )
+
+
+def extract_pst_calendar(
+    pst_path: Path, work_dir: Path, *, binary: Path = Path("readpst"),
+    include_deleted: bool = False,
+) -> Path:
+    """Extract appointments (.ics) from a PST.
+
+    Output goes into a separate sibling directory of the mail extraction
+    (``<work_dir>/<pst_stem>__calendar``) so the two never overlap and so
+    re-running ``import`` doesn't invalidate the calendar sentinel.
+    """
+    return _run_readpst(
+        pst_path, work_dir, binary=binary, include_deleted=include_deleted,
+        type_codes="a", subdir_suffix="__calendar",
+    )
+
+
+def extract_pst_contacts(
+    pst_path: Path, work_dir: Path, *, binary: Path = Path("readpst"),
+    include_deleted: bool = False,
+) -> Path:
+    """Extract contacts (.vcf) from a PST.
+
+    See ``extract_pst_calendar`` for the directory-isolation rationale.
+    """
+    return _run_readpst(
+        pst_path, work_dir, binary=binary, include_deleted=include_deleted,
+        type_codes="c", subdir_suffix="__contacts",
+    )
+
+
+def _run_readpst(
+    pst_path: Path,
+    work_dir: Path,
+    *,
+    binary: Path,
+    include_deleted: bool,
+    type_codes: str,
+    subdir_suffix: str,
+) -> Path:
+    """Run readpst with a specific ``-t`` selection, return the output dir.
 
     Resume-friendly: if a previous run already extracted this PST successfully
-    (sentinel file present + matching source size), we reuse the existing work
-    dir instead of re-running readpst, which can take hours on multi-GB PSTs.
+    for this type-code set (sentinel file present + matching source size + same
+    type-codes), we reuse the existing work dir instead of re-running readpst,
+    which can take hours on multi-GB PSTs.
 
-    If the work dir exists but the sentinel is missing, we assume the previous
-    extraction was killed mid-flight and start over (wipe + re-extract).
+    If the work dir exists but the sentinel is missing or recorded a different
+    type-code set, we assume the previous extraction was for something else
+    and start over (wipe + re-extract).
     """
     if not pst_path.exists():
         raise ReadpstError(f"PST not found: {pst_path}")
 
-    out_dir = work_dir / _safe_name(pst_path.stem)
+    out_dir = work_dir / (_safe_name(pst_path.stem) + subdir_suffix)
     sentinel = out_dir / ".extract_complete"
     src_size = pst_path.stat().st_size
+    sentinel_payload = f"{src_size}\n{type_codes}\n"
 
     if sentinel.exists():
-        try:
-            recorded_size = int(sentinel.read_text().strip())
-        except (OSError, ValueError):
-            recorded_size = -1
-        if recorded_size == src_size:
+        recorded = sentinel.read_text(errors="replace").strip().splitlines()
+        recorded_size = -1
+        recorded_codes = ""
+        if recorded:
+            try:
+                recorded_size = int(recorded[0])
+            except ValueError:
+                recorded_size = -1
+            recorded_codes = recorded[1] if len(recorded) > 1 else "e"  # legacy mail extractions only had size
+        if recorded_size == src_size and recorded_codes == type_codes:
             n_files, total_bytes = _measure_dir(out_dir)
             logger.bind(ctx="pst").info(
-                "Reusing previous extraction of {}: {} files / {:.2f} GB "
+                "Reusing previous extraction of {} (-t {}): {} files / {:.2f} GB "
                 "(skipping readpst — delete {} to force re-extract)",
-                pst_path.name, n_files, total_bytes / 1024**3, sentinel,
+                pst_path.name, type_codes, n_files, total_bytes / 1024**3, sentinel,
             )
             return out_dir
         logger.bind(ctx="pst").warning(
-            "Sentinel for {} records different source size ({} vs {}); re-extracting",
-            pst_path.name, recorded_size, src_size,
+            "Sentinel for {} records ({} bytes / -t {}); re-extracting for ({} bytes / -t {})",
+            pst_path.name, recorded_size, recorded_codes or "?", src_size, type_codes,
         )
 
     if out_dir.exists():
@@ -104,8 +171,8 @@ def extract_pst(pst_path: Path, work_dir: Path, *, binary: Path = Path("readpst"
 
     args = [
         str(binary),
-        "-e",                  # one .eml per message in folder tree
-        "-t", "e",             # emails only
+        "-e",                  # one file per item, with proper extensions (.eml/.ics/.vcf)
+        "-t", type_codes,
         "-o", str(out_dir),
     ]
     if include_deleted:
@@ -171,9 +238,10 @@ def extract_pst(pst_path: Path, work_dir: Path, *, binary: Path = Path("readpst"
             final_bytes / 1024**3, src_bytes / 1024**3,
         )
 
-    # Sentinel: marks this extraction as complete + records source size so a
-    # later restart can reuse it (and detect if the PST was modified/replaced).
-    sentinel.write_text(str(src_bytes), encoding="utf-8")
+    # Sentinel: marks this extraction as complete and records both source
+    # size and the readpst -t selection, so a later restart can reuse it
+    # only when extracting the same item types from the same PST file.
+    sentinel.write_text(sentinel_payload, encoding="utf-8")
     return out_dir
 
 
@@ -278,6 +346,73 @@ def _build_message(eml: Path, pst_dir: Path) -> ExtractedMessage:
         subject=subject[:500],
         received=received,
         message_id=message_id or None,
+    )
+
+
+def iter_appointments(extracted_root: Path) -> Iterator[ExtractedAppointment]:
+    """Walk the calendar-extracted tree, yield one appointment per .ics file.
+
+    readpst -t a -e lays out:
+        <out_dir>/<pst_stem>/Calendar/12345.ics
+
+    Files that don't parse as iCalendar are logged and skipped rather than
+    aborting the whole run.
+    """
+    if not extracted_root.exists():
+        return
+
+    pst_dirs = [p for p in extracted_root.iterdir() if p.is_dir()]
+    if not pst_dirs:
+        return
+
+    for pst_dir in pst_dirs:
+        for ics in sorted(pst_dir.rglob("*.ics")):
+            try:
+                yield _build_appointment(ics, pst_dir)
+            except Exception as e:
+                logger.bind(ctx="pst").warning("Skipping unreadable {}: {}", ics, e)
+
+
+def _build_appointment(ics: Path, pst_dir: Path) -> ExtractedAppointment:
+    rel = ics.relative_to(pst_dir).parts[:-1]
+    file_size = ics.stat().st_size
+
+    raw = ics.read_bytes()
+    summary = ""
+    uid: str | None = None
+    start: str | None = None
+    # Parse just the lines we need without pulling in icalendar at index time.
+    # The proper iCalendar parse happens at upload time. Here we only need a
+    # stable dedup key and a human-readable summary for logs.
+    for line in raw.splitlines():
+        try:
+            decoded = line.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        # iCalendar folds long lines with leading whitespace; we don't unfold
+        # because the fields we read are short and unfolded in practice for
+        # readpst's output.
+        if not summary and decoded.startswith("SUMMARY:"):
+            summary = decoded[len("SUMMARY:"):].strip()
+        elif not uid and decoded.startswith("UID:"):
+            uid = decoded[len("UID:"):].strip()
+        elif not start and (decoded.startswith("DTSTART:") or decoded.startswith("DTSTART;")):
+            start = decoded.split(":", 1)[1].strip() if ":" in decoded else None
+        if summary and uid and start:
+            break
+
+    dedupe_key = (
+        f"uid:{uid.lower()}" if uid else f"sha256:{hashlib.sha256(raw).hexdigest()}"
+    )
+
+    return ExtractedAppointment(
+        file_path=ics,
+        folder_path=tuple(_clean_folder(p) for p in rel),
+        bytes_=file_size,
+        dedupe_key=dedupe_key,
+        summary=(summary or "(no subject)")[:500],
+        uid=uid,
+        start=start,
     )
 
 

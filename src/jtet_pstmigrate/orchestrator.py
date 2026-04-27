@@ -33,13 +33,20 @@ from rich.progress import (
 from rich.table import Table
 
 from jtet_pstmigrate.auth import AppPool
+from jtet_pstmigrate.calendar_uploader import (
+    CalendarUploader,
+    CalendarUploadError,
+)
 from jtet_pstmigrate.config import AppConfig, MappingRow
 from jtet_pstmigrate.folder_manager import FolderManager
 from jtet_pstmigrate.graph_client import GraphClient, GraphError
 from jtet_pstmigrate.pst_reader import (
+    ExtractedAppointment,
     ExtractedMessage,
     ReadpstError,
     extract_pst,
+    extract_pst_calendar,
+    iter_appointments,
     iter_messages,
 )
 from jtet_pstmigrate.state import StateStore
@@ -274,8 +281,206 @@ class Orchestrator:
             transient=False,
         )
 
-    def _render_summary(self, reports: Iterable[RunReport], graph: GraphClient) -> None:
-        table = Table(title=f"Migration Summary  ({datetime.now().isoformat(timespec='seconds')})")
+    # ------------------------------------------------------------------
+    # Calendar import
+    # ------------------------------------------------------------------
+    #
+    # The calendar path mirrors the mail path but with three differences:
+    #   - readpst is run with -t a (appointments) into a separate work dir
+    #   - items are deduped via the ``non_mail_items`` table, not ``messages``
+    #   - they're POSTed as Graph events to the user's default calendar,
+    #     not as messages into a folder hierarchy
+    #
+    # Folder routing (Inbox/Sent/etc.) doesn't apply: a mailbox has exactly
+    # one default calendar, and we don't recreate sub-calendar structure
+    # in v1. Sub-folders inside the PST's Calendar tree (custom calendars
+    # the user kept) are flattened into the default calendar; the original
+    # source folder is recoverable from ``non_mail_items.source_path`` if
+    # we ever need to revisit that.
+
+    def run_calendar(self, mapping: list[MappingRow]) -> list[RunReport]:
+        if not mapping:
+            return []
+
+        graph = GraphClient(self._pool, self._cfg.throttle)
+        reports: list[RunReport] = []
+
+        with graph, ThreadPoolExecutor(
+            max_workers=self._cfg.migration.max_parallel_mailboxes,
+            thread_name_prefix="pst-cal",
+        ) as pool:
+            futures: dict[Future, MappingRow] = {
+                pool.submit(self._run_calendar_one, graph, row): row for row in mapping
+            }
+
+            with self._make_progress() as progress:
+                task = progress.add_task("PST calendar jobs", total=len(futures))
+                for fut in as_completed(futures):
+                    row = futures[fut]
+                    try:
+                        rep = fut.result()
+                    except Exception as e:
+                        logger.bind(ctx=f"{row.target_mailbox}").exception("Calendar worker crashed")
+                        rep = RunReport(
+                            pst_path=row.pst_path,
+                            mailbox=row.target_mailbox,
+                            status="failed",
+                            last_error=str(e),
+                        )
+                    reports.append(rep)
+                    progress.advance(task)
+
+        self._render_summary(reports, graph, title_suffix=" (calendar)")
+        return reports
+
+    def _run_calendar_one(self, graph: GraphClient, row: MappingRow) -> RunReport:
+        log = logger.bind(ctx=f"caljob[{row.target_mailbox}|{row.pst_path.name}]")
+        report = RunReport(pst_path=row.pst_path, mailbox=row.target_mailbox)
+        started = time.time()
+
+        try:
+            extracted_dir = extract_pst_calendar(
+                row.pst_path,
+                self._cfg.paths.work_dir,
+                binary=self._cfg.paths.readpst_binary,
+            )
+        except ReadpstError as e:
+            log.error("Calendar extraction failed: {}", e)
+            report.status = "failed"
+            report.last_error = str(e)
+            report.elapsed_seconds = time.time() - started
+            return report
+
+        appointments = list(iter_appointments(extracted_dir))
+        report.items_total = len(appointments)
+        log.info("{} appointments to consider", len(appointments))
+
+        if not appointments:
+            report.status = "done"
+            report.elapsed_seconds = time.time() - started
+            return report
+
+        uploader = CalendarUploader(graph, row.target_mailbox)
+
+        with ThreadPoolExecutor(
+            max_workers=self._cfg.migration.workers_per_mailbox,
+            thread_name_prefix=f"cal-{row.target_mailbox.split('@')[0][:6]}",
+        ) as up_pool:
+            futures = {
+                up_pool.submit(self._upload_appointment, appt, row, uploader): appt
+                for appt in appointments
+            }
+            for fut in as_completed(futures):
+                outcome = fut.result()
+                if outcome == "uploaded":
+                    report.items_uploaded += 1
+                elif outcome == "skipped":
+                    report.items_skipped += 1
+                else:
+                    report.items_failed += 1
+
+        if report.items_failed and self._cfg.migration.fail_fast:
+            report.status = "failed"
+            report.last_error = f"{report.items_failed} item failures"
+        else:
+            report.status = "done"
+        report.elapsed_seconds = time.time() - started
+        return report
+
+    def _upload_appointment(
+        self,
+        appt: ExtractedAppointment,
+        row: MappingRow,
+        uploader: CalendarUploader,
+    ) -> str:
+        pst_str = str(row.pst_path)
+        src = str(appt.file_path)
+        # Same dedup discipline as messages: per-row done check first (don't
+        # downgrade an existing 'done' to 'skipped'), then per-mailbox UID
+        # check (handles the same UID showing up under two folders inside
+        # the same PST or across PSTs assigned to one mailbox).
+        if self._state.is_item_row_done(row.target_mailbox, pst_str, src, "event"):
+            return "skipped"
+        if self._state.is_item_done(row.target_mailbox, "event", appt.dedupe_key):
+            self._state.upsert_item(
+                mailbox=row.target_mailbox,
+                pst_path=pst_str,
+                source_path=src,
+                item_type="event",
+                dedupe_key=appt.dedupe_key,
+                status="skipped",
+                bytes_=appt.bytes_,
+            )
+            return "skipped"
+
+        chosen_app = self._pool.pick()
+        try:
+            result = uploader.upload(appt, app_id=chosen_app)
+            self._state.upsert_item(
+                mailbox=row.target_mailbox,
+                pst_path=pst_str,
+                source_path=src,
+                item_type="event",
+                dedupe_key=appt.dedupe_key,
+                graph_id=result.graph_event_id,
+                app_id=chosen_app,
+                status="done",
+                bytes_=result.bytes_uploaded,
+            )
+            return "uploaded"
+        except CalendarUploadError as e:
+            # Unparseable .ics or no VEVENT -- terminal, mark skipped so we
+            # don't keep retrying it on the next run.
+            self._state.upsert_item(
+                mailbox=row.target_mailbox,
+                pst_path=pst_str,
+                source_path=src,
+                item_type="event",
+                dedupe_key=appt.dedupe_key,
+                app_id=chosen_app,
+                status="skipped",
+                bytes_=appt.bytes_,
+                last_error=str(e)[:300],
+            )
+            return "skipped"
+        except GraphError as e:
+            body_str = str(e.body) if e.body is not None else ""
+            self._state.upsert_item(
+                mailbox=row.target_mailbox,
+                pst_path=pst_str,
+                source_path=src,
+                item_type="event",
+                dedupe_key=appt.dedupe_key,
+                app_id=chosen_app,
+                status="failed",
+                bytes_=appt.bytes_,
+                last_error=f"graph {e.status}: {body_str[:300]}",
+            )
+            return "failed"
+        except Exception as e:
+            self._state.upsert_item(
+                mailbox=row.target_mailbox,
+                pst_path=pst_str,
+                source_path=src,
+                item_type="event",
+                dedupe_key=appt.dedupe_key,
+                app_id=chosen_app,
+                status="failed",
+                bytes_=appt.bytes_,
+                last_error=f"{type(e).__name__}: {str(e)[:300]}",
+            )
+            return "failed"
+
+    def _render_summary(
+        self,
+        reports: Iterable[RunReport],
+        graph: GraphClient,
+        *,
+        title_suffix: str = "",
+    ) -> None:
+        table = Table(
+            title=f"Migration Summary{title_suffix}  ({datetime.now().isoformat(timespec='seconds')})"
+        )
         table.add_column("Mailbox", overflow="fold")
         table.add_column("PST", overflow="fold")
         table.add_column("Total", justify="right")

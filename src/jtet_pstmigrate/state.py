@@ -67,6 +67,29 @@ CREATE INDEX IF NOT EXISTS idx_messages_status
     ON messages(target_mailbox, status);
 CREATE INDEX IF NOT EXISTS idx_messages_app
     ON messages(app_id);
+
+-- Non-mail PST items: appointments/events, contacts, tasks, notes, journal.
+-- Kept in a dedicated table so the mail dedup keys (RFC822 Message-ID) and
+-- the calendar/contact dedup keys (UID, vCard FN+EMAIL) cannot collide.
+CREATE TABLE IF NOT EXISTS non_mail_items (
+    target_mailbox    TEXT NOT NULL,
+    pst_path          TEXT NOT NULL,
+    source_path       TEXT NOT NULL,
+    item_type         TEXT NOT NULL,        -- 'event'|'contact'|'task'|'note'
+    dedupe_key        TEXT NOT NULL,
+    graph_id          TEXT,                 -- /events/{id}, /contacts/{id}, ...
+    app_id            TEXT,
+    status            TEXT NOT NULL,        -- queued|done|failed|skipped
+    bytes             INTEGER DEFAULT 0,
+    last_error        TEXT,
+    updated_at        REAL,
+    PRIMARY KEY (target_mailbox, pst_path, source_path, item_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_non_mail_items_dedupe
+    ON non_mail_items(target_mailbox, item_type, dedupe_key);
+CREATE INDEX IF NOT EXISTS idx_non_mail_items_status
+    ON non_mail_items(target_mailbox, item_type, status);
 """
 
 # Forward-compatible additions for existing DBs created by an older version.
@@ -290,3 +313,85 @@ class StateStore:
     def all_runs(self) -> list[sqlite3.Row]:
         with self._connect() as conn:
             return list(conn.execute("SELECT * FROM pst_runs ORDER BY started_at"))
+
+    # Non-mail item lifecycle (calendar/contacts/tasks/notes) -----------
+
+    def is_item_done(self, mailbox: str, item_type: str, dedupe_key: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM non_mail_items "
+                "WHERE target_mailbox=? AND item_type=? AND dedupe_key=? AND status='done' "
+                "LIMIT 1",
+                (mailbox, item_type, dedupe_key),
+            ).fetchone()
+            return row is not None
+
+    def is_item_row_done(
+        self, mailbox: str, pst_path: str, source_path: str, item_type: str
+    ) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM non_mail_items "
+                "WHERE target_mailbox=? AND pst_path=? AND source_path=? "
+                "AND item_type=? AND status='done' LIMIT 1",
+                (mailbox, pst_path, source_path, item_type),
+            ).fetchone()
+            return row is not None
+
+    def upsert_item(
+        self,
+        *,
+        mailbox: str,
+        pst_path: str,
+        source_path: str,
+        item_type: str,
+        dedupe_key: str,
+        status: str,
+        graph_id: str | None = None,
+        app_id: str | None = None,
+        bytes_: int = 0,
+        last_error: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO non_mail_items(
+                    target_mailbox, pst_path, source_path, item_type, dedupe_key,
+                    graph_id, app_id, status, bytes, last_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(target_mailbox, pst_path, source_path, item_type) DO UPDATE SET
+                    dedupe_key  = excluded.dedupe_key,
+                    graph_id    = excluded.graph_id,
+                    app_id      = excluded.app_id,
+                    status      = excluded.status,
+                    bytes       = excluded.bytes,
+                    last_error  = excluded.last_error,
+                    updated_at  = excluded.updated_at
+                """,
+                (
+                    mailbox, pst_path, source_path, item_type, dedupe_key,
+                    graph_id, app_id, status, bytes_, last_error,
+                    time.time(),
+                ),
+            )
+
+    def counts_for_items(
+        self, mailbox: str, pst_path: str, item_type: str
+    ) -> dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS c
+                FROM non_mail_items
+                WHERE target_mailbox=? AND pst_path=? AND item_type=?
+                GROUP BY status
+                """,
+                (mailbox, pst_path, item_type),
+            ).fetchall()
+            out = {r["status"]: r["c"] for r in rows}
+            return {
+                "queued":  out.get("queued", 0),
+                "done":    out.get("done", 0),
+                "failed":  out.get("failed", 0),
+                "skipped": out.get("skipped", 0),
+            }
