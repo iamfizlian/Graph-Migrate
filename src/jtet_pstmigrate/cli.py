@@ -753,6 +753,132 @@ def run_purge_contacts(
     raise typer.Exit(1 if errors else 0)
 
 
+@app.command("purge-mail")
+def run_purge_mail(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Delete previously-imported mail messages and clear their state.
+
+    Targets only messages this tool actually uploaded (rows in the
+    ``messages`` table with ``status='done'`` and a recorded
+    ``graph_message_id``). Pre-existing mail in the destination mailbox is
+    not touched.
+
+    Two-phase delete:
+
+      1. ``DELETE /users/{upn}/messages/{graph_message_id}`` for every
+         recorded message. Graph soft-deletes by moving the message into
+         the user's Deleted Items folder.
+      2. Page through Deleted Items and ``DELETE`` every entry whose
+         ``internetMessageId`` matches the set we soft-deleted in
+         phase 1. A second DELETE on a Deleted-Items message moves it
+         to Recoverable Items (the hidden 14-day retention area), which
+         is what users mean by "permanent" -- it disappears from every
+         visible folder. Targeting by ``internetMessageId`` keeps the
+         user's pre-existing deleted items in place.
+
+    Why two phases instead of Graph's ``permanentDelete`` action? The
+    latter is /beta only, and we keep every other request on /v1.0.
+
+    Required Graph permission: ``Mail.ReadWrite`` (Application) on every
+    app in the pool -- which the import phase already needs, so this
+    command works without any new admin grants.
+
+    Use this when you need to re-run mail import cleanly after fixing
+    a bug, or to clean up a destination mailbox before re-importing
+    against a fresh state DB. Calendar and contact state are untouched.
+
+    Bulk usage (everyone except the two pilot mailboxes you finished):
+
+      pstmigrate purge-mail -c c.toml -m m.csv \
+          -X tinad@x -X allysonp@x -y
+    """
+    cfg = _load(config)
+    run_id = f"purge-mail_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=None,
+    )
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+    pool = AppPool(cfg.apps)
+
+    # Pre-flight: count what we're about to wipe per (mailbox, PST).
+    total = 0
+    for row in rows:
+        n = state.count_done_messages(row.target_mailbox, str(row.pst_path))
+        if n:
+            console.print(
+                f"  {row.target_mailbox} | {row.pst_path.name}: "
+                f"[yellow]{n}[/] message(s) to purge"
+            )
+            total += n
+
+    if total == 0:
+        console.print(
+            "[green]Nothing to purge.[/] No 'done' message rows for the "
+            "selected scope."
+        )
+        raise typer.Exit(0)
+
+    console.print(
+        f"\n[bold red]About to DELETE {total} message(s) from Graph[/] "
+        f"and remove their state rows.\n"
+        f"Two passes: phase 1 soft-deletes (move to Deleted Items), "
+        f"phase 2 permanently deletes (Recoverable Items, 14-day "
+        f"hidden retention).\n"
+        f"This is irreversible from the user's perspective -- after "
+        f"phase 2, ``import`` / ``import-all`` will re-upload every "
+        f"message from the PST extract.\n"
+        f"  app pool = {len(pool)} ({', '.join(pool.names)})\n"
+        f"  workers/mailbox = {cfg.migration.workers_per_mailbox}\n"
+        f"  parallel mailboxes = {cfg.migration.max_parallel_mailboxes}\n"
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    from jtet_pstmigrate.orchestrator import Orchestrator
+    orch = Orchestrator(cfg, state, pool)
+    deleted, missing, errors = orch.purge_mail(rows)
+
+    console.print(
+        f"\n[bold]Mail purge complete:[/] "
+        f"deleted=[green]{deleted}[/]  "
+        f"already-gone=[yellow]{missing}[/]  "
+        f"errors=[red]{errors}[/]"
+    )
+    if errors:
+        console.print(
+            "[yellow]Note:[/] errors include phase-2 failures, where a "
+            "soft-deleted message could not be permanently removed from "
+            "Deleted Items. Those messages are still in the destination "
+            "mailbox's Deleted Items folder and you can drain them via "
+            "OWA (right-click Deleted Items -> Empty folder) on the "
+            "affected accounts."
+        )
+    raise typer.Exit(1 if errors else 0)
+
+
 @app.command("import-all")
 def run_import_all(
     config: ConfigOpt = None,

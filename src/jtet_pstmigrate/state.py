@@ -277,6 +277,53 @@ class StateStore:
                 ),
             )
 
+    def list_done_messages(
+        self, mailbox: str, pst_path: str
+    ) -> list[sqlite3.Row]:
+        """Mail messages uploaded successfully, with the Graph id needed for deletion.
+
+        Returned columns: ``source_path``, ``dedupe_key``, ``graph_message_id``,
+        ``app_id``. Rows where ``graph_message_id`` is NULL are excluded --
+        without it we cannot DELETE the message from Graph, so there's no
+        purge work for that row anyway.
+        """
+        with self._connect() as conn:
+            return list(conn.execute(
+                """
+                SELECT source_path, dedupe_key, graph_message_id, app_id
+                FROM messages
+                WHERE target_mailbox=? AND pst_path=?
+                  AND status='done' AND graph_message_id IS NOT NULL
+                """,
+                (mailbox, pst_path),
+            ))
+
+    def count_done_messages(self, mailbox: str, pst_path: str) -> int:
+        """Pre-flight count for ``purge-mail`` confirmation prompt."""
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM messages "
+                "WHERE target_mailbox=? AND pst_path=? "
+                "AND status='done' AND graph_message_id IS NOT NULL",
+                (mailbox, pst_path),
+            ).fetchone()[0]
+
+    def delete_message_row(
+        self, mailbox: str, pst_path: str, source_path: str
+    ) -> None:
+        """Remove a single message row (used after a successful purge).
+
+        We delete rather than mark 'purged' so a follow-up ``import`` re-uploads
+        the message cleanly -- otherwise ``is_message_done`` would short-circuit
+        the dedup check and the message would be skipped on re-run.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM messages "
+                "WHERE target_mailbox=? AND pst_path=? AND source_path=?",
+                (mailbox, pst_path, source_path),
+            )
+
     def app_breakdown(self) -> dict[str, dict[str, int]]:
         """Return {app_id: {status: count}} across all messages."""
         out: dict[str, dict[str, int]] = {}
