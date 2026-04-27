@@ -8,8 +8,19 @@ version = "0.1.0"
 description = "PST -> Microsoft 365 mailbox migration via Graph API"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Proprietary" }
+license = { text = "Apache-2.0" }
+license-files = ["LICENSE"]
 authors = [{ name = "JTET" }]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Email",
+    "Topic :: System :: Archiving",
+]
 dependencies = [
     "msal>=1.28",
     "httpx>=0.27",

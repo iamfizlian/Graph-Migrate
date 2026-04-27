@@ -1214,6 +1214,37 @@ function Fix-Mailbox {
 }
 
 # ---------------------------------------------------------------------------
+# Live status file (set by Run-FullCleanup.ps1 via env)
+# ---------------------------------------------------------------------------
+
+function Write-JtetLiveStatusOutlook {
+    param(
+        [int]$MbIdx,
+        [int]$MbTotal,
+        [string]$Upn,
+        [int]$CumFixedBefore,
+        [string]$Note
+    )
+    $path = $env:JTET_LIVE_STATUS_FILE
+    if (-not $path) { return }
+    $pl = $env:JTET_LIVE_PIPELINE_LABEL
+    if (-not $pl) { $pl = 'Outlook (draft fix)' }
+    $u = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ssZ')
+    $lines = @(
+        "pipeline_step: $pl",
+        "run_step: clear MSGFLAG_UNSENT (Outlook / MAPI)",
+        "mailbox_index: $MbIdx of $MbTotal",
+        "current_mailbox: $Upn",
+        "cumulative_fixed_before_this_mailbox: $CumFixedBefore",
+        "note: $Note",
+        "updated_utc: $u"
+    )
+    try {
+        Set-Content -LiteralPath $path -Value ($lines -join "`n") -Encoding utf8
+    } catch { }
+}
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1332,6 +1363,8 @@ function Main {
     $mbIdx   = 0
     foreach ($upn in $script:Mailbox) {
         $mbIdx++
+        Write-JtetLiveStatusOutlook -MbIdx $mbIdx -MbTotal $mbTotal -Upn $upn `
+            -CumFixedBefore $sessionFixed -Note 'Processing this mailbox now (folders may take a long time).'
         Write-Host ("---------- MAILBOX {0,3} / {1}  START: {2}  (cumulative Fixed before this box: {3})" -f $mbIdx, $mbTotal, $upn, $sessionFixed) -ForegroundColor Yellow
         $r = Fix-Mailbox -Namespace $ns -Upn $upn -IsDryRun:$DryRun.IsPresent `
             -FolderFilter $Folder -RdoSession $rdo `
@@ -1343,6 +1376,15 @@ function Main {
         Write-Host ("---------- MAILBOX {0,3} / {1}  END:   {2}  |  this box: Fixed={3} Drafts={4} Stuck={5} Failed={6}  |  run cumulative Fixed: {7}  |  {8} of {1} mailboxes done" -f `
             $mbIdx, $mbTotal, $upn, $r.Fixed, $r.Drafts, $r.Stuck, $r.Failed, $sessionFixed, $mbIdx) -ForegroundColor Yellow
         Write-Host ""
+    }
+
+    if ($env:JTET_LIVE_STATUS_FILE) {
+        $u = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ssZ')
+        @(
+            "pipeline_step: $($env:JTET_LIVE_PIPELINE_LABEL) (Outlook pass complete for all mailboxes in this invocation)",
+            "run_step: clear MSGFLAG_UNSENT — finished",
+            "updated_utc: $u"
+        ) | Set-Content -LiteralPath $env:JTET_LIVE_STATUS_FILE -Encoding utf8
     }
 
     Write-Host ""

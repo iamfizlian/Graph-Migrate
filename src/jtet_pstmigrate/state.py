@@ -28,7 +28,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS pst_runs (
     pst_path        TEXT NOT NULL,
     target_mailbox  TEXT NOT NULL,
-    status          TEXT NOT NULL,        -- pending|extracting|uploading|done|failed
+    status          TEXT NOT NULL,        -- pending|extracting|uploading|done|failed|cancelled
     started_at      REAL,
     finished_at     REAL,
     items_total     INTEGER DEFAULT 0,
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS messages (
     graph_message_id   TEXT,
     graph_folder_id    TEXT,
     app_id             TEXT,                 -- which app pool member did the upload
-    status             TEXT NOT NULL,        -- queued|done|failed|skipped
+    status             TEXT NOT NULL,        -- queued|done|failed|skipped|cancelled
     bytes              INTEGER DEFAULT 0,
     last_error         TEXT,
     updated_at         REAL,
@@ -290,3 +290,71 @@ class StateStore:
     def all_runs(self) -> list[sqlite3.Row]:
         with self._connect() as conn:
             return list(conn.execute("SELECT * FROM pst_runs ORDER BY started_at"))
+
+    def list_messages(
+        self,
+        *,
+        mailbox: str | None = None,
+        pst_path: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[sqlite3.Row]:
+        """Page through the messages table with optional filters.
+
+        Ordered by updated_at DESC so the most recently-touched rows come
+        first — that's what a "show me failures from this run" page wants.
+        Pass status='failed' to drive the inspect-failures view, or omit
+        all filters to scan the whole audit log.
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if mailbox is not None:
+            clauses.append("target_mailbox = ?")
+            params.append(mailbox)
+        if pst_path is not None:
+            clauses.append("pst_path = ?")
+            params.append(pst_path)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        # Clamp limit to a sane ceiling; offset is bounded by the caller.
+        limit = max(1, min(int(limit), 1000))
+        offset = max(0, int(offset))
+        params.extend([limit, offset])
+        with self._connect() as conn:
+            return list(
+                conn.execute(
+                    f"SELECT * FROM messages {where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    params,
+                )
+            )
+
+    def count_messages(
+        self,
+        *,
+        mailbox: str | None = None,
+        pst_path: str | None = None,
+        status: str | None = None,
+    ) -> int:
+        """Total rows matching the same filter shape as `list_messages`.
+
+        Separate from `list_messages` so the API can return pagination
+        metadata (total / limit / offset) without re-scanning the page.
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if mailbox is not None:
+            clauses.append("target_mailbox = ?")
+            params.append(mailbox)
+        if pst_path is not None:
+            clauses.append("pst_path = ?")
+            params.append(pst_path)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            row = conn.execute(f"SELECT COUNT(*) AS c FROM messages {where}", params).fetchone()
+            return int(row["c"]) if row else 0

@@ -257,7 +257,12 @@ $RunStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $RunDir   = Join-Path $LogDir $RunStamp
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 
-$SummaryPath = Join-Path $RunDir 'summary.txt'
+$SummaryPath     = Join-Path $RunDir 'summary.txt'
+$LiveStatusFile  = Join-Path $RunDir 'LIVE-STATUS.txt'
+# Child processes (_flatten, _consolidate) read this path from the environment
+# and rewrite the file on every milestone so the operator can open one file
+# for *current* state mid-run.
+$env:JTET_LIVE_STATUS_FILE = $LiveStatusFile
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -395,6 +400,12 @@ Add-Summary ('{0,-32} {1,-12} {2,8} {3}' -f ('-' * 32), ('-' * 12), ('-' * 8), (
 
 $results = @()
 
+Write-Host ''
+Write-Host "LIVE STATUS FILE (open in Notepad; refreshes as the run works):" -ForegroundColor Green
+Write-Host "  $LiveStatusFile" -ForegroundColor Green
+Write-Host "  It shows which pipeline step (1–3), and mailbox counts within the current step." -ForegroundColor DarkGray
+Write-Host ''
+
 # --- Step 1: Flatten -------------------------------------------------------
 
 if (-not $SkipFlatten) {
@@ -407,6 +418,7 @@ if (-not $SkipFlatten) {
         -Name    'Step 1: Flatten Imported PST' `
         -LogFile 'step1-flatten.log' `
         -Action  {
+            $env:JTET_LIVE_STATUS_FILE = $using:LiveStatusFile
             $pyArgs = @('_flatten_imported.py', '-c', $ConfigPath) + $selection.PythonArgs
             if ($DryRun) { $pyArgs += '--dry-run' }
             & $PythonExe @pyArgs
@@ -423,6 +435,7 @@ if (-not $SkipConsolidate) {
         -Name    'Step 2: Consolidate Sent Items' `
         -LogFile 'step2-consolidate.log' `
         -Action  {
+            $env:JTET_LIVE_STATUS_FILE = $using:LiveStatusFile
             $pyArgs = @('_consolidate_sent.py', '-c', $ConfigPath) + $selection.PythonArgs
             if ($DryRun) { $pyArgs += '--dry-run' }
             & $PythonExe @pyArgs
@@ -436,9 +449,12 @@ if (-not $SkipDrafts) {
         -Name    'Step 3: Clear MSGFLAG_UNSENT' `
         -LogFile 'step3-drafts.log' `
         -Action  {
+            $env:JTET_LIVE_STATUS_FILE = $using:LiveStatusFile
+            $pCount = $using:plan.Count
+            $env:JTET_LIVE_PIPELINE_LABEL = "$pCount of $pCount (Outlook — last step in this plan)"
             Write-Host ""
             Write-Host ("========== RUN-FULL-CLEANUP: pipeline step {0} of {0} (Outlook / MAPI — usually the slowest) ==========" -f $plan.Count) -ForegroundColor Cyan
-            Write-Host "Mailboxes: $($SelectedMailboxes.Count) (numbered list in Selection above).`n" -ForegroundColor Cyan
+            Write-Host "LIVE-STATUS: $using:LiveStatusFile (updated per mailbox in this step)`n" -ForegroundColor Cyan
             $childScript = Join-Path $ScriptRoot 'Fix-DraftsViaOutlook.ps1'
             $params = @{} + $selection.PSArgs
             if ($DryRun) { $params['DryRun'] = $true }
@@ -477,4 +493,6 @@ if ($failed) {
 
 Write-Host ''
 Write-Host 'All steps completed successfully.' -ForegroundColor Green
+Add-Summary ''
+Add-Summary ("Run complete. Live status was: $LiveStatusFile")
 exit 0

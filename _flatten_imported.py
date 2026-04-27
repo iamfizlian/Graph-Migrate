@@ -38,9 +38,11 @@ Run from Graph-Migrate/:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
@@ -892,6 +894,22 @@ def flatten_mailbox(
 # ----------------------------------------------------------------------- driver
 
 
+def _write_jtet_live_status(**fields: str) -> None:
+    """If JTET_LIVE_STATUS_FILE is set (by Run-FullCleanup.ps1), refresh one file
+    the operator can open anytime for *current* position (not only at step end)."""
+    path = os.environ.get("JTET_LIVE_STATUS_FILE")
+    if not path:
+        return
+    lines = [f"{k}: {v}" for k, v in fields.items()]
+    lines.append(
+        f"updated_utc: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}"
+    )
+    try:
+        Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Merge 'Imported PST' folders into mailbox root.")
     ap.add_argument("-c", "--config", required=True, help="config.toml path")
@@ -953,6 +971,14 @@ def main() -> int:
         n_mb,
     )
 
+    _write_jtet_live_status(
+        pipeline_step="1 of 3",
+        run_step="flatten (Graph / Imported PST)",
+        mailboxes_total=str(n_mb),
+        mailboxes_finished_in_this_step=f"0/{n_mb}",
+        what_this_means="This line updates every time one mailbox *fully* finishes flatten. If two are still merging, the count rises slowly.",
+    )
+
     all_stats: list[dict] = []
     with GraphClient(pool, cfg.throttle) as graph:
         with ThreadPoolExecutor(max_workers=parallelism, thread_name_prefix="flatten") as ex:
@@ -973,6 +999,15 @@ def main() -> int:
                         "PROGRESS: {}/{} mailboxes complete (finished: {}, ok).",
                         done, n_mb, m,
                     )
+                    _write_jtet_live_status(
+                        pipeline_step="1 of 3",
+                        run_step="flatten (Graph / Imported PST)",
+                        mailboxes_total=str(n_mb),
+                        mailboxes_finished_in_this_step=f"{done}/{n_mb}",
+                        last_mailbox_just_completed=m,
+                        not_finished_yet_in_this_step=str(n_mb - done),
+                        what_this_means="Open this file anytime. When the fraction equals N/N, all mailboxes are done with Step 1 (flatten) only.",
+                    )
                 except Exception as e:
                     logger.bind(ctx=f"flatten[{m}]").exception("Crashed: {}", e)
                     all_stats.append({"mailbox": m, "error": str(e)})
@@ -981,6 +1016,20 @@ def main() -> int:
                         "PROGRESS: {}/{} mailboxes complete (finished: {}, ERROR — see traceback above).",
                         done, n_mb, m,
                     )
+                    _write_jtet_live_status(
+                        pipeline_step="1 of 3",
+                        run_step="flatten (Graph / Imported PST)",
+                        mailboxes_total=str(n_mb),
+                        mailboxes_finished_in_this_step=f"{done}/{n_mb}",
+                        last_mailbox_just_completed=m,
+                        last_result="ERROR (see step1-flatten.log)",
+                    )
+
+    _write_jtet_live_status(
+        pipeline_step="1 of 3 (complete)",
+        run_step="flatten",
+        status="Step 1 finished for this process — Run-FullCleanup will continue to step 2 if enabled.",
+    )
 
     # Summary
     print()

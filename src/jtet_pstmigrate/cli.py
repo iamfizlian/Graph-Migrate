@@ -13,10 +13,8 @@ from rich.table import Table
 
 from jtet_pstmigrate.auth import AppPool
 from jtet_pstmigrate.config import AppConfig, MappingRow, expand_user_paths
-from jtet_pstmigrate.graph_client import GraphClient
 from jtet_pstmigrate.log import configure_logging
-from jtet_pstmigrate.orchestrator import Orchestrator, load_mapping
-from jtet_pstmigrate.pst_reader import check_readpst
+from jtet_pstmigrate.orchestrator import Orchestrator, load_mapping, preflight
 from jtet_pstmigrate.state import StateStore
 
 app = typer.Typer(
@@ -221,14 +219,8 @@ def validate(
     table.add_column("Check")
     table.add_column("Result")
 
-    # readpst
-    try:
-        ver = check_readpst(cfg.paths.readpst_binary)
-        table.add_row("readpst available", f"[green]OK[/] {ver}")
-    except Exception as e:
-        table.add_row("readpst available", f"[red]FAIL[/] {e}")
-
-    # mapping CSV
+    # Mapping CSV is loaded by the CLI (not preflight) so we can apply the
+    # selection filters and surface a CSV parse error in the same table.
     rows: list[MappingRow] = []
     try:
         all_rows = load_mapping(mapping)
@@ -237,60 +229,13 @@ def validate(
         table.add_row("mapping CSV parses", f"[green]OK[/] {len(rows)} rows{suffix}")
     except Exception as e:
         table.add_row("mapping CSV parses", f"[red]FAIL[/] {e}")
+        console.print(table)
+        return
 
-    # PST files exist
-    missing = [r.pst_path for r in rows if not r.pst_path.exists()]
-    if missing:
-        table.add_row("PST files exist", f"[red]FAIL[/] missing: {', '.join(str(p) for p in missing[:5])}")
-    elif rows:
-        total_gb = sum(r.pst_path.stat().st_size for r in rows) / 1024**3
-        table.add_row("PST files exist", f"[green]OK[/] {len(rows)} files, {total_gb:0.2f} GB total")
-
-    # Graph token + mailbox resolution — verify each app independently
-    try:
-        pool = AppPool(cfg.apps)
-        per_app_ok: list[str] = []
-        per_app_fail: list[str] = []
-        with GraphClient(pool, cfg.throttle) as graph:
-            for name in pool.names:
-                try:
-                    graph.get("/me/$metadata" if False else "/$metadata", expect_status=(200,), app_id=name)
-                    per_app_ok.append(name)
-                except Exception as e:
-                    per_app_fail.append(f"{name}: {e}")
-        if per_app_fail:
-            table.add_row("Graph token (per app)", f"[red]FAIL[/] {'; '.join(per_app_fail[:3])}")
-        else:
-            table.add_row("Graph token (per app)", f"[green]OK[/] {len(per_app_ok)} app(s): {', '.join(per_app_ok)}")
-
-        # Try opening each unique mailbox using the first app.
-        # We deliberately use a Mail.Read*-only endpoint here. /users/{upn}
-        # would also work but requires User.Read.All, which we don't grant.
-        # /users/{upn}/mailFolders/inbox needs only Mail.ReadWrite (Application)
-        # AND surfaces the same failure modes we care about: the user doesn't
-        # exist, the mailbox isn't provisioned, or the app's
-        # ApplicationAccessPolicy doesn't include this mailbox.
-        unique = sorted({r.target_mailbox for r in rows})
-        unresolved: list[str] = []
-        with GraphClient(pool, cfg.throttle) as graph:
-            for upn in unique:
-                try:
-                    graph.get(
-                        f"/users/{upn}/mailFolders/inbox",
-                        params={"$select": "id,displayName"},
-                        app_id=pool.names[0],
-                    )
-                except Exception as e:
-                    unresolved.append(f"{upn} ({e})")
-        if unresolved:
-            table.add_row(
-                "Mailboxes accessible",
-                f"[red]FAIL[/] {len(unresolved)}/{len(unique)}: {unresolved[0]}",
-            )
-        elif unique:
-            table.add_row("Mailboxes accessible", f"[green]OK[/] {len(unique)} mailboxes")
-    except Exception as e:
-        table.add_row("Graph token + connectivity", f"[red]FAIL[/] {e}")
+    report = preflight(cfg, rows)
+    for check in report.checks:
+        marker = "[green]OK[/]" if check.ok else "[red]FAIL[/]"
+        table.add_row(check.name, f"{marker} {check.detail}")
 
     console.print(table)
 

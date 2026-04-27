@@ -36,8 +36,10 @@ Run from Graph-Migrate/:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -343,6 +345,20 @@ def consolidate_mailbox(graph: GraphClient, mailbox: str, *, dry_run: bool) -> d
     return stats
 
 
+def _write_jtet_live_status(**fields: str) -> None:
+    path = os.environ.get("JTET_LIVE_STATUS_FILE")
+    if not path:
+        return
+    lines = [f"{k}: {v}" for k, v in fields.items()]
+    lines.append(
+        f"updated_utc: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}"
+    )
+    try:
+        Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Move misplaced 'Sent'-named folders into the actual Sent Items.",
@@ -381,6 +397,13 @@ def main() -> int:
         n_mb,
     )
 
+    _write_jtet_live_status(
+        pipeline_step="2 of 3",
+        run_step="consolidate Sent Items (Graph)",
+        mailboxes_total=str(n_mb),
+        mailboxes_finished_in_this_step=f"0/{n_mb}",
+    )
+
     results: list[dict] = []
     with GraphClient(pool, cfg.throttle) as graph:
         with ThreadPoolExecutor(max_workers=parallelism, thread_name_prefix="sent") as ex:
@@ -398,6 +421,14 @@ def main() -> int:
                         "PROGRESS: {}/{} mailboxes complete (finished: {}, ok).",
                         done, n_mb, m,
                     )
+                    _write_jtet_live_status(
+                        pipeline_step="2 of 3",
+                        run_step="consolidate Sent Items (Graph)",
+                        mailboxes_total=str(n_mb),
+                        mailboxes_finished_in_this_step=f"{done}/{n_mb}",
+                        last_mailbox_just_completed=m,
+                        not_finished_yet_in_this_step=str(n_mb - done),
+                    )
                 except GraphError as e:
                     logger.bind(ctx=f"sent[{m}]").error("Graph error: {}", e)
                     results.append({"mailbox": m, "error": str(e)})
@@ -405,6 +436,13 @@ def main() -> int:
                     logger.bind(ctx="sent").warning(
                         "PROGRESS: {}/{} mailboxes complete (finished: {}, Graph error).",
                         done, n_mb, m,
+                    )
+                    _write_jtet_live_status(
+                        pipeline_step="2 of 3",
+                        run_step="consolidate Sent Items",
+                        mailboxes_finished_in_this_step=f"{done}/{n_mb}",
+                        last_mailbox_just_completed=m,
+                        last_result="Graph error",
                     )
                 except Exception as e:
                     logger.bind(ctx=f"sent[{m}]").exception("Crashed: {}", e)
@@ -414,6 +452,19 @@ def main() -> int:
                         "PROGRESS: {}/{} mailboxes complete (finished: {}, ERROR).",
                         done, n_mb, m,
                     )
+                    _write_jtet_live_status(
+                        pipeline_step="2 of 3",
+                        run_step="consolidate Sent Items",
+                        mailboxes_finished_in_this_step=f"{done}/{n_mb}",
+                        last_mailbox_just_completed=m,
+                        last_result="ERROR",
+                    )
+
+    _write_jtet_live_status(
+        pipeline_step="2 of 3 (complete)",
+        run_step="consolidate Sent Items",
+        status="Step 2 finished for this process.",
+    )
 
     print()
     hdr = f"{'mailbox':<46} {'folders':>8} {'messages':>10}  status"
