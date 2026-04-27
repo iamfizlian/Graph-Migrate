@@ -67,8 +67,48 @@ class CalendarUploader:
 
 # -- ICS parsing ----------------------------------------------------------
 
+# libpst (PRODID:LibPST v0.6.76) emits multi-day BYDAY values using `;`
+# instead of `,` -- e.g., `BYDAY=WE;TH;FR` for a Wed/Thu/Fri series. RFC
+# 5545 reserves `;` as the rule-part separator and `,` for value lists,
+# so a conformant parser sees BYDAY=WE plus two orphan rule-parts (TH,
+# FR) and silently drops them. The fix-up below rewrites only the
+# semicolons that follow a BYDAY day-code with a comma, leaving every
+# other rule part untouched. We don't change other multi-value parts
+# (BYMONTHDAY, BYHOUR, ...) because we haven't seen libpst mangle them
+# in practice; if that changes, generalise this in place.
+_RRULE_LINE_RE = re.compile(rb"^(RRULE:)([^\r\n]*)", re.MULTILINE)
+# A day-code is an optional ordinal (+/-N) followed by exactly two
+# uppercase letters. The lookahead `(?=;|\Z)` guarantees the orphan day
+# isn't actually a real `KEY=VALUE` rule part (no rule-part name in RFC
+# 5545 is exactly two letters, but the lookahead is belt-and-braces).
+_BYDAY_FIX_RE = re.compile(
+    rb"(BYDAY=(?:[+-]?\d+)?[A-Z]{2})"
+    rb"((?:;(?:[+-]?\d+)?[A-Z]{2}(?=;|\Z))+)"
+)
+
+
+def _fix_libpst_rrule(raw: bytes) -> bytes:
+    """Repair libpst's `BYDAY=WE;TH;FR` -> `BYDAY=WE,TH,FR`.
+
+    Operates only on the RRULE lines and only on the orphan-day suffix
+    that follows the first BYDAY value, so it can't accidentally clobber
+    a well-formed rule.
+    """
+    def _fix_value(line_match: re.Match) -> bytes:
+        prefix = line_match.group(1)
+        value = line_match.group(2)
+        fixed = _BYDAY_FIX_RE.sub(
+            lambda m: m.group(1) + m.group(2).replace(b";", b","),
+            value,
+        )
+        return prefix + fixed
+
+    return _RRULE_LINE_RE.sub(_fix_value, raw)
+
+
 def _ics_to_graph_event(raw: bytes) -> dict | None:
     """Parse an .ics blob and return a Graph-shaped event document, or None."""
+    raw = _fix_libpst_rrule(raw)
     try:
         cal = Calendar.from_ical(raw)
     except Exception:
