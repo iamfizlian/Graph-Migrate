@@ -552,48 +552,30 @@ class Orchestrator:
     # Mail purge
     # ------------------------------------------------------------------
     #
-    # Two-phase delete that matches Search-Mailbox semantics on a Graph-only
-    # codepath (Search-Mailbox itself is unreachable from the EXO V3
-    # PowerShell module, which dropped Remote PowerShell -- so we do the
-    # equivalent here):
+    # Enumerate every mail message in each selected mailbox via Graph and
+    # DELETE it. Messages whose parentFolderId matches the mailbox's
+    # Deleted Items folder are skipped (one fewer round-trip per message
+    # and the user explicitly doesn't care about those). We deliberately
+    # do NOT consult the local `messages` state table: that table is
+    # cleared whenever the user runs `reset-state`, and even when it
+    # isn't, what we want here is "kill every visible mail in the
+    # mailbox," not "kill only what we previously imported."
     #
-    #   Phase 1: DELETE /users/{upn}/messages/{graph_message_id}
-    #            for every row we recorded as 'done'. This soft-deletes
-    #            the message: Graph moves it from its current folder
-    #            (Inbox / sub-folder / etc.) into the user's Deleted
-    #            Items folder. The id assigned in Deleted Items differs
-    #            from the original, so phase 1 is one-shot per id.
+    # A regular DELETE soft-deletes (moves the message to Deleted
+    # Items). That's fine -- we're not trying to permanently purge,
+    # just to make the mailbox look empty for re-import.
     #
-    #   Phase 2: page through /users/{upn}/mailFolders/deletedItems/messages
-    #            and DELETE every entry whose internetMessageId is in the
-    #            set we just soft-deleted. A second DELETE on a message
-    #            that is already in Deleted Items moves it to Recoverable
-    #            Items (the hidden 14-day retention area), which is what
-    #            users mean by "permanent" -- the message disappears from
-    #            every visible folder. Targeting by internetMessageId
-    #            keeps us from touching the user's pre-existing deleted
-    #            items.
-    #
-    # Why not call Graph's `permanentDelete` action and skip phase 2?
-    # That endpoint only exists on /beta and isn't a contractually stable
-    # surface. The DELETE-twice approach uses /v1.0 for both phases,
-    # which is what we already trust for every other request.
-    #
-    # Throughput: phase 1 parallelises per-mailbox via ThreadPoolExecutor
-    # (workers_per_mailbox) and per-batch via max_parallel_mailboxes.
-    # Phase 2 enumerates Deleted Items in 999-item pages (Graph's max);
-    # the GET pages serialise per mailbox but the resulting DELETEs are
-    # parallel again. Realistic end-to-end throughput sits around
-    # 200-400 messages/sec across the app pool.
+    # Throughput: parallel mailboxes (max_parallel_mailboxes) x
+    # workers_per_mailbox x app pool. ~200-400 deletes/sec per mailbox
+    # in steady state.
 
     def purge_mail(self, mapping: list[MappingRow]) -> tuple[int, int, int]:
-        """DELETE imported mail messages and clear their state rows.
+        """DELETE every message outside Deleted Items for the selected mailboxes.
 
-        Returns ``(deleted_in_graph, missing_in_graph, errors)``. ``deleted``
-        counts phase-1 successes (message removed from its origin folder);
-        ``missing`` counts phase-1 404s (message already gone); ``errors``
-        counts everything else, including phase-2 failures (items that were
-        soft-deleted but not permanently purged from Deleted Items).
+        Returns ``(deleted, missing, errors)``. ``missing`` counts 404s on
+        DELETE (messages that disappeared mid-run, e.g. from another worker).
+        Does not touch the local state DB -- the destination mailbox is the
+        sole source of truth for which messages exist.
         """
         if not mapping:
             return (0, 0, 0)
@@ -602,25 +584,34 @@ class Orchestrator:
         totals = {"deleted": 0, "missing": 0, "errors": 0}
         totals_lock = threading.Lock()
 
+        # De-dup by mailbox: if mapping has multiple PST rows for the same
+        # UPN, we only need to wipe the mailbox once.
+        unique_mailboxes: list[str] = []
+        seen: set[str] = set()
+        for row in mapping:
+            if row.target_mailbox.lower() not in seen:
+                seen.add(row.target_mailbox.lower())
+                unique_mailboxes.append(row.target_mailbox)
+
         with graph, ThreadPoolExecutor(
             max_workers=self._cfg.migration.max_parallel_mailboxes,
             thread_name_prefix="pst-purge-mail",
         ) as pool:
-            futures: dict[Future, MappingRow] = {
-                pool.submit(self._purge_mail_one, graph, row): row for row in mapping
+            futures = {
+                pool.submit(self._purge_mail_one, graph, mb): mb
+                for mb in unique_mailboxes
             }
             with self._make_progress() as progress:
-                task = progress.add_task("Purge mail jobs", total=len(futures))
+                task = progress.add_task(
+                    "Purge mail (per mailbox)", total=len(futures)
+                )
                 for fut in as_completed(futures):
-                    row = futures[fut]
+                    mb = futures[fut]
                     try:
                         d, m, e = fut.result()
-                    except Exception as exc:
-                        logger.bind(ctx=row.target_mailbox).exception(
-                            "Purge worker crashed"
-                        )
+                    except Exception:
+                        logger.bind(ctx=mb).exception("Purge worker crashed")
                         d, m, e = (0, 0, 1)
-                        del exc
                     with totals_lock:
                         totals["deleted"] += d
                         totals["missing"] += m
@@ -630,141 +621,80 @@ class Orchestrator:
         return (totals["deleted"], totals["missing"], totals["errors"])
 
     def _purge_mail_one(
-        self, graph: GraphClient, row: MappingRow
+        self, graph: GraphClient, mailbox: str
     ) -> tuple[int, int, int]:
-        items = self._state.list_done_messages(
-            row.target_mailbox, str(row.pst_path)
-        )
-        if not items:
-            return (0, 0, 0)
+        upn = quote(mailbox)
+        log = logger.bind(ctx=f"purge-mail[{mailbox}]")
 
-        log = logger.bind(
-            ctx=f"purge-mail[{row.target_mailbox}|{row.pst_path.name}]"
-        )
-        log.info("Phase 1 (soft delete): {} message(s)", len(items))
-
-        # imid:<lower-cased-Message-ID> -> phase-2 can find this in Deleted
-        # Items by matching internetMessageId. sha256:<hex> -> source had no
-        # Message-ID header, so phase-2 can't address it; we still soft-delete
-        # in phase 1 and the user can manually empty Deleted Items if needed.
-        imids_to_purge: set[str] = set()
-        deleted = 0
-        missing = 0
-        errors = 0
-
-        workers = max(1, self._cfg.migration.workers_per_mailbox)
-        upn = quote(row.target_mailbox)
-
-        def _phase1_one(item) -> tuple[str, str | None]:
-            graph_id = item["graph_message_id"]
-            app_id = item["app_id"] or self._pool.names[0]
-            dedupe_key = item["dedupe_key"] or ""
-            try:
-                graph.delete(
-                    f"/users/{upn}/messages/{quote(graph_id)}",
-                    expect_status=(204, 200),
-                    app_id=app_id,
-                )
-                outcome = "deleted"
-            except GraphError as e:
-                if e.status == 404:
-                    outcome = "missing"
-                else:
-                    log.warning(
-                        "phase-1 DELETE failed for {}: {} {}",
-                        graph_id, e.status, e.body,
-                    )
-                    return ("error", None)
-            except Exception as e:
-                log.warning("phase-1 DELETE failed for {}: {}", graph_id, e)
-                return ("error", None)
-
-            # Drop the state row whether it was soft-deleted or 'already
-            # gone'; either way a follow-up `import` should re-upload.
-            self._state.delete_message_row(
-                row.target_mailbox, str(row.pst_path), item["source_path"]
+        # 1. Resolve the Deleted Items folder id so we can skip messages in
+        #    it. The well-known name 'deleteditems' is locale-stable.
+        del_folder_id: str | None = None
+        try:
+            resp = graph.get(
+                f"/users/{upn}/mailFolders/deleteditems",
+                expect_status=(200,),
             )
-            imid = (
-                dedupe_key[len("imid:"):]
-                if dedupe_key.startswith("imid:")
-                else None
-            )
-            return (outcome, imid)
+            del_folder_id = resp.json().get("id")
+        except Exception as e:
+            log.warning("could not resolve deleteditems folder id: {}", e)
+            # Continue without filtering; worst case we delete from Deleted
+            # Items too, which the user already said doesn't matter.
 
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="purge-p1"
-        ) as p1:
-            for outcome, imid in p1.map(_phase1_one, items):
-                if outcome == "deleted":
-                    deleted += 1
-                elif outcome == "missing":
-                    missing += 1
-                else:
-                    errors += 1
-                if imid:
-                    imids_to_purge.add(imid.lower())
-
-        if not imids_to_purge:
-            log.info(
-                "Phase 2 skipped: no imid-keyed messages to permanently delete"
-            )
-            return (deleted, missing, errors)
-
-        # Phase 2 -- enumerate Deleted Items, match by internetMessageId.
-        log.info(
-            "Phase 2 (permanent delete): scanning Deleted Items for "
-            "{} target message(s)", len(imids_to_purge),
-        )
-
+        # 2. Page /users/{upn}/messages, collecting ids to delete. The
+        #    /messages collection returns mail across ALL mail folders
+        #    (Inbox, Sent Items, sub-folders, custom folders, ...) but
+        #    excludes hidden Recoverable Items. parentFolderId is
+        #    returned via $select so we can filter Deleted Items.
+        ids_to_delete: list[str] = []
         next_url: str | None = (
-            f"/users/{upn}/mailFolders/deletedItems/messages"
-            f"?$select=id,internetMessageId&$top=999"
+            f"/users/{upn}/messages"
+            f"?$top=999&$select=id,parentFolderId"
         )
-        delete_ids: list[str] = []
         pages = 0
+        list_errors = 0
         while next_url:
             try:
                 resp = graph.get(next_url, expect_status=(200,))
             except Exception as e:
-                log.warning("phase-2 page GET failed: {}", e)
-                errors += 1
+                log.warning("paging GET failed: {}", e)
+                list_errors += 1
                 break
             body = resp.json()
             for msg in body.get("value", []):
-                raw = (msg.get("internetMessageId") or "").strip("<> ").lower()
-                if raw and raw in imids_to_purge:
-                    delete_ids.append(msg["id"])
+                if del_folder_id and msg.get("parentFolderId") == del_folder_id:
+                    continue
+                ids_to_delete.append(msg["id"])
             next_url = body.get("@odata.nextLink")
-            # @odata.nextLink is an absolute URL; httpx with a base_url will
-            # ignore the base when the path itself is absolute, so passing it
-            # through is fine.
+            # @odata.nextLink is absolute; strip the v1.0 host so the
+            # request rides our existing base_url + auth/throttle wiring.
+            if next_url and next_url.startswith(
+                "https://graph.microsoft.com/v1.0"
+            ):
+                next_url = next_url[len("https://graph.microsoft.com/v1.0"):]
             pages += 1
-            if pages > 1000:
-                log.warning(
-                    "phase-2 paging gave up after 1000 pages -- runaway "
-                    "Deleted Items folder?"
-                )
-                errors += 1
-                break
 
-        if not delete_ids:
-            log.warning(
-                "Phase 2 matched 0 messages in Deleted Items. The phase-1 "
-                "soft-deletes succeeded but the items are no longer "
-                "addressable -- either an inbox rule moved them, or a prior "
-                "purge already permanently deleted them."
+        if not ids_to_delete:
+            log.info(
+                "Nothing to purge ({} pages enumerated, all empty or in "
+                "Deleted Items)", pages,
             )
-            return (deleted, missing, errors)
+            return (0, 0, list_errors)
 
         log.info(
-            "Phase 2: deleting {} matched message(s) from Deleted Items",
-            len(delete_ids),
+            "Deleting {} message(s) across {} folder(s)",
+            len(ids_to_delete),
+            "(unknown — not enumerated)",
         )
 
-        def _phase2_one(graph_id: str) -> str:
+        deleted = 0
+        missing = 0
+        errors = list_errors
+        workers = max(1, self._cfg.migration.workers_per_mailbox)
+
+        def _delete_one(mid: str) -> str:
             try:
                 graph.delete(
-                    f"/users/{upn}/messages/{quote(graph_id)}",
+                    f"/users/{upn}/messages/{quote(mid)}",
                     expect_status=(204, 200),
                 )
                 return "deleted"
@@ -772,26 +702,28 @@ class Orchestrator:
                 if e.status == 404:
                     return "missing"
                 log.warning(
-                    "phase-2 DELETE failed for {}: {} {}",
-                    graph_id, e.status, e.body,
+                    "DELETE failed for {}: {} {}", mid, e.status, e.body
                 )
                 return "error"
             except Exception as e:
-                log.warning("phase-2 DELETE failed for {}: {}", graph_id, e)
+                log.warning("DELETE failed for {}: {}", mid, e)
                 return "error"
 
         with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="purge-p2"
-        ) as p2:
-            for outcome in p2.map(_phase2_one, delete_ids):
-                # Phase-2 success is a continuation of phase-1 success; we
-                # already counted those messages in `deleted`. Phase-2
-                # 'missing' is a benign race. Phase-2 errors leave the
-                # message visible in Deleted Items, which the user
-                # cares about, so we surface them as errors.
-                if outcome == "error":
+            max_workers=workers, thread_name_prefix="purge-mail-del"
+        ) as p:
+            for outcome in p.map(_delete_one, ids_to_delete):
+                if outcome == "deleted":
+                    deleted += 1
+                elif outcome == "missing":
+                    missing += 1
+                else:
                     errors += 1
 
+        log.info(
+            "Done. deleted={} missing={} errors={}",
+            deleted, missing, errors,
+        )
         return (deleted, missing, errors)
 
     # ------------------------------------------------------------------

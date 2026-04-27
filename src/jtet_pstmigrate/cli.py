@@ -763,41 +763,34 @@ def run_purge_mail(
     exclude_pst: ExcludePstFilterOpt = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
 ) -> None:
-    """Delete previously-imported mail messages and clear their state.
+    """Delete every mail message in the selected mailboxes, except Deleted Items.
 
-    Targets only messages this tool actually uploaded (rows in the
-    ``messages`` table with ``status='done'`` and a recorded
-    ``graph_message_id``). Pre-existing mail in the destination mailbox is
-    not touched.
+    Enumerates ``/users/{upn}/messages`` for each target mailbox and
+    DELETEs every message whose parent folder is not Deleted Items.
+    A regular DELETE soft-deletes (moves the message to Deleted Items),
+    which is fine -- the goal is to make the visible folders look empty
+    so a subsequent ``import`` / ``import-all`` runs against a clean
+    destination.
 
-    Two-phase delete:
+    Does NOT consult the local state database. Whatever the
+    ``messages`` table currently holds is irrelevant: the destination
+    mailbox itself is enumerated, so this works equally well after
+    ``reset-state``, after a botched run, or against a mailbox you
+    never imported into with this tool. Calendar and contact state and
+    items are untouched.
 
-      1. ``DELETE /users/{upn}/messages/{graph_message_id}`` for every
-         recorded message. Graph soft-deletes by moving the message into
-         the user's Deleted Items folder.
-      2. Page through Deleted Items and ``DELETE`` every entry whose
-         ``internetMessageId`` matches the set we soft-deleted in
-         phase 1. A second DELETE on a Deleted-Items message moves it
-         to Recoverable Items (the hidden 14-day retention area), which
-         is what users mean by "permanent" -- it disappears from every
-         visible folder. Targeting by ``internetMessageId`` keeps the
-         user's pre-existing deleted items in place.
+    Mailboxes are de-duplicated, so multiple PST rows for the same UPN
+    only wipe the mailbox once.
 
-    Why two phases instead of Graph's ``permanentDelete`` action? The
-    latter is /beta only, and we keep every other request on /v1.0.
+    Required Graph permission: ``Mail.ReadWrite`` (Application) on
+    every app in the pool -- already required by ``import``, so this
+    command needs no extra admin grants.
 
-    Required Graph permission: ``Mail.ReadWrite`` (Application) on every
-    app in the pool -- which the import phase already needs, so this
-    command works without any new admin grants.
-
-    Use this when you need to re-run mail import cleanly after fixing
-    a bug, or to clean up a destination mailbox before re-importing
-    against a fresh state DB. Calendar and contact state are untouched.
-
-    Bulk usage (everyone except the two pilot mailboxes you finished):
+    Bulk usage (everyone except the pilot mailboxes you've already
+    finished):
 
       pstmigrate purge-mail -c c.toml -m m.csv \
-          -X tinad@x -X allysonp@x -y
+          -X tinad@x -X allysonp@x -X debbiep@x -y
     """
     cfg = _load(config)
     run_id = f"purge-mail_{_run_id()}"
@@ -823,34 +816,24 @@ def run_purge_mail(
     state = StateStore(cfg.paths.state_dir / "state.sqlite")
     pool = AppPool(cfg.apps)
 
-    # Pre-flight: count what we're about to wipe per (mailbox, PST).
-    total = 0
+    # De-dup mailboxes for the confirmation prompt; the orchestrator
+    # also de-dups internally.
+    seen: set[str] = set()
+    unique_mailboxes: list[str] = []
     for row in rows:
-        n = state.count_done_messages(row.target_mailbox, str(row.pst_path))
-        if n:
-            console.print(
-                f"  {row.target_mailbox} | {row.pst_path.name}: "
-                f"[yellow]{n}[/] message(s) to purge"
-            )
-            total += n
-
-    if total == 0:
-        console.print(
-            "[green]Nothing to purge.[/] No 'done' message rows for the "
-            "selected scope."
-        )
-        raise typer.Exit(0)
+        key = row.target_mailbox.lower()
+        if key not in seen:
+            seen.add(key)
+            unique_mailboxes.append(row.target_mailbox)
 
     console.print(
-        f"\n[bold red]About to DELETE {total} message(s) from Graph[/] "
-        f"and remove their state rows.\n"
-        f"Two passes: phase 1 soft-deletes (move to Deleted Items), "
-        f"phase 2 permanently deletes (Recoverable Items, 14-day "
-        f"hidden retention).\n"
-        f"This is irreversible from the user's perspective -- after "
-        f"phase 2, ``import`` / ``import-all`` will re-upload every "
-        f"message from the PST extract.\n"
-        f"  app pool = {len(pool)} ({', '.join(pool.names)})\n"
+        f"\n[bold red]About to DELETE all mail (except Deleted Items)[/] "
+        f"from {len(unique_mailboxes)} mailbox(es):"
+    )
+    for mb in unique_mailboxes:
+        console.print(f"  - {mb}")
+    console.print(
+        f"\n  app pool = {len(pool)} ({', '.join(pool.names)})\n"
         f"  workers/mailbox = {cfg.migration.workers_per_mailbox}\n"
         f"  parallel mailboxes = {cfg.migration.max_parallel_mailboxes}\n"
     )
@@ -867,15 +850,6 @@ def run_purge_mail(
         f"already-gone=[yellow]{missing}[/]  "
         f"errors=[red]{errors}[/]"
     )
-    if errors:
-        console.print(
-            "[yellow]Note:[/] errors include phase-2 failures, where a "
-            "soft-deleted message could not be permanently removed from "
-            "Deleted Items. Those messages are still in the destination "
-            "mailbox's Deleted Items folder and you can drain them via "
-            "OWA (right-click Deleted Items -> Empty folder) on the "
-            "affected accounts."
-        )
     raise typer.Exit(1 if errors else 0)
 
 
