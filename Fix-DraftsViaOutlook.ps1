@@ -1217,6 +1217,30 @@ function Fix-Mailbox {
 # Live status file (set by Run-FullCleanup.ps1 via env)
 # ---------------------------------------------------------------------------
 
+function Get-JtetOverallRunApprox {
+    <#
+        Equal weight per full pipeline step; within Outlook step, use mailbox_index / total
+        (at START of each mailbox, MbIdx is the one we're about to run).
+    #>
+    param(
+        [int]$MbIdx,
+        [int]$MbTotal
+    )
+    $pS = 1
+    $pT = 1
+    try { $pS = [int][string]$env:JTET_LIVE_PIPELINE_STEP_INDEX } catch { }
+    try { $pT = [int][string]$env:JTET_LIVE_PIPELINE_TOTAL_STEPS } catch { }
+    if ($pT -lt 1) { $pT = 1 }
+    if ($pS -lt 1) { $pS = 1 }
+    if ($pS -gt $pT) { $pS = $pT }
+    if ($MbTotal -lt 1) { $MbTotal = 1 }
+    $f = [double]($MbIdx - 1) / [double]$MbTotal
+    if ($f -lt 0) { $f = 0 }
+    if ($f -gt 1) { $f = 1 }
+    $pct = 100.0 * (([double]($pS - 1)) + $f) / [double]$pT
+    return ('{0:n1}%' -f $pct)
+}
+
 function Write-JtetLiveStatusOutlook {
     param(
         [int]$MbIdx,
@@ -1230,7 +1254,10 @@ function Write-JtetLiveStatusOutlook {
     $pl = $env:JTET_LIVE_PIPELINE_LABEL
     if (-not $pl) { $pl = 'Outlook (draft fix)' }
     $u = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ssZ')
+    $overall = Get-JtetOverallRunApprox -MbIdx $MbIdx -MbTotal $MbTotal
     $lines = @(
+        "overall_run_approx: $overall",
+        "what_this_run_means: Percent = full pipeline; mailbox k/N = Outlook MAPI pass only (slow step is normal).",
         "pipeline_step: $pl",
         "run_step: clear MSGFLAG_UNSENT (Outlook / MAPI)",
         "mailbox_index: $MbIdx of $MbTotal",
@@ -1380,7 +1407,16 @@ function Main {
 
     if ($env:JTET_LIVE_STATUS_FILE) {
         $u = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ssZ')
+        $pS = 1; $pT = 1
+        try { $pS = [int][string]$env:JTET_LIVE_PIPELINE_STEP_INDEX } catch { }
+        try { $pT = [int][string]$env:JTET_LIVE_PIPELINE_TOTAL_STEPS } catch { }
+        if ($pT -lt 1) { $pT = 1 }
+        if ($pS -lt 1) { $pS = 1 }
+        if ($pS -gt $pT) { $pS = $pT }
+        $endPct = 100.0 * [double]($pS) / [double]$pT
+        $endApprox = ('{0:n1}%' -f $endPct)
         @(
+            "overall_run_approx: $endApprox (outlook MAPI pass finished for all listed mailboxes)",
             "pipeline_step: $($env:JTET_LIVE_PIPELINE_LABEL) (Outlook pass complete for all mailboxes in this invocation)",
             "run_step: clear MSGFLAG_UNSENT — finished",
             "updated_utc: $u"

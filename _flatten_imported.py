@@ -910,6 +910,30 @@ def _write_jtet_live_status(**fields: str) -> None:
         pass
 
 
+def _live_pipeline_meta() -> tuple[str, int, int]:
+    """pipeline label and indices from env (set by Run-FullCleanup.ps1)."""
+    try:
+        t = int(os.environ.get("JTET_LIVE_PIPELINE_TOTAL_STEPS", "3") or 3)
+    except ValueError:
+        t = 3
+    try:
+        s = int(os.environ.get("JTET_LIVE_PIPELINE_STEP_INDEX", "1") or 1)
+    except ValueError:
+        s = 1
+    if t < 1:
+        t = 3
+    s = max(1, min(s, t))
+    return f"{s} of {t}", s, t
+
+
+def _live_overall_pct(fraction_in_step: float) -> str:
+    """Equal weight for each full pipeline step; within step, 0..1 (e.g. done/total)."""
+    _, s, t = _live_pipeline_meta()
+    f = max(0.0, min(1.0, float(fraction_in_step)))
+    pct = 100.0 * (s - 1 + f) / t
+    return f"{pct:.1f}%"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Merge 'Imported PST' folders into mailbox root.")
     ap.add_argument("-c", "--config", required=True, help="config.toml path")
@@ -971,12 +995,15 @@ def main() -> int:
         n_mb,
     )
 
+    pl, _, _ = _live_pipeline_meta()
     _write_jtet_live_status(
-        pipeline_step="1 of 3",
+        overall_run_approx=_live_overall_pct(0.0),
+        what_this_run_means="Percent = whole pipeline, not one step. This step = flatten; later steps = consolidate, then Outlook.",
+        pipeline_step=pl,
         run_step="flatten (Graph / Imported PST)",
         mailboxes_total=str(n_mb),
         mailboxes_finished_in_this_step=f"0/{n_mb}",
-        what_this_means="This line updates every time one mailbox *fully* finishes flatten. If two are still merging, the count rises slowly.",
+        what_this_step_means="k/N here is only for flatten. overall_run_approx includes step position.",
     )
 
     all_stats: list[dict] = []
@@ -999,14 +1026,16 @@ def main() -> int:
                         "PROGRESS: {}/{} mailboxes complete (finished: {}, ok).",
                         done, n_mb, m,
                     )
+                    pl, _, _ = _live_pipeline_meta()
                     _write_jtet_live_status(
-                        pipeline_step="1 of 3",
+                        overall_run_approx=_live_overall_pct(done / n_mb if n_mb else 0.0),
+                        pipeline_step=pl,
                         run_step="flatten (Graph / Imported PST)",
                         mailboxes_total=str(n_mb),
                         mailboxes_finished_in_this_step=f"{done}/{n_mb}",
                         last_mailbox_just_completed=m,
                         not_finished_yet_in_this_step=str(n_mb - done),
-                        what_this_means="Open this file anytime. When the fraction equals N/N, all mailboxes are done with Step 1 (flatten) only.",
+                        what_this_step_means="k/N = flatten only. overall_run_approx = whole run (equal weight per pipeline step).",
                     )
                 except Exception as e:
                     logger.bind(ctx=f"flatten[{m}]").exception("Crashed: {}", e)
@@ -1016,8 +1045,10 @@ def main() -> int:
                         "PROGRESS: {}/{} mailboxes complete (finished: {}, ERROR — see traceback above).",
                         done, n_mb, m,
                     )
+                    pl, _, _ = _live_pipeline_meta()
                     _write_jtet_live_status(
-                        pipeline_step="1 of 3",
+                        overall_run_approx=_live_overall_pct(done / n_mb if n_mb else 0.0),
+                        pipeline_step=pl,
                         run_step="flatten (Graph / Imported PST)",
                         mailboxes_total=str(n_mb),
                         mailboxes_finished_in_this_step=f"{done}/{n_mb}",
@@ -1025,10 +1056,12 @@ def main() -> int:
                         last_result="ERROR (see step1-flatten.log)",
                     )
 
+    pl, _, _ = _live_pipeline_meta()
     _write_jtet_live_status(
-        pipeline_step="1 of 3 (complete)",
+        overall_run_approx=_live_overall_pct(1.0),
+        pipeline_step=f"{pl} (this step done)",
         run_step="flatten",
-        status="Step 1 finished for this process — Run-FullCleanup will continue to step 2 if enabled.",
+        status="Flatten finished — next pipeline step (if any) runs next.",
     )
 
     # Summary

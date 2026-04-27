@@ -377,6 +377,11 @@ if ($plan.Count -eq 0) {
     throw 'All three steps were skipped via -SkipFlatten / -SkipConsolidate / -SkipDrafts. Nothing to do.'
 }
 
+# Children (_flatten, _consolidate, Fix-DraftsViaOutlook) read these for LIVE-STATUS.txt
+# overall_run_approx: equal weight per enabled step + mailbox progress within the step.
+$env:JTET_LIVE_PIPELINE_TOTAL_STEPS = "$($plan.Count)"
+$pipelineStepNum = 0
+
 Write-Host ''
 Write-Host "Selection : $selectStr"
 foreach ($m in $SelectedMailboxes) { Write-Host "              - $m" }
@@ -403,14 +408,16 @@ $results = @()
 Write-Host ''
 Write-Host "LIVE STATUS FILE (open in Notepad; refreshes as the run works):" -ForegroundColor Green
 Write-Host "  $LiveStatusFile" -ForegroundColor Green
-Write-Host "  It shows which pipeline step (1–3), and mailbox counts within the current step." -ForegroundColor DarkGray
-Write-Host ''
+Write-Host "  overall_run_approx = rough %% through the whole run (equal weight per pipeline step, then mailboxes in that step). Not time-based." -ForegroundColor DarkGray
+Write-Host ""
 
 # --- Step 1: Flatten -------------------------------------------------------
 
 if (-not $SkipFlatten) {
+    $pipelineStepNum++
+    $env:JTET_LIVE_PIPELINE_STEP_INDEX = "$pipelineStepNum"
     Write-Host ''
-    Write-Host ">>> STEP 1 of $($plan.Count): Flatten (_flatten_imported.py) — Microsoft Graph, mailboxes run in PARALLEL." -ForegroundColor Yellow
+    Write-Host ">>> PIPELINE STEP $pipelineStepNum of $($plan.Count): Flatten (_flatten_imported.py) — Microsoft Graph, mailboxes run in PARALLEL." -ForegroundColor Yellow
     Write-Host ">>> Log: $RunDir\step1-flatten.log  |  Search for:  PROGRESS:  to see how many of $($SelectedMailboxes.Count) mailboxes have FINISHED (each line = one mailbox done)." -ForegroundColor Yellow
     Write-Host ">>> While a large Inbox merge runs, you also get  moved N messages  every 200 msgs. Graph 500 + backoff is throttling; usually succeeds after retries." -ForegroundColor DarkGray
     Write-Host ''
@@ -428,8 +435,10 @@ if (-not $SkipFlatten) {
 # --- Step 2: Consolidate Sent ---------------------------------------------
 
 if (-not $SkipConsolidate) {
+    $pipelineStepNum++
+    $env:JTET_LIVE_PIPELINE_STEP_INDEX = "$pipelineStepNum"
     Write-Host ''
-    Write-Host ">>> STEP 2 of $($plan.Count): Consolidate Sent (_consolidate_sent.py) — parallel mailboxes, same PROGRESS: k/N idea in step2-consolidate.log." -ForegroundColor Yellow
+    Write-Host ">>> PIPELINE STEP $pipelineStepNum of $($plan.Count): Consolidate Sent (_consolidate_sent.py) — parallel mailboxes, same PROGRESS: k/N idea in step2-consolidate.log." -ForegroundColor Yellow
     Write-Host ''
     $results += Invoke-Step `
         -Name    'Step 2: Consolidate Sent Items' `
@@ -445,15 +454,18 @@ if (-not $SkipConsolidate) {
 # --- Step 3: Fix drafts via Outlook ---------------------------------------
 
 if (-not $SkipDrafts) {
+    $pipelineStepNum++
+    $env:JTET_LIVE_PIPELINE_STEP_INDEX = "$pipelineStepNum"
     $results += Invoke-Step `
         -Name    'Step 3: Clear MSGFLAG_UNSENT' `
         -LogFile 'step3-drafts.log' `
         -Action  {
             $env:JTET_LIVE_STATUS_FILE = $LiveStatusFile
-            $pCount = $plan.Count
-            $env:JTET_LIVE_PIPELINE_LABEL = "$pCount of $pCount (Outlook — last step in this plan)"
+            $pIdx  = $env:JTET_LIVE_PIPELINE_STEP_INDEX
+            $pTot  = $env:JTET_LIVE_PIPELINE_TOTAL_STEPS
+            $env:JTET_LIVE_PIPELINE_LABEL = "Step $pIdx of $pTot (Outlook MAPI — usually slowest)"
             Write-Host ""
-            Write-Host ("========== RUN-FULL-CLEANUP: pipeline step {0} of {0} (Outlook / MAPI — usually the slowest) ==========" -f $plan.Count) -ForegroundColor Cyan
+            Write-Host ("========== RUN-FULL-CLEANUP: pipeline step {0} of {1} (Outlook / MAPI) ==========" -f $pIdx, $pTot) -ForegroundColor Cyan
             Write-Host "LIVE-STATUS: $LiveStatusFile (updated per mailbox in this step)`n" -ForegroundColor Cyan
             $childScript = Join-Path $ScriptRoot 'Fix-DraftsViaOutlook.ps1'
             $params = @{} + $selection.PSArgs
