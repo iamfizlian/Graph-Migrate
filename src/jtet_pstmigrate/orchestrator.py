@@ -15,7 +15,7 @@ import csv
 import dataclasses
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -90,6 +90,20 @@ def load_mapping(csv_path: Path) -> list[MappingRow]:
             )
             rows.append(row)
     return rows
+
+
+_DELETED_ITEMS_WELL_KNOWN = "deleteditems"
+
+
+def _purge_mail_skip_deleted_items_folder(
+    folder: Mapping[str, object], skip_ids: set[str]
+) -> bool:
+    """Return True if this mailFolder is Deleted Items and must not be purged."""
+    fid = folder.get("id")
+    if isinstance(fid, str) and fid in skip_ids:
+        return True
+    wk = str(folder.get("wellKnownName") or "").lower()
+    return wk == _DELETED_ITEMS_WELL_KNOWN
 
 
 class Orchestrator:
@@ -655,11 +669,20 @@ class Orchestrator:
                 f"/users/{upn}/mailFolders/deleteditems",
                 expect_status=(200,),
             )
-            skip_folder_ids.add(resp.json()["id"])
+            did = resp.json().get("id")
+            if did:
+                skip_folder_ids.add(did)
+            else:
+                log.warning(
+                    "deleteditems folder response had no id; relying on "
+                    "wellKnownName=deleteditems skip during folder walk",
+                )
         except Exception as e:
             log.warning(
                 "could not resolve deleteditems folder id: {} -- "
-                "continuing without skip", e,
+                "still skipping any folder with wellKnownName={!r}",
+                e,
+                _DELETED_ITEMS_WELL_KNOWN,
             )
 
         # Aggregated counters (closure-mutated by helpers below).
@@ -678,13 +701,7 @@ class Orchestrator:
             out: list[dict] = []
             next_url: str | None = path
             while next_url:
-                try:
-                    body = graph.get(
-                        next_url, expect_status=(200,)
-                    ).json()
-                except Exception as e:
-                    log.warning("enum GET failed at {}: {}", next_url, e)
-                    return out
+                body = graph.get(next_url, expect_status=(200,)).json()
                 out.extend(body.get("value", []))
                 next_url = _strip_host(body.get("@odata.nextLink"))
             return out
@@ -735,7 +752,11 @@ class Orchestrator:
             """Try to cascade-delete ``folder``; otherwise recurse + drain."""
             nonlocal msg_deleted, msg_errors, folder_deleted
             fid = folder["id"]
-            if fid in skip_folder_ids:
+            if _purge_mail_skip_deleted_items_folder(folder, skip_folder_ids):
+                log.debug(
+                    "skipping folder {!r} — Deleted Items (id or wellKnownName)",
+                    folder.get("displayName", "?"),
+                )
                 return
             display = folder.get("displayName", "?")
             total = folder.get("totalItemCount", 0) or 0
@@ -778,7 +799,7 @@ class Orchestrator:
                 for child in _enum(
                     f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
                     f"?$top=100"
-                    f"&$select=id,displayName,totalItemCount,childFolderCount"
+                    f"&$select=id,displayName,totalItemCount,childFolderCount,wellKnownName"
                 ):
                     _walk(child)
             if total > 0:
@@ -787,7 +808,7 @@ class Orchestrator:
         top = _enum(
             f"/users/{upn}/mailFolders"
             f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
+            f"&$select=id,displayName,totalItemCount,childFolderCount,wellKnownName"
         )
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
