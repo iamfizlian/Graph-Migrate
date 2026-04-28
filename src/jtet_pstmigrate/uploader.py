@@ -1,48 +1,42 @@
 """Upload a single .eml message into a Graph mailFolder.
 
-For sub-threshold messages we POST the MIME body straight to
+We always POST a JSON message document directly to
   /users/{upn}/mailFolders/{folderId}/messages
-with Content-Type: text/plain (Graph parses the MIME server-side).
+with ``singleValueExtendedProperties`` populated at create time so the
+message lands in the destination folder, not in Drafts. Attachments are
+uploaded individually after the parent message is created; small ones
+inline, large ones via ``createUploadSession``.
 
-For larger messages with big attachments we'd ordinarily switch to an
-upload session. In practice though, Graph's MIME endpoint accepts up to
-~150 MB per request — well past most archive emails. We measure body size
-and only fall back to the create-message + per-attachment-upload-session path
-when the MIME exceeds `large_attachment_threshold_bytes`.
+We deliberately do not use the MIME-import endpoint (POST /users/{id}/messages
+with text/plain MIME). That path always lands the message in Drafts first,
+so the only way to clear the draft flag is a PATCH after the move. That
+PATCH is silently rejected by some tenants, which is exactly the bug the
+``Fix-DraftsViaOutlook.ps1`` and ``_fix_drafts_*.py`` scripts in this repo
+exist to clean up.
 
 Date preservation
 -----------------
-Graph's POST to ``.../mailFolders/{id}/messages`` (MIME in the body) still
-stamps receivedDateTime / sentDateTime / createdDateTime / lastModifiedDateTime
-with the *current* server time. The MIME's Date: header is ignored. To make
-Outlook show the original timestamps
-we PATCH each message after creation with a set of MAPI extended properties:
+Graph stamps ``receivedDateTime`` / ``sentDateTime`` / ``createdDateTime`` /
+``lastModifiedDateTime`` with the current server time on create. To make
+Outlook show the original timestamps we attach the corresponding MAPI
+extended properties to the create call:
 
     PR_CLIENT_SUBMIT_TIME      0x0039  -> sentDateTime
     PR_MESSAGE_DELIVERY_TIME   0x0E06  -> receivedDateTime
     PR_CREATION_TIME           0x3007  -> createdDateTime
     PR_LAST_MODIFICATION_TIME  0x3008  -> lastModifiedDateTime
 
-This costs an extra request per message. For pure archival migrations every
-message will need it, so the overhead is unavoidable; the alternative (wrong
-dates everywhere) defeats the purpose of preserving the archive.
+Some tenants reject writes to PR_CREATION_TIME / PR_LAST_MODIFICATION_TIME
+at create time. On a 400 from the create call we retry with PR_MESSAGE_FLAGS
+ONLY (preserving the no-draft invariant) and PATCH the dates afterwards.
 
 Draft-flag fix
 --------------
-Both the MIME path and the JSON path create messages whose initial
-PR_MESSAGE_FLAGS value has the MSGFLAG_UNSENT bit (0x08) set, because
-Graph treats freshly-created messages as drafts. Moving the message to
-Inbox / Sent Items / etc. preserves its content and its dates, but does
-NOT clear MSGFLAG_UNSENT, so every imported message is permanently
-flagged isDraft=true. Outlook on the web is the most visible casualty:
-imported mail shows up under Drafts and the regular folders display
-"Draft" badges and lose their date-sort.
-
-The fix is to set PR_MESSAGE_FLAGS (tag 0x0E07, PT_LONG) to MSGFLAG_READ
-(0x01) at PATCH time. That clears UNSENT and SUBMIT, marks the item as
-read, and lets Outlook treat it as ordinary mail. We bundle this into the
-same extended-property PATCH that sets the date metadata, so it costs no
-additional Graph round-trip per message.
+PR_MESSAGE_FLAGS (tag 0x0E07, PT_LONG) is set to MSGFLAG_READ (0x01) in
+``singleValueExtendedProperties`` on the create call, so MSGFLAG_UNSENT
+(0x08) and MSGFLAG_SUBMIT (0x04) are cleared before the message ever
+exists on the server. Messages created this way report ``isDraft=false``
+from the moment they appear and never need a follow-up flag PATCH.
 """
 
 from __future__ import annotations
@@ -88,65 +82,16 @@ class MessageUploader:
         self._log = logger.bind(ctx=f"upload[{mailbox}]")
 
     def upload(self, msg: ExtractedMessage, folder_id: str, *, app_id: str) -> UploadResult:
+        # Always use the JSON create-in-target-folder path so PR_MESSAGE_FLAGS
+        # (clear MSGFLAG_UNSENT) goes in at create time, in singleValueExtendedProperties,
+        # and the message never lands under Drafts. The old MIME path created the
+        # message under Drafts and tried to clear the flag with a PATCH afterwards;
+        # that PATCH is unreliable across tenants -- existing _fix_drafts_*.py and
+        # Fix-DraftsViaOutlook.ps1 in this repo are the empirical proof.
         raw = msg.file_path.read_bytes()
         date_props = _date_props_from_eml(raw)
-        if len(raw) <= self._threshold:
-            return self._upload_mime(raw, folder_id, date_props=date_props, app_id=app_id)
-        return self._upload_via_create_then_attach(raw, folder_id, date_props=date_props, app_id=app_id)
-
-    def _upload_mime(
-        self, raw: bytes, folder_id: str, *, date_props: list[dict[str, str]], app_id: str
-    ) -> UploadResult:
-        """Create from MIME, then move into the target folder.
-
-        Microsoft Graph's MIME-import endpoint is ``POST /users/{id}/messages``
-        (no folder segment) with Content-Type: text/plain and a base64-encoded
-        MIME body. The created message lands in the user's Drafts folder.
-        Posting MIME to ``mailFolders/{id}/messages`` returns
-        ``UnableToDeserializePostBody`` because that endpoint expects JSON.
-        Posting MIME to ``mailFolders/{id}/messages/$value`` returns
-        ``$value cannot be applied to a collection``. So the correct shape
-        is create-in-drafts then move.
-
-        After ``/move`` the message ID CHANGES, so we use the moved id for
-        the follow-up date PATCH.
-        """
-        encoded = base64.b64encode(raw)
-        create_path = f"/users/{quote(self._mailbox)}/messages"
-        resp = self._graph.post(
-            create_path,
-            content=encoded,
-            headers={"Content-Type": "text/plain"},
-            expect_status=(201, 202),
-            app_id=app_id,
-        )
-        body = resp.json() if resp.content else {}
-        draft_id = body.get("id", "")
-        if not draft_id:
-            return UploadResult(
-                graph_message_id="",
-                bytes_uploaded=len(raw),
-                via="mime+move(no-id)",
-            )
-
-        move_path = f"/users/{quote(self._mailbox)}/messages/{draft_id}/move"
-        mv = self._graph.post(
-            move_path,
-            json={"destinationId": folder_id},
-            expect_status=(200, 201),
-            app_id=app_id,
-        )
-        moved = mv.json() if mv.content else {}
-        # Move returns the moved message; its id is regenerated.
-        msg_id = moved.get("id", draft_id)
-
-        if msg_id and date_props:
-            self._patch_dates(msg_id, date_props, app_id=app_id)
-
-        return UploadResult(
-            graph_message_id=msg_id,
-            bytes_uploaded=len(raw),
-            via="mime+move",
+        return self._upload_via_create_then_attach(
+            raw, folder_id, date_props=date_props, app_id=app_id
         )
 
     def _patch_dates(
@@ -237,33 +182,56 @@ class MessageUploader:
         message_doc = {k: v for k, v in message_doc.items() if v not in (None, [], "", {})}
 
         path = f"/users/{quote(self._mailbox)}/mailFolders/{folder_id}/messages"
+        # Two-tier fallback that preserves the no-draft invariant:
+        #   1. create with msg_flags + date props together
+        #   2. on 400, retry with msg_flags ONLY (drop date props -- some tenants
+        #      reject server-managed PR_CREATION_TIME / PR_LAST_MODIFICATION_TIME),
+        #      then PATCH the dates after.
+        # We never fall back to "create with no extended props"; that path used to
+        # let the message exist as a draft until a follow-up PATCH cleared the
+        # flag, and the PATCH is unreliable on locked-down tenants.
+        msg_flags_only = [p for p in date_props if p["id"] == PROP_MESSAGE_FLAGS]
+        date_only_props = [p for p in date_props if p["id"] != PROP_MESSAGE_FLAGS]
         create_with_dates_failed = False
         try:
             resp = self._graph.post(path, json=message_doc, expect_status=(201,), app_id=app_id)
         except GraphError as e:
-            if e.status == 400 and "singleValueExtendedProperties" in message_doc:
-                self._log.debug("Create-with-dates rejected; retrying without and PATCHing after")
+            if e.status == 400 and date_only_props and msg_flags_only:
+                self._log.debug(
+                    "Create-with-dates rejected; retrying with msg_flags only and PATCHing dates after"
+                )
                 create_with_dates_failed = True
-                fallback_doc = {k: v for k, v in message_doc.items() if k != "singleValueExtendedProperties"}
+                fallback_doc = dict(message_doc)
+                fallback_doc["singleValueExtendedProperties"] = msg_flags_only
                 resp = self._graph.post(path, json=fallback_doc, expect_status=(201,), app_id=app_id)
             else:
                 raise
         msg_id = resp.json()["id"]
-        if create_with_dates_failed and date_props:
-            self._patch_dates(msg_id, date_props, app_id=app_id)  # best-effort
+        if create_with_dates_failed and date_only_props:
+            self._patch_dates(msg_id, date_only_props, app_id=app_id)  # best-effort
 
         attached_bytes = 0
         for part in parsed.walk():
             if part.is_multipart():
                 continue
             payload = part.get_payload(decode=True) or b""
-            if not payload or part.get_content_disposition() not in ("attachment", "inline"):
+            disp = part.get_content_disposition()
+            content_id = (part.get("Content-ID") or "").strip("<> \t")
+            # An inline image can be marked either with Content-Disposition:
+            # inline OR by simply having a Content-ID that the HTML body
+            # references via cid:. Treat both as inline so OWA links the
+            # <img src="cid:..."> to the attachment instead of showing a
+            # broken-image placeholder beside a separate downloadable copy.
+            is_inline = disp == "inline" or bool(content_id)
+            if not payload or (disp not in ("attachment", "inline") and not content_id):
                 continue
             attached_bytes += self._upload_attachment(
                 msg_id,
-                filename=part.get_filename() or "attachment.bin",
+                filename=part.get_filename() or ("image.bin" if is_inline else "attachment.bin"),
                 content_bytes=payload,
                 content_type=part.get_content_type(),
+                content_id=content_id or None,
+                is_inline=is_inline,
                 app_id=app_id,
             )
 
@@ -274,18 +242,32 @@ class MessageUploader:
         )
 
     def _upload_attachment(
-        self, msg_id: str, filename: str, content_bytes: bytes, content_type: str, *, app_id: str
+        self,
+        msg_id: str,
+        filename: str,
+        content_bytes: bytes,
+        content_type: str,
+        *,
+        content_id: str | None = None,
+        is_inline: bool = False,
+        app_id: str,
     ) -> int:
         if len(content_bytes) <= self._threshold:
+            attachment: dict[str, object] = {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": filename[:255],
+                "contentType": content_type,
+                "contentBytes": base64.b64encode(content_bytes).decode("ascii"),
+                "isInline": is_inline,
+            }
+            if content_id:
+                # Graph stores contentId as the bare token (no <>); the
+                # parser already stripped angle brackets above.
+                attachment["contentId"] = content_id
             path = f"/users/{quote(self._mailbox)}/messages/{msg_id}/attachments"
             self._graph.post(
                 path,
-                json={
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": filename[:255],
-                    "contentType": content_type,
-                    "contentBytes": base64.b64encode(content_bytes).decode("ascii"),
-                },
+                json=attachment,
                 expect_status=(201,),
                 app_id=app_id,
             )
@@ -293,16 +275,18 @@ class MessageUploader:
 
         # Large attachment: open upload session, chunk-upload via PUT.
         session_path = f"/users/{quote(self._mailbox)}/messages/{msg_id}/attachments/createUploadSession"
+        attachment_item: dict[str, object] = {
+            "attachmentType": "file",
+            "name": filename[:255],
+            "size": len(content_bytes),
+            "contentType": content_type,
+            "isInline": is_inline,
+        }
+        if content_id:
+            attachment_item["contentId"] = content_id
         resp = self._graph.post(
             session_path,
-            json={
-                "AttachmentItem": {
-                    "attachmentType": "file",
-                    "name": filename[:255],
-                    "size": len(content_bytes),
-                    "contentType": content_type,
-                }
-            },
+            json={"AttachmentItem": attachment_item},
             expect_status=(201, 200),
             app_id=app_id,
         )
