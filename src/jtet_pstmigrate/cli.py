@@ -45,12 +45,22 @@ def _filter_mapping(
     *,
     mailboxes: list[str] | None,
     pst_names: list[str] | None,
+    exclude_mailboxes: list[str] | None = None,
+    exclude_pst_names: list[str] | None = None,
     limit: int | None,
 ) -> list[MappingRow]:
-    """Apply selection filters in order: mailbox match, PST filename match, then row-count limit.
+    """Apply selection filters in order:
 
-    UPN matching is case-insensitive (M365 UPNs aren't case-sensitive).
-    PST name matching uses substring on the file basename, also case-insensitive.
+      1. ``mailboxes``  -- include only these (UPN exact match, case-insensitive)
+      2. ``pst_names``  -- include only PSTs whose filename contains one of these
+                           (substring, case-insensitive)
+      3. ``exclude_mailboxes`` -- drop these UPNs (exact match, case-insensitive)
+      4. ``exclude_pst_names`` -- drop PSTs matching these substrings
+      5. ``limit`` -- after all filtering, take only the first N rows
+
+    Excludes win over includes: ``-M user@x -X user@x`` returns nothing.
+    Excludes work on their own too -- you don't have to pass any include
+    filter, just ``-X user@x`` to "everything except this user".
     """
     selected = list(rows)
 
@@ -68,6 +78,26 @@ def _filter_mapping(
         selected = [
             r for r in selected
             if any(n in r.pst_path.name.lower() for n in needles)
+        ]
+
+    if exclude_mailboxes:
+        unwanted = {m.strip().lower() for m in exclude_mailboxes if m and m.strip()}
+        before = {r.target_mailbox.lower() for r in selected}
+        selected = [r for r in selected if r.target_mailbox.lower() not in unwanted]
+        # Warn about excludes that didn't actually match anything in scope --
+        # usually means a typo in the UPN.
+        no_op_excludes = unwanted - before
+        if no_op_excludes:
+            console.print(
+                f"[yellow]Warning:[/] --exclude-mailbox had no effect for: "
+                f"{', '.join(sorted(no_op_excludes))}"
+            )
+
+    if exclude_pst_names:
+        needles = [p.strip().lower() for p in exclude_pst_names if p and p.strip()]
+        selected = [
+            r for r in selected
+            if not any(n in r.pst_path.name.lower() for n in needles)
         ]
 
     if limit is not None and limit > 0:
@@ -108,6 +138,27 @@ PstFilterOpt = Annotated[
     typer.Option(
         "--pst", "-P",
         help="Filter by substring of the PST filename. Repeat for multi-select.",
+    ),
+]
+ExcludeMailboxOpt = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--exclude-mailbox", "-X",
+        help=(
+            "Skip these target mailboxes (UPN). Repeat for multi-select. "
+            "Useful when bulk-running everyone EXCEPT users you've already "
+            "finished. Applied after --mailbox / --pst includes."
+        ),
+    ),
+]
+ExcludePstFilterOpt = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--exclude-pst",
+        help=(
+            "Skip PSTs whose filename contains any of these substrings. "
+            "Repeat for multi-select."
+        ),
     ),
 ]
 LimitOpt = Annotated[
@@ -207,12 +258,15 @@ def validate(
     mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
     mailbox: MailboxOpt = None,
     pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
     limit: LimitOpt = None,
 ) -> None:
     """Check prerequisites: readpst, config, mapping CSV, Graph token, mailboxes.
 
-    Selection flags (mailbox/pst/limit) restrict the resolvability check to only
-    the rows you intend to run, so you can pre-flight a single mailbox quickly.
+    Selection flags (mailbox/pst/exclude-mailbox/exclude-pst/limit) restrict the
+    resolvability check to only the rows you intend to run, so you can pre-flight
+    a single mailbox quickly or skip mailboxes you've already finished.
     """
     cfg = _load(config)
     configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=f"validate_{_run_id()}")
@@ -232,7 +286,14 @@ def validate(
     rows: list[MappingRow] = []
     try:
         all_rows = load_mapping(mapping)
-        rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=limit)
+        rows = _filter_mapping(
+            all_rows,
+            mailboxes=mailbox,
+            pst_names=pst,
+            exclude_mailboxes=exclude_mailbox,
+            exclude_pst_names=exclude_pst,
+            limit=limit,
+        )
         suffix = f" (filtered from {len(all_rows)})" if len(rows) != len(all_rows) else ""
         table.add_row("mapping CSV parses", f"[green]OK[/] {len(rows)} rows{suffix}")
     except Exception as e:
@@ -301,6 +362,8 @@ def run_import(
     mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
     mailbox: MailboxOpt = None,
     pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
     limit: LimitOpt = None,
     list_only: ListOnlyOpt = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
@@ -311,6 +374,7 @@ def run_import(
 
       Single mailbox:    pstmigrate import -c c.toml -m m.csv -M emmak@contoso.onmicrosoft.com
       Several mailboxes: pstmigrate import -c c.toml -m m.csv -M a@x -M b@x -M c@x
+      Skip finished:     pstmigrate import -c c.toml -m m.csv -X tinad@x -X allyson@x
       Just a canary:     pstmigrate import -c c.toml -m m.csv -n 1
       One PST file:      pstmigrate import -c c.toml -m m.csv -P jsmith.pst
       Preview selection: pstmigrate import -c c.toml -m m.csv -M a@x --list
@@ -324,7 +388,14 @@ def run_import(
         console.print("[red]Empty mapping CSV[/]")
         raise typer.Exit(1)
 
-    rows = _filter_mapping(all_rows, mailboxes=mailbox, pst_names=pst, limit=limit)
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=limit,
+    )
     if not rows:
         console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
         raise typer.Exit(1)
@@ -361,6 +432,696 @@ def run_import(
 
     failed = sum(1 for r in reports if r.status != "done" or r.items_failed)
     raise typer.Exit(1 if failed else 0)
+
+
+@app.command("import-calendar")
+def run_import_calendar(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
+    limit: LimitOpt = None,
+    list_only: ListOnlyOpt = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Import calendar appointments from PSTs into each mailbox's default calendar.
+
+    This is a separate pass from ``import`` (mail). It uses the same mapping
+    CSV but extracts only appointments via ``readpst -t a`` into a sibling
+    work directory, so re-running it doesn't invalidate or trigger a re-run
+    of the mail extraction. State for calendar items lives in the
+    ``non_mail_items`` table, which is independent of the ``messages``
+    dedupe table -- so a calendar UID and a mail Message-ID can never
+    collide and a 'done' calendar event won't be re-uploaded if you also
+    re-run ``import``.
+
+    All events go into the user's default calendar; sub-calendar structure
+    inside the PST (custom calendars the user kept) is flattened. Recurring
+    series become single-occurrence events for v1; the original RRULE text
+    is preserved in the event body so no data is silently dropped.
+    """
+    cfg = _load(config)
+    run_id = f"import-calendar_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=limit,
+    )
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    if list_only or len(rows) != len(all_rows):
+        _print_selection(
+            rows,
+            heading=("Dry-run selection (calendar)" if list_only else "Selected rows (calendar, filtered)"),
+        )
+    if list_only:
+        raise typer.Exit(0)
+
+    pool = AppPool(cfg.apps)
+    filter_note = (
+        f"  selection = {len(rows)}/{len(all_rows)} rows (filtered)\n"
+        if len(rows) != len(all_rows) else ""
+    )
+    console.print(
+        f"\n[bold]About to import calendar items[/] from {len(rows)} PSTs "
+        f"into {len({r.target_mailbox for r in rows})} mailbox calendar(s).\n"
+        f"{filter_note}"
+        f"  app pool = {len(pool)} ({', '.join(pool.names)})\n"
+        f"  workers/mailbox = {cfg.migration.workers_per_mailbox}\n"
+        f"  parallel mailboxes = {cfg.migration.max_parallel_mailboxes}\n"
+        f"  state dir = {cfg.paths.state_dir}\n"
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+    orch = Orchestrator(cfg, state, pool)
+    reports = orch.run_calendar(rows)
+
+    failed = sum(1 for r in reports if r.status != "done" or r.items_failed)
+    raise typer.Exit(1 if failed else 0)
+
+
+@app.command("purge-calendar")
+def run_purge_calendar(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Delete previously-imported calendar events and clear their state.
+
+    Use this when a calendar-import bug needs to be re-run cleanly: after
+    purge, the next ``import-calendar`` re-uploads every event from
+    scratch with the corrected code path. Mail state is untouched.
+
+    The purge is keyed on (mailbox, pst_path) just like ``import-calendar``,
+    so you can scope to a single mailbox/PST while you iterate on a fix
+    and leave other mailboxes alone.
+    """
+    cfg = _load(config)
+    run_id = f"purge-calendar_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=None,
+    )
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+    pool = AppPool(cfg.apps)
+
+    # Show the user what we're about to wipe before doing it.
+    total = 0
+    for row in rows:
+        items = state.list_done_items(row.target_mailbox, str(row.pst_path), "event")
+        if items:
+            console.print(
+                f"  {row.target_mailbox} | {row.pst_path.name}: "
+                f"[yellow]{len(items)}[/] event(s) to purge"
+            )
+            total += len(items)
+
+    if total == 0:
+        console.print("[green]Nothing to purge.[/] No 'done' calendar rows for the selected scope.")
+        raise typer.Exit(0)
+
+    console.print(
+        f"\n[bold red]About to DELETE {total} calendar event(s) from Graph[/] "
+        f"and remove their state rows.\n"
+        f"This is irreversible -- the events will be gone from the destination "
+        f"mailbox and ``import-calendar`` will re-create them from the PST extract."
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    from jtet_pstmigrate.orchestrator import Orchestrator
+    orch = Orchestrator(cfg, state, pool)
+    deleted, missing, errors = orch.purge_calendar(rows)
+
+    console.print(
+        f"\n[bold]Purge complete:[/] "
+        f"deleted=[green]{deleted}[/]  "
+        f"already-gone=[yellow]{missing}[/]  "
+        f"errors=[red]{errors}[/]"
+    )
+    raise typer.Exit(1 if errors else 0)
+
+
+@app.command("import-contacts")
+def run_import_contacts(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
+    limit: LimitOpt = None,
+    list_only: ListOnlyOpt = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Import contacts from PSTs into each mailbox's default contact folder.
+
+    Separate pass from ``import`` (mail) and ``import-calendar``. Uses the
+    same mapping CSV but extracts only contacts via ``readpst -t c`` into a
+    sibling work directory (``__contacts``), so re-running it doesn't
+    invalidate or trigger the mail/calendar extractions. State for contact
+    items lives in the ``non_mail_items`` table with ``item_type='contact'``,
+    keyed by vCard UID (or FN+email when no UID is present).
+
+    All contacts go into the user's default contact folder; sub-folder
+    structure inside the PST is flattened. Required Graph permission:
+    ``Contacts.ReadWrite`` (Application) on every app in the pool, with
+    admin consent. A 403 here means a worker app is missing that grant.
+    """
+    cfg = _load(config)
+    run_id = f"import-contacts_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=limit,
+    )
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    if list_only or len(rows) != len(all_rows):
+        _print_selection(
+            rows,
+            heading=("Dry-run selection (contacts)" if list_only else "Selected rows (contacts, filtered)"),
+        )
+    if list_only:
+        raise typer.Exit(0)
+
+    pool = AppPool(cfg.apps)
+    filter_note = (
+        f"  selection = {len(rows)}/{len(all_rows)} rows (filtered)\n"
+        if len(rows) != len(all_rows) else ""
+    )
+    console.print(
+        f"\n[bold]About to import contacts[/] from {len(rows)} PSTs "
+        f"into {len({r.target_mailbox for r in rows})} mailbox contact folder(s).\n"
+        f"{filter_note}"
+        f"  app pool = {len(pool)} ({', '.join(pool.names)})\n"
+        f"  workers/mailbox = {cfg.migration.workers_per_mailbox}\n"
+        f"  parallel mailboxes = {cfg.migration.max_parallel_mailboxes}\n"
+        f"  state dir = {cfg.paths.state_dir}\n"
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+    orch = Orchestrator(cfg, state, pool)
+    reports = orch.run_contacts(rows)
+
+    failed = sum(1 for r in reports if r.status != "done" or r.items_failed)
+    raise typer.Exit(1 if failed else 0)
+
+
+@app.command("purge-contacts")
+def run_purge_contacts(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Delete previously-imported contacts and clear their state.
+
+    Use this when a contacts-import bug needs a clean re-run: after purge,
+    the next ``import-contacts`` re-uploads every contact from scratch with
+    the corrected code path. Mail and calendar state are untouched.
+    """
+    cfg = _load(config)
+    run_id = f"purge-contacts_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=None,
+    )
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+    pool = AppPool(cfg.apps)
+
+    total = 0
+    for row in rows:
+        items = state.list_done_items(row.target_mailbox, str(row.pst_path), "contact")
+        if items:
+            console.print(
+                f"  {row.target_mailbox} | {row.pst_path.name}: "
+                f"[yellow]{len(items)}[/] contact(s) to purge"
+            )
+            total += len(items)
+
+    if total == 0:
+        console.print("[green]Nothing to purge.[/] No 'done' contact rows for the selected scope.")
+        raise typer.Exit(0)
+
+    console.print(
+        f"\n[bold red]About to DELETE {total} contact(s) from Graph[/] "
+        f"and remove their state rows.\n"
+        f"This is irreversible -- the contacts will be gone from the destination "
+        f"mailbox and ``import-contacts`` will re-create them from the PST extract."
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    from jtet_pstmigrate.orchestrator import Orchestrator
+    orch = Orchestrator(cfg, state, pool)
+    deleted, missing, errors = orch.purge_contacts(rows)
+
+    console.print(
+        f"\n[bold]Purge complete:[/] "
+        f"deleted=[green]{deleted}[/]  "
+        f"already-gone=[yellow]{missing}[/]  "
+        f"errors=[red]{errors}[/]"
+    )
+    raise typer.Exit(1 if errors else 0)
+
+
+@app.command("purge-mail")
+def run_purge_mail(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Wipe every mail folder + message in the selected mailboxes (except Deleted Items).
+
+    Walks ``/users/{upn}/mailFolders`` top-down for each target
+    mailbox. For every folder it tries ``DELETE
+    /users/{upn}/mailFolders/{id}``: on success Graph cascades the
+    entire subtree -- every message and every child folder beneath
+    that folder -- in a single round-trip. For "distinguished" folders
+    that Exchange refuses to delete (Inbox, Sent Items, Drafts,
+    Outbox, Junk Email, Conversation History, ...), it falls back to
+    recursing into their children and draining their own messages
+    with parallel per-message DELETE.
+
+    Net result: after this command runs, the only folders left are
+    the ones Exchange protects (and Deleted Items), and they are all
+    empty. The mailbox is ready for a clean re-import that recreates
+    whatever folder structure your PST had.
+
+    Does NOT consult the local state database. The destination
+    mailbox is the sole source of truth, so this works equally well
+    after ``reset-state``, after a botched run, or against a mailbox
+    you never imported into with this tool. Calendar and contact
+    items are untouched.
+
+    Mailboxes are de-duplicated, so multiple PST rows for the same
+    UPN only wipe the mailbox once.
+
+    Required Graph permission: ``Mail.ReadWrite`` (Application) on
+    every app in the pool -- already required by ``import``, so this
+    command needs no extra admin grants.
+
+    Bulk usage (everyone except the pilot mailboxes you've already
+    finished):
+
+      pstmigrate purge-mail -c c.toml -m m.csv \
+          -X tinad@x -X allysonp@x -X debbiep@x -y
+    """
+    cfg = _load(config)
+    run_id = f"purge-mail_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=None,
+    )
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+    pool = AppPool(cfg.apps)
+
+    # De-dup mailboxes for the confirmation prompt; the orchestrator
+    # also de-dups internally.
+    seen: set[str] = set()
+    unique_mailboxes: list[str] = []
+    for row in rows:
+        key = row.target_mailbox.lower()
+        if key not in seen:
+            seen.add(key)
+            unique_mailboxes.append(row.target_mailbox)
+
+    console.print(
+        f"\n[bold red]About to wipe all mail folders + messages[/] "
+        f"(except Deleted Items) from {len(unique_mailboxes)} "
+        f"mailbox(es):"
+    )
+    for mb in unique_mailboxes:
+        console.print(f"  - {mb}")
+    console.print(
+        f"\n  Custom folders are cascade-deleted (folder + all "
+        f"contents in one round-trip).\n"
+        f"  Distinguished folders (Inbox / Sent Items / Drafts / "
+        f"Outbox / Junk Email / etc.) cannot be deleted; their "
+        f"messages are drained instead.\n"
+        f"  app pool = {len(pool)} ({', '.join(pool.names)})\n"
+        f"  workers/mailbox = {cfg.migration.workers_per_mailbox}\n"
+        f"  parallel mailboxes = {cfg.migration.max_parallel_mailboxes}\n"
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    from jtet_pstmigrate.orchestrator import Orchestrator
+    orch = Orchestrator(cfg, state, pool)
+    deleted, missing, errors = orch.purge_mail(rows)
+
+    console.print(
+        f"\n[bold]Mail purge complete:[/] "
+        f"deleted=[green]{deleted}[/]  "
+        f"already-gone=[yellow]{missing}[/]  "
+        f"errors=[red]{errors}[/]"
+    )
+    raise typer.Exit(1 if errors else 0)
+
+
+@app.command("import-all")
+def run_import_all(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
+    limit: LimitOpt = None,
+    list_only: ListOnlyOpt = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Run mail + calendar + contacts back-to-back for the selected mailboxes.
+
+    Equivalent to running ``import`` then ``import-calendar`` then
+    ``import-contacts`` with the same mapping and filters, but with one
+    confirmation prompt and one consolidated exit code.
+
+    The three phases share state but run independently: a mail failure on
+    one mailbox does not skip that mailbox's calendar or contacts. Each
+    phase is also idempotent against the existing dedup tables, so running
+    this against a partly-imported mailbox safely no-ops the parts that
+    already finished.
+
+    Use this for production/bulk runs once the per-pass commands have
+    been verified on a pilot mailbox. For iterative debugging keep using
+    the dedicated subcommands -- those produce the same state, just with
+    smaller blast radius if something goes wrong.
+
+    Bulk-run example, skipping users that are already done:
+
+      pstmigrate import-all -c c.toml -m m.csv \
+          -X tinad@contoso.onmicrosoft.com \
+          -X allysonp@contoso.onmicrosoft.com -y
+    """
+    cfg = _load(config)
+    run_id = f"import-all_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=limit,
+    )
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    if list_only or len(rows) != len(all_rows):
+        _print_selection(
+            rows,
+            heading=("Dry-run selection (mail + calendar + contacts)"
+                     if list_only else
+                     "Selected rows (mail + calendar + contacts, filtered)"),
+        )
+    if list_only:
+        raise typer.Exit(0)
+
+    pool = AppPool(cfg.apps)
+    filter_note = (
+        f"  selection = {len(rows)}/{len(all_rows)} rows (filtered)\n"
+        if len(rows) != len(all_rows) else ""
+    )
+    console.print(
+        f"\n[bold]About to import MAIL + CALENDAR + CONTACTS[/] "
+        f"from {len(rows)} PSTs into "
+        f"{len({r.target_mailbox for r in rows})} mailbox(es).\n"
+        f"{filter_note}"
+        f"  app pool = {len(pool)} ({', '.join(pool.names)})\n"
+        f"  workers/mailbox = {cfg.migration.workers_per_mailbox}\n"
+        f"  parallel mailboxes = {cfg.migration.max_parallel_mailboxes}\n"
+        f"  state dir = {cfg.paths.state_dir}\n"
+        f"\n"
+        f"Required Graph Application permissions on every app in the pool:\n"
+        f"  - Mail.ReadWrite      (mail phase)\n"
+        f"  - Calendars.ReadWrite (calendar phase)\n"
+        f"  - Contacts.ReadWrite  (contacts phase)\n"
+        f"A 403 in any phase usually means a worker app is missing the\n"
+        f"corresponding grant. The other phases will still run.\n"
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+    orch = Orchestrator(cfg, state, pool)
+
+    # Phases run sequentially because each builds its own GraphClient and
+    # ThreadPoolExecutor; running them concurrently would just multiply
+    # per-mailbox throttling pressure without finishing any faster on a
+    # single tenant. We deliberately do NOT short-circuit the next phase
+    # when the previous one has failures -- mail and calendar/contacts
+    # are independent in the source PST, and if one phase has bad data
+    # we still want the others to land.
+    console.print("\n[bold cyan]Phase 1/3 -- mail[/]")
+    mail_reports = orch.run(rows)
+
+    console.print("\n[bold cyan]Phase 2/3 -- calendar[/]")
+    cal_reports = orch.run_calendar(rows)
+
+    console.print("\n[bold cyan]Phase 3/3 -- contacts[/]")
+    con_reports = orch.run_contacts(rows)
+
+    def _failed(reports: list) -> int:
+        return sum(1 for r in reports if r.status != "done" or r.items_failed)
+
+    failed = _failed(mail_reports) + _failed(cal_reports) + _failed(con_reports)
+
+    console.print(
+        f"\n[bold]All phases complete.[/]  "
+        f"mail-failed=[red]{_failed(mail_reports)}[/]  "
+        f"calendar-failed=[red]{_failed(cal_reports)}[/]  "
+        f"contacts-failed=[red]{_failed(con_reports)}[/]"
+    )
+    raise typer.Exit(1 if failed else 0)
+
+
+@app.command("reset-state")
+def run_reset_state(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m")] = ...,  # type: ignore[assignment]
+    mailbox: MailboxOpt = None,
+    pst: PstFilterOpt = None,
+    exclude_mailbox: ExcludeMailboxOpt = None,
+    exclude_pst: ExcludePstFilterOpt = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Clear local dedup/run state for the selected scope. Does NOT touch Graph.
+
+    Wipes the matching rows from these tables in ``state.sqlite``:
+      - ``messages``        (mail dedup keyed by Message-ID)
+      - ``non_mail_items``  (calendar/contacts dedup keyed by UID/FN+email)
+      - ``pst_runs``        (per-mailbox-per-PST run history)
+      - ``folder_map``      (cached Graph folder IDs per mailbox)
+
+    [bold red]DANGER:[/] this only clears LOCAL state. Items already
+    uploaded to Graph stay where they are. Running ``import`` /
+    ``import-calendar`` / ``import-contacts`` / ``import-all`` afterwards
+    WILL upload everything again, which means duplicate emails, calendar
+    events, and contacts in the destination mailbox -- the dedup tables
+    are how we prevent that, and you just emptied them.
+
+    Intended for: starting from scratch after manually clearing the
+    destination mailboxes (mailbox reset, delete-and-recreate, manual
+    purge in OWA, etc.). For a safe reset that also removes items from
+    Graph, use ``purge-calendar`` / ``purge-contacts`` instead -- there's
+    no equivalent for mail because mail-purge of large mailboxes is
+    expensive (one DELETE per message); if you need that, do it on the
+    Exchange side and then run this to clear local tracking.
+
+    Default scope is every row in the mapping CSV. Narrow with
+    ``--mailbox`` / ``--pst`` to reset specific users, or use
+    ``--exclude-mailbox`` / ``--exclude-pst`` to reset everyone EXCEPT
+    a few -- handy when you've finished a couple of pilot users and
+    want to clear local state for the rest before a bulk re-run.
+    """
+    cfg = _load(config)
+    run_id = f"reset-state_{_run_id()}"
+    configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=run_id)
+
+    all_rows = load_mapping(mapping)
+    if not all_rows:
+        console.print("[red]Empty mapping CSV[/]")
+        raise typer.Exit(1)
+
+    rows = _filter_mapping(
+        all_rows,
+        mailboxes=mailbox,
+        pst_names=pst,
+        exclude_mailboxes=exclude_mailbox,
+        exclude_pst_names=exclude_pst,
+        limit=None,
+    )
+    if not rows:
+        console.print("[red]Selection produced 0 rows. Nothing to do.[/]")
+        raise typer.Exit(1)
+
+    state = StateStore(cfg.paths.state_dir / "state.sqlite")
+
+    # Show the user what we're about to wipe before doing it.
+    total = {"messages": 0, "non_mail_items": 0, "pst_runs": 0, "folder_map": 0}
+    affected_mailboxes: set[str] = set()
+    per_row_counts: list[tuple[str, str, dict[str, int]]] = []
+    for row in rows:
+        counts = state.count_scope(row.target_mailbox, str(row.pst_path))
+        if any(counts.values()):
+            per_row_counts.append((row.target_mailbox, row.pst_path.name, counts))
+        for k, v in counts.items():
+            total[k] += v
+        affected_mailboxes.add(row.target_mailbox)
+
+    folder_total = sum(state.count_folder_map(m) for m in affected_mailboxes)
+    total["folder_map"] = folder_total
+
+    if not any(total.values()):
+        console.print("[green]Nothing to reset.[/] No state rows for the selected scope.")
+        raise typer.Exit(0)
+
+    if per_row_counts:
+        table = Table(title="Rows to clear (per mapping row)")
+        table.add_column("Mailbox", overflow="fold")
+        table.add_column("PST", overflow="fold")
+        table.add_column("messages", justify="right")
+        table.add_column("non_mail_items", justify="right")
+        table.add_column("pst_runs", justify="right")
+        for mbx, pst_name, c in per_row_counts:
+            table.add_row(
+                mbx, pst_name,
+                str(c["messages"]), str(c["non_mail_items"]), str(c["pst_runs"]),
+            )
+        console.print(table)
+    if folder_total:
+        console.print(
+            f"\nfolder_map cache: [yellow]{folder_total}[/] row(s) "
+            f"across {len(affected_mailboxes)} mailbox(es) (safe to drop -- "
+            f"folder lookups will re-resolve via Graph on the next import)."
+        )
+
+    console.print(
+        f"\n[bold red]About to WIPE local state[/] for "
+        f"{len(rows)} mapping row(s) "
+        f"({len(affected_mailboxes)} mailbox(es)):\n"
+        f"  messages       = {total['messages']}\n"
+        f"  non_mail_items = {total['non_mail_items']}\n"
+        f"  pst_runs       = {total['pst_runs']}\n"
+        f"  folder_map     = {total['folder_map']}\n"
+        f"\n"
+        f"[red]Items already uploaded to Graph remain in the destination "
+        f"mailboxes.[/] Re-running an import after this WILL create "
+        f"duplicates unless you've separately cleared the destination side."
+    )
+    if not yes and not typer.confirm("Proceed?", default=False):
+        raise typer.Exit(0)
+
+    cleared = {"messages": 0, "non_mail_items": 0, "pst_runs": 0, "folder_map": 0}
+    for row in rows:
+        result = state.clear_scope(row.target_mailbox, str(row.pst_path))
+        for k, v in result.items():
+            cleared[k] += v
+    for m in affected_mailboxes:
+        cleared["folder_map"] += state.clear_folder_map(m)
+
+    console.print(
+        f"\n[bold]Reset complete:[/]  "
+        f"messages=[yellow]{cleared['messages']}[/]  "
+        f"non_mail_items=[yellow]{cleared['non_mail_items']}[/]  "
+        f"pst_runs=[yellow]{cleared['pst_runs']}[/]  "
+        f"folder_map=[yellow]{cleared['folder_map']}[/]"
+    )
 
 
 @app.command()
