@@ -62,6 +62,17 @@ from jtet_pstmigrate.state import StateStore
 from jtet_pstmigrate.uploader import MessageUploader
 
 
+def _folder_is_graph_deleted_items(folder: dict) -> bool:
+    """True when Graph marks this folder as the mailbox Deleted Items well-known folder.
+
+    Relying only on ``GET .../mailFolders/deleteditems`` is unsafe: if that call
+    fails (throttle, transient error, permission), we must still never cascade-
+    delete or drain the real Deleted Items subtree.
+    """
+    wkn = (folder.get("wellKnownFolderName") or "").strip().lower()
+    return wkn == "deleteditems"
+
+
 @dataclasses.dataclass
 class RunReport:
     pst_path: Path
@@ -735,6 +746,9 @@ class Orchestrator:
             """Try to cascade-delete ``folder``; otherwise recurse + drain."""
             nonlocal msg_deleted, msg_errors, folder_deleted
             fid = folder["id"]
+            if _folder_is_graph_deleted_items(folder):
+                skip_folder_ids.add(fid)
+                return
             if fid in skip_folder_ids:
                 return
             display = folder.get("displayName", "?")
@@ -778,7 +792,8 @@ class Orchestrator:
                 for child in _enum(
                     f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
                     f"?$top=100"
-                    f"&$select=id,displayName,totalItemCount,childFolderCount"
+                    f"&$select=id,displayName,totalItemCount,childFolderCount,"
+                    f"wellKnownFolderName"
                 ):
                     _walk(child)
             if total > 0:
@@ -787,7 +802,8 @@ class Orchestrator:
         top = _enum(
             f"/users/{upn}/mailFolders"
             f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
+            f"&$select=id,displayName,totalItemCount,childFolderCount,"
+            f"wellKnownFolderName"
         )
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
