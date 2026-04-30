@@ -657,16 +657,21 @@ class Orchestrator:
             )
             skip_folder_ids.add(resp.json()["id"])
         except Exception as e:
-            log.warning(
-                "could not resolve deleteditems folder id: {} -- "
-                "continuing without skip", e,
+            # Never drain or recurse without knowing Deleted Items — if this
+            # GET fails, "_walk" would treat Deleted Items like any protected
+            # root folder and DELETE every message inside it (data loss).
+            log.error(
+                "could not resolve deleteditems folder id (aborting this mailbox): {}",
+                e,
             )
+            return (0, 0, 1)
 
         # Aggregated counters (closure-mutated by helpers below).
         msg_deleted = 0
         msg_missing = 0
         msg_errors = 0
         folder_deleted = 0
+        counter_lock = threading.Lock()
 
         def _strip_host(url: str | None) -> str | None:
             if url and url.startswith("https://graph.microsoft.com/v1.0"):
@@ -724,18 +729,23 @@ class Orchestrator:
                 max_workers=workers, thread_name_prefix="purge-mail-msg"
             ) as p:
                 for outcome in p.map(_delete_message, ids):
-                    if outcome == "deleted":
-                        msg_deleted += 1
-                    elif outcome == "missing":
-                        msg_missing += 1
-                    else:
-                        msg_errors += 1
+                    with counter_lock:
+                        if outcome == "deleted":
+                            msg_deleted += 1
+                        elif outcome == "missing":
+                            msg_missing += 1
+                        else:
+                            msg_errors += 1
 
         def _walk(folder: dict) -> None:
             """Try to cascade-delete ``folder``; otherwise recurse + drain."""
             nonlocal msg_deleted, msg_errors, folder_deleted
             fid = folder["id"]
             if fid in skip_folder_ids:
+                return
+            # Defense in depth: match well-known folder even if id resolution
+            # differed from enumeration (Graph returns this on mailFolder).
+            if (folder.get("wellKnownName") or "").lower() == "deleteditems":
                 return
             display = folder.get("displayName", "?")
             total = folder.get("totalItemCount", 0) or 0
@@ -778,7 +788,7 @@ class Orchestrator:
                 for child in _enum(
                     f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
                     f"?$top=100"
-                    f"&$select=id,displayName,totalItemCount,childFolderCount"
+                    f"&$select=id,displayName,wellKnownName,totalItemCount,childFolderCount"
                 ):
                     _walk(child)
             if total > 0:
@@ -787,7 +797,7 @@ class Orchestrator:
         top = _enum(
             f"/users/{upn}/mailFolders"
             f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
+            f"&$select=id,displayName,wellKnownName,totalItemCount,childFolderCount"
         )
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
