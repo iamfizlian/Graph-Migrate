@@ -19,6 +19,7 @@ from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 from loguru import logger
@@ -90,6 +91,38 @@ def load_mapping(csv_path: Path) -> list[MappingRow]:
             )
             rows.append(row)
     return rows
+
+
+def _strip_graph_collection_next(url: str | None) -> str | None:
+    if url and url.startswith("https://graph.microsoft.com/v1.0"):
+        return url[len("https://graph.microsoft.com/v1.0"):]
+    return url
+
+
+def graph_enum_collection(
+    graph: GraphClient,
+    initial_path: str,
+    *,
+    log: Any = None,
+) -> tuple[list[dict], bool]:
+    """Follow ``@odata.nextLink`` until exhaustion.
+
+    Returns ``(values, ok)``. ``ok`` is False when any page GET raises before
+    the sequence completes — callers must not interpret ``values == []`` as an
+    empty collection in that case (Graph may be throttled or unreachable).
+    """
+    log = log or logger
+    out: list[dict] = []
+    next_url: str | None = initial_path
+    while next_url:
+        try:
+            body = graph.get(next_url, expect_status=(200,)).json()
+        except Exception as e:
+            log.warning("enum GET failed at {}: {}", next_url, e)
+            return out, False
+        out.extend(body.get("value", []))
+        next_url = _strip_graph_collection_next(body.get("@odata.nextLink"))
+    return out, True
 
 
 class Orchestrator:
@@ -668,27 +701,6 @@ class Orchestrator:
         msg_errors = 0
         folder_deleted = 0
 
-        def _strip_host(url: str | None) -> str | None:
-            if url and url.startswith("https://graph.microsoft.com/v1.0"):
-                return url[len("https://graph.microsoft.com/v1.0"):]
-            return url
-
-        def _enum(path: str) -> list[dict]:
-            """Page through a Graph collection, returning all values."""
-            out: list[dict] = []
-            next_url: str | None = path
-            while next_url:
-                try:
-                    body = graph.get(
-                        next_url, expect_status=(200,)
-                    ).json()
-                except Exception as e:
-                    log.warning("enum GET failed at {}: {}", next_url, e)
-                    return out
-                out.extend(body.get("value", []))
-                next_url = _strip_host(body.get("@odata.nextLink"))
-            return out
-
         def _delete_message(mid: str) -> str:
             try:
                 graph.delete(
@@ -711,13 +723,16 @@ class Orchestrator:
         def _drain_folder_messages(fid: str) -> None:
             """Per-message DELETE for a folder we couldn't cascade-delete."""
             nonlocal msg_deleted, msg_missing, msg_errors
-            ids = [
-                m["id"]
-                for m in _enum(
-                    f"/users/{upn}/mailFolders/{quote(fid)}/messages"
-                    f"?$top=999&$select=id"
-                )
-            ]
+            msgs, msgs_ok = graph_enum_collection(
+                graph,
+                f"/users/{upn}/mailFolders/{quote(fid)}/messages"
+                f"?$top=999&$select=id",
+                log=log,
+            )
+            if not msgs_ok:
+                msg_errors += 1
+                return
+            ids = [m["id"] for m in msgs]
             if not ids:
                 return
             with ThreadPoolExecutor(
@@ -775,20 +790,34 @@ class Orchestrator:
                 return
 
             if kids > 0:
-                for child in _enum(
+                children, ch_ok = graph_enum_collection(
+                    graph,
                     f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
                     f"?$top=100"
-                    f"&$select=id,displayName,totalItemCount,childFolderCount"
-                ):
-                    _walk(child)
+                    f"&$select=id,displayName,totalItemCount,childFolderCount",
+                    log=log,
+                )
+                if not ch_ok:
+                    msg_errors += 1
+                else:
+                    for child in children:
+                        _walk(child)
             if total > 0:
                 _drain_folder_messages(fid)
 
-        top = _enum(
+        top, top_ok = graph_enum_collection(
+            graph,
             f"/users/{upn}/mailFolders"
             f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
+            f"&$select=id,displayName,totalItemCount,childFolderCount",
+            log=log,
         )
+        if not top_ok:
+            log.error(
+                "could not enumerate mailFolders (Graph error/throttle) — "
+                "aborting purge for this mailbox; destination may still contain mail"
+            )
+            return (0, 0, 1)
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
             return (0, 0, 0)
