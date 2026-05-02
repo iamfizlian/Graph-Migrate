@@ -379,10 +379,10 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
         autoescape=select_autoescape(["html"]),
     )
 
-    def render(name: str, **context: Any) -> HTMLResponse:
+    def render(template_name: str, **context: Any) -> HTMLResponse:
         context.setdefault("config_path", config_path)
         context.setdefault("mapping_path", mapping_path)
-        return HTMLResponse(env.get_template(name).render(**context))
+        return HTMLResponse(env.get_template(template_name).render(**context))
 
     def state_queries() -> StateQueries | None:
         try:

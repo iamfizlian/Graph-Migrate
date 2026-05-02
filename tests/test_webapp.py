@@ -93,6 +93,22 @@ async def test_mapping_aware_pages_render_select_options(tmp_path: Path) -> None
         assert "a.pst" in response.text
 
 
+@pytest.mark.anyio
+async def test_log_detail_page_renders_log_file(tmp_path: Path) -> None:
+    config = _config_file(tmp_path)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(exist_ok=True)
+    (log_dir / "run.jsonl").write_text('{"message": "hello"}\n', encoding="utf-8")
+    transport = httpx.ASGITransport(app=create_app(config_path=config, mapping_path=_mapping_file(tmp_path)))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/logs/run.jsonl")
+
+    assert response.status_code == 200
+    assert "run.jsonl" in response.text
+    assert "hello" in response.text
+
+
 def _mapping_file(tmp_path: Path) -> Path:
     pst = tmp_path / "a.pst"
     pst.write_bytes(b"")
