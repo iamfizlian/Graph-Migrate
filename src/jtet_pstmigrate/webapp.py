@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Annotated, Any
@@ -296,7 +297,37 @@ TEMPLATES: dict[str, str] = {
 {% extends "layout.html" %}
 {% block body %}
 <h1>{{ name }}</h1>
-<pre>{{ text }}</pre>
+{% if error %}<p class="bad">{{ error }}</p>{% endif %}
+<section class="grid">
+  <div class="card"><div class="muted">Lines</div><div class="metric">{{ summary.total }}</div></div>
+  <div class="card"><div class="muted">Errors</div><div class="metric bad">{{ summary.errors }}</div></div>
+  <div class="card"><div class="muted">Warnings</div><div class="metric warn">{{ summary.warnings }}</div></div>
+  <div class="card"><div class="muted">Info</div><div class="metric ok">{{ summary.info }}</div></div>
+</section>
+<section class="panel" style="margin-top:16px">
+  <table>
+    <thead><tr><th>Time</th><th>Level</th><th>Context</th><th>Message</th><th>Details</th></tr></thead>
+    <tbody>
+    {% for row in rows %}
+      <tr>
+        <td>{{ row.time }}</td>
+        <td class="{{ row.level_class }}">{{ row.level }}</td>
+        <td>{{ row.context }}</td>
+        <td>{{ row.message }}</td>
+        <td>{% if row.details %}<details><summary>view</summary><pre>{{ row.details }}</pre></details>{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="5" class="muted">No log lines found.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% if raw_text %}
+<section class="panel">
+  <h2>Raw Tail</h2>
+  <pre>{{ raw_text }}</pre>
+</section>
+{% endif %}
 {% endblock %}
 """,
     "job_detail.html": """
@@ -510,7 +541,7 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
         try:
             cfg = load_config(config_path)
         except Exception as e:
-            return render("log_detail.html", name="Logs", text=f"Config is not ready: {e}")
+            return render("log_detail.html", name="Logs", error=f"Config is not ready: {e}", **_empty_log_view())
         logs = []
         if cfg.paths.log_dir.exists():
             for path in sorted(cfg.paths.log_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
@@ -523,11 +554,11 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
         try:
             cfg = load_config(config_path)
         except Exception as e:
-            return render("log_detail.html", name=name, text=f"Config is not ready: {e}")
+            return render("log_detail.html", name=name, error=f"Config is not ready: {e}", **_empty_log_view())
         path = (cfg.paths.log_dir / name).resolve()
         if path.parent != cfg.paths.log_dir.resolve() or not path.exists():
             return HTMLResponse("Log not found", status_code=404)
-        return render("log_detail.html", name=name, text=path.read_text(errors="replace")[-120_000:])
+        return render("log_detail.html", name=name, error="", **_read_log_view(path))
 
     @app.post("/jobs")
     async def submit_job(
@@ -585,6 +616,93 @@ def _load_mapping_for_ui(mapping_path: Path | None) -> list:
         return load_mapping(mapping_path)
     except Exception:
         return []
+
+
+def _empty_log_view() -> dict[str, Any]:
+    return {
+        "summary": {"total": 0, "errors": 0, "warnings": 0, "info": 0},
+        "rows": [],
+        "raw_text": "",
+    }
+
+
+def _read_log_view(path: Path, *, max_lines: int = 500) -> dict[str, Any]:
+    lines = path.read_text(errors="replace").splitlines()
+    tail = lines[-max_lines:]
+    rows = [_parse_log_line(line) for line in tail]
+    summary = {
+        "total": len(lines),
+        "errors": sum(1 for row in rows if row["level"] in {"ERROR", "CRITICAL"}),
+        "warnings": sum(1 for row in rows if row["level"] == "WARNING"),
+        "info": sum(1 for row in rows if row["level"] == "INFO"),
+    }
+    return {"summary": summary, "rows": rows, "raw_text": ""}
+
+
+def _parse_log_line(line: str) -> dict[str, str]:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return {
+            "time": "",
+            "level": "TEXT",
+            "level_class": "",
+            "context": "",
+            "message": line,
+            "details": "",
+        }
+
+    record = payload.get("record") if isinstance(payload, dict) else None
+    if not isinstance(record, dict):
+        return {
+            "time": "",
+            "level": "JSON",
+            "level_class": "",
+            "context": "",
+            "message": str(payload),
+            "details": "",
+        }
+
+    level = _log_level_name(record.get("level"))
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    exception = record.get("exception")
+    details: dict[str, Any] = {}
+    if exception:
+        details["exception"] = exception
+    if extra:
+        details["extra"] = extra
+
+    return {
+        "time": _log_time(record.get("time")),
+        "level": level,
+        "level_class": _log_level_class(level),
+        "context": str(extra.get("ctx") or ""),
+        "message": str(record.get("message") or payload.get("text") or ""),
+        "details": json.dumps(details, indent=2, default=str) if details else "",
+    }
+
+
+def _log_level_name(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("name") or "").upper()
+    return str(value or "").upper()
+
+
+def _log_level_class(level: str) -> str:
+    if level in {"ERROR", "CRITICAL"}:
+        return "bad"
+    if level == "WARNING":
+        return "warn"
+    if level == "INFO":
+        return "ok"
+    return ""
+
+
+def _log_time(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("repr") or value.get("timestamp")
+    text = str(value or "")
+    return text[:19].replace("T", " ")
 
 
 def _config_form_defaults(config_path: Path) -> dict[str, Any]:

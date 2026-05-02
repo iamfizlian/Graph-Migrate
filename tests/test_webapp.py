@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import httpx
@@ -98,7 +99,33 @@ async def test_log_detail_page_renders_log_file(tmp_path: Path) -> None:
     config = _config_file(tmp_path)
     log_dir = tmp_path / "logs"
     log_dir.mkdir(exist_ok=True)
-    (log_dir / "run.jsonl").write_text('{"message": "hello"}\n', encoding="utf-8")
+    (log_dir / "run.jsonl").write_text(
+        json.dumps(
+            {
+                "text": "2026-01-01 00:00:00 | INFO | hello\n",
+                "record": {
+                    "time": {"repr": "2026-01-01T00:00:00+00:00"},
+                    "level": {"name": "INFO"},
+                    "extra": {"ctx": "validate"},
+                    "message": "hello",
+                },
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "record": {
+                    "time": {"repr": "2026-01-01T00:00:01+00:00"},
+                    "level": {"name": "ERROR"},
+                    "extra": {"ctx": "graph"},
+                    "message": "bad thing",
+                    "exception": {"type": "RuntimeError", "value": "boom"},
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     transport = httpx.ASGITransport(app=create_app(config_path=config, mapping_path=_mapping_file(tmp_path)))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -107,6 +134,10 @@ async def test_log_detail_page_renders_log_file(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert "run.jsonl" in response.text
     assert "hello" in response.text
+    assert "bad thing" in response.text
+    assert "validate" in response.text
+    assert "Errors" in response.text
+    assert "<table>" in response.text
 
 
 def _mapping_file(tmp_path: Path) -> Path:
