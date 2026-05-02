@@ -657,10 +657,19 @@ class Orchestrator:
             )
             skip_folder_ids.add(resp.json()["id"])
         except Exception as e:
-            log.warning(
-                "could not resolve deleteditems folder id: {} -- "
-                "continuing without skip", e,
+            # Without this id we cannot skip Deleted Items. The purge walk
+            # treats distinguished folders as DELETE 400/403/405 then drains
+            # messages in place -- which would wipe Deleted Items and remove
+            # mail the user did not intend to touch (and may still need).
+            log.error(
+                "cannot resolve Deleted Items folder (GET .../deleteditems): {}",
+                e,
             )
+            raise RuntimeError(
+                f"purge-mail aborted for {mailbox!r}: could not resolve "
+                "Deleted Items folder id (required to skip that tree). "
+                f"Underlying error: {e}"
+            ) from e
 
         # Aggregated counters (closure-mutated by helpers below).
         msg_deleted = 0
