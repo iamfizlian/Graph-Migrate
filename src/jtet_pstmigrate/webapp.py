@@ -212,10 +212,7 @@ TEMPLATES: dict[str, str] = {
 <section class="panel">
   <form method="post" action="/jobs">
     <input type="hidden" name="kind" value="validate">
-    <div class="row">
-      <div><label>Mailbox</label><input name="mailbox"></div>
-      <div><label>PST filename</label><input name="pst"></div>
-    </div>
+    {% include "mapping_select.html" %}
     <div class="actions"><button>Run Validation</button></div>
   </form>
 </section>
@@ -235,10 +232,7 @@ TEMPLATES: dict[str, str] = {
       <option value="import-contacts">Import contacts</option>
       <option value="import-all">Import all</option>
     </select>
-    <div class="row">
-      <div><label>Mailbox</label><input name="mailbox"></div>
-      <div><label>PST filename</label><input name="pst"></div>
-    </div>
+    {% include "mapping_select.html" %}
     <div class="actions"><button>Start Import</button></div>
   </form>
 </section>
@@ -258,10 +252,7 @@ TEMPLATES: dict[str, str] = {
       <option value="purge-mail">Purge mailbox mail</option>
       <option value="reset-state">Reset local state</option>
     </select>
-    <div class="row">
-      <div><label>Mailbox</label><input name="mailbox"></div>
-      <div><label>PST filename</label><input name="pst"></div>
-    </div>
+    {% include "mapping_select.html" %}
     <label><input type="checkbox" name="confirmed" value="yes" style="width:auto"> I understand this operation is destructive.</label>
     <div class="actions"><button>Run Tool</button></div>
   </form>
@@ -336,6 +327,41 @@ TEMPLATES: dict[str, str] = {
 {% endif %}
 {% if job.result %}<pre>{{ job.result }}</pre>{% endif %}
 """,
+    "mapping_select.html": """
+<div class="row">
+  <div>
+    <label>Mailbox</label>
+    <select name="mailbox">
+      <option value="">All mailboxes ({{ mapping_options.mailboxes|length }})</option>
+      {% for mailbox in mapping_options.mailboxes %}
+        <option value="{{ mailbox }}">{{ mailbox }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label>PST</label>
+    <select name="pst">
+      <option value="">All PSTs ({{ mapping_options.psts|length }})</option>
+      {% for pst in mapping_options.psts %}
+        <option value="{{ pst }}">{{ pst }}</option>
+      {% endfor %}
+    </select>
+  </div>
+</div>
+<p class="muted">Selections come from {{ mapping_path or "mapping.csv" }}. Choose both a mailbox and PST only when you need to target one mapping row.</p>
+{% if mapping_options.rows %}
+<table style="margin-top:10px">
+  <thead><tr><th>Mailbox</th><th>PST</th><th>Exists</th></tr></thead>
+  <tbody>
+  {% for row in mapping_options.rows[:8] %}
+    <tr><td>{{ row.target_mailbox }}</td><td>{{ row.pst_path.name }}</td><td>{{ "yes" if row.pst_path.exists() else "no" }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="warn">No mapping rows loaded yet.</p>
+{% endif %}
+""",
 }
 
 
@@ -370,6 +396,14 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
 
     def jobs_html() -> str:
         return env.get_template("jobs.html").render(jobs=app.state.jobs.latest())
+
+    def mapping_options() -> dict[str, Any]:
+        rows = _load_mapping_for_ui(mapping_path)
+        return {
+            "rows": rows,
+            "mailboxes": sorted({row.target_mailbox for row in rows}),
+            "psts": sorted({row.pst_path.name for row in rows}),
+        }
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard() -> HTMLResponse:
@@ -455,15 +489,15 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
 
     @app.get("/validate", response_class=HTMLResponse)
     async def validate_page() -> HTMLResponse:
-        return render("validate.html", jobs_html=jobs_html())
+        return render("validate.html", jobs_html=jobs_html(), mapping_options=mapping_options())
 
     @app.get("/run", response_class=HTMLResponse)
     async def run_page() -> HTMLResponse:
-        return render("run.html", jobs_html=jobs_html())
+        return render("run.html", jobs_html=jobs_html(), mapping_options=mapping_options())
 
     @app.get("/tools", response_class=HTMLResponse)
     async def tools_page() -> HTMLResponse:
-        return render("tools.html", jobs_html=jobs_html())
+        return render("tools.html", jobs_html=jobs_html(), mapping_options=mapping_options())
 
     @app.get("/status", response_class=HTMLResponse)
     async def status_page() -> HTMLResponse:
@@ -542,6 +576,15 @@ def _mask_config(text: str) -> str:
         else:
             masked.append(line)
     return "\n".join(masked)
+
+
+def _load_mapping_for_ui(mapping_path: Path | None) -> list:
+    if mapping_path is None or not mapping_path.exists():
+        return []
+    try:
+        return load_mapping(mapping_path)
+    except Exception:
+        return []
 
 
 def _config_form_defaults(config_path: Path) -> dict[str, Any]:

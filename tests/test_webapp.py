@@ -74,6 +74,25 @@ async def test_web_config_page_can_create_config(tmp_path: Path) -> None:
     assert "********" in response.text
 
 
+@pytest.mark.anyio
+async def test_mapping_aware_pages_render_select_options(tmp_path: Path) -> None:
+    transport = httpx.ASGITransport(
+        app=create_app(config_path=_config_file(tmp_path), mapping_path=_mapping_file(tmp_path))
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        validate = await client.get("/validate")
+        run = await client.get("/run")
+        tools = await client.get("/tools")
+
+    for response in (validate, run, tools):
+        assert response.status_code == 200
+        assert '<select name="mailbox">' in response.text
+        assert '<select name="pst">' in response.text
+        assert "alice@example.com" in response.text
+        assert "a.pst" in response.text
+
+
 def _mapping_file(tmp_path: Path) -> Path:
     pst = tmp_path / "a.pst"
     pst.write_bytes(b"")
