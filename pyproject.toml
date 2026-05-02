@@ -25,10 +25,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+web = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+]
 dev = [
     "ruff>=0.4",
     "pytest>=8.0",
     "pytest-mock>=3.12",
+    "fastapi>=0.111",
+    "python-multipart>=0.0.9",
 ]
 
 [project.scripts]
@@ -40,6 +48,7 @@ packages = ["src/jtet_pstmigrate"]
 [tool.ruff]
 line-length = 110
 target-version = "py310"
+extend-exclude = ["tools/legacy"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]

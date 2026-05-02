@@ -12,11 +12,14 @@ from rich.console import Console
 from rich.table import Table
 
 from jtet_pstmigrate.auth import AppPool
-from jtet_pstmigrate.config import AppConfig, MappingRow, expand_user_paths
+from jtet_pstmigrate.config import AppConfig, MappingRow
 from jtet_pstmigrate.graph_client import GraphClient
 from jtet_pstmigrate.log import configure_logging
-from jtet_pstmigrate.orchestrator import Orchestrator, load_mapping
+from jtet_pstmigrate.mapping import load_mapping
+from jtet_pstmigrate.orchestrator import Orchestrator
 from jtet_pstmigrate.pst_reader import check_readpst
+from jtet_pstmigrate.selection import SelectionFilters, select_mapping
+from jtet_pstmigrate.services import load_config
 from jtet_pstmigrate.state import StateStore
 
 app = typer.Typer(
@@ -32,8 +35,7 @@ ConfigOpt = Annotated[Path | None, typer.Option("--config", "-c", help="TOML con
 
 
 def _load(config_path: Path | None) -> AppConfig:
-    cfg = AppConfig.load(config_path)
-    return expand_user_paths(cfg)
+    return load_config(config_path)
 
 
 def _run_id() -> str:
@@ -62,48 +64,19 @@ def _filter_mapping(
     Excludes work on their own too -- you don't have to pass any include
     filter, just ``-X user@x`` to "everything except this user".
     """
-    selected = list(rows)
-
-    if mailboxes:
-        wanted = {m.strip().lower() for m in mailboxes if m and m.strip()}
-        selected = [r for r in selected if r.target_mailbox.lower() in wanted]
-        unmatched = wanted - {r.target_mailbox.lower() for r in selected}
-        if unmatched:
-            console.print(
-                f"[yellow]Warning:[/] no mapping rows for: {', '.join(sorted(unmatched))}"
-            )
-
-    if pst_names:
-        needles = [p.strip().lower() for p in pst_names if p and p.strip()]
-        selected = [
-            r for r in selected
-            if any(n in r.pst_path.name.lower() for n in needles)
-        ]
-
-    if exclude_mailboxes:
-        unwanted = {m.strip().lower() for m in exclude_mailboxes if m and m.strip()}
-        before = {r.target_mailbox.lower() for r in selected}
-        selected = [r for r in selected if r.target_mailbox.lower() not in unwanted]
-        # Warn about excludes that didn't actually match anything in scope --
-        # usually means a typo in the UPN.
-        no_op_excludes = unwanted - before
-        if no_op_excludes:
-            console.print(
-                f"[yellow]Warning:[/] --exclude-mailbox had no effect for: "
-                f"{', '.join(sorted(no_op_excludes))}"
-            )
-
-    if exclude_pst_names:
-        needles = [p.strip().lower() for p in exclude_pst_names if p and p.strip()]
-        selected = [
-            r for r in selected
-            if not any(n in r.pst_path.name.lower() for n in needles)
-        ]
-
-    if limit is not None and limit > 0:
-        selected = selected[:limit]
-
-    return selected
+    result = select_mapping(
+        rows,
+        SelectionFilters(
+            mailboxes=mailboxes,
+            pst_names=pst_names,
+            exclude_mailboxes=exclude_mailboxes,
+            exclude_pst_names=exclude_pst_names,
+            limit=limit,
+        ),
+    )
+    for warning in result.warnings:
+        console.print(f"[yellow]Warning:[/] {warning}")
+    return result.rows
 
 
 def _print_selection(rows: list[MappingRow], heading: str = "Selected") -> None:
@@ -1173,6 +1146,30 @@ def status(
                 str(statuses.get("skipped", 0)),
             )
         console.print(per_app)
+
+
+@app.command()
+def web(
+    config: ConfigOpt = None,
+    mapping: Annotated[Path, typer.Option("--mapping", "-m", help="Mapping CSV file")] = Path("mapping.csv"),
+    host: Annotated[str, typer.Option("--host", help="Bind address")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Bind port")] = 8765,
+) -> None:
+    """Start the local web admin GUI."""
+    try:
+        import uvicorn
+
+        from jtet_pstmigrate.webapp import create_app
+    except Exception as e:
+        console.print(f"[red]Web UI dependencies are not available:[/] {e}")
+        console.print("Install them with: [bold]pip install -e .[web][/]")
+        raise typer.Exit(1) from e
+
+    if mapping and not mapping.exists():
+        console.print(f"[yellow]Warning:[/] mapping file does not exist yet: {mapping}")
+
+    console.print(f"[green]Starting pstmigrate web UI[/] at http://{host}:{port}")
+    uvicorn.run(create_app(config_path=config, mapping_path=mapping), host=host, port=port)
 
 
 def main() -> None:

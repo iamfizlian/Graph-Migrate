@@ -496,7 +496,68 @@ pstmigrate import -c config.toml -m mapping.csv
 
 # 5. Inspect status of past runs
 pstmigrate status -c config.toml
+
+# Optional: start the local web admin GUI
+pstmigrate web -c config.toml -m mapping.csv
 ```
+
+## Local web GUI
+
+The CLI remains the canonical automation surface, but the package also includes
+a local-only web admin UI for day-of-migration operations:
+
+### Windows PowerShell
+
+From the Windows migration machine:
+
+```powershell
+cd C:\Tools\JTET-Email-Migration\Graph-Migrate
+
+# Activate the virtual environment created during install
+.\.venv\Scripts\Activate.ps1
+
+# Install the optional web dependencies once
+pip install -e ".[web]"
+
+# Start the GUI
+pstmigrate web -c config.toml -m mapping.csv --host 127.0.0.1 --port 8765
+```
+
+Then open this address in Edge/Chrome on that same Windows machine:
+
+```text
+http://127.0.0.1:8765
+```
+
+Leave the PowerShell window open while using the GUI. Stop it with
+<kbd>Ctrl</kbd>+<kbd>C</kbd>.
+
+### Linux / WSL / macOS
+
+```bash
+cd Graph-Migrate
+source .venv/bin/activate
+pip install -e ".[web]"
+pstmigrate web -c config.toml -m mapping.csv --host 127.0.0.1 --port 8765
+```
+
+Open <http://127.0.0.1:8765>. The GUI reads the same `config.toml`,
+`mapping.csv`, logs, work directory, and SQLite state DB as the CLI. It does
+not store any separate Graph credentials.
+
+If `config.toml` does not exist yet, open the **Config** tab and fill in the
+tenant ID/domain, client ID, client secret or certificate path, concurrency,
+and local paths. Saving the form creates `config.toml`; existing secrets are
+masked in the browser and preserved when the secret field is left blank.
+
+The GUI includes:
+
+- Dashboard and prior-run status from `.pstmigrate-state/state.sqlite`
+- Config and mapping preview pages
+- Validation, import, import-all, purge, and reset-state job forms
+- One active mutating job at a time
+- Explicit confirmation for destructive tools
+- Logs browser for JSONL run logs
 
 ### Selecting a subset of mailboxes / PSTs
 
