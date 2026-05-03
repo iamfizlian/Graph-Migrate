@@ -674,17 +674,16 @@ class Orchestrator:
             return url
 
         def _enum(path: str) -> list[dict]:
-            """Page through a Graph collection, returning all values."""
+            """Page through a Graph collection, returning all values.
+
+            Any failure after the first page raises instead of returning a
+            truncated list — otherwise ``purge-mail`` would skip undeleted
+            folders/messages while reporting success.
+            """
             out: list[dict] = []
             next_url: str | None = path
             while next_url:
-                try:
-                    body = graph.get(
-                        next_url, expect_status=(200,)
-                    ).json()
-                except Exception as e:
-                    log.warning("enum GET failed at {}: {}", next_url, e)
-                    return out
+                body = graph.get(next_url, expect_status=(200,)).json()
                 out.extend(body.get("value", []))
                 next_url = _strip_host(body.get("@odata.nextLink"))
             return out
@@ -784,17 +783,25 @@ class Orchestrator:
             if total > 0:
                 _drain_folder_messages(fid)
 
-        top = _enum(
-            f"/users/{upn}/mailFolders"
-            f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
-        )
-        if not top:
-            log.info("Nothing to purge -- mailFolders enum returned 0 entries")
-            return (0, 0, 0)
+        try:
+            top = _enum(
+                f"/users/{upn}/mailFolders"
+                f"?$top=100"
+                f"&$select=id,displayName,totalItemCount,childFolderCount"
+            )
+            if not top:
+                log.info("Nothing to purge -- mailFolders enum returned 0 entries")
+                return (0, 0, 0)
 
-        for f in top:
-            _walk(f)
+            for f in top:
+                _walk(f)
+        except Exception:
+            log.exception(
+                "purge-mail aborted mid-run for {}; "
+                "counts below may be partial",
+                mailbox,
+            )
+            return (msg_deleted, msg_missing, msg_errors + 1)
 
         log.info(
             "Done. folders_deleted={} messages_deleted~={} missing={} errors={}",
