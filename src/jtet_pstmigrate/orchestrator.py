@@ -647,31 +647,87 @@ class Orchestrator:
         log = logger.bind(ctx=f"purge-mail[{mailbox}]")
         workers = max(1, self._cfg.migration.workers_per_mailbox)
 
-        # Folder ids whose subtree we never enter. The well-known name
-        # 'deleteditems' is locale-stable across tenants.
-        skip_folder_ids: set[str] = set()
-        try:
-            resp = graph.get(
-                f"/users/{upn}/mailFolders/deleteditems",
-                expect_status=(200,),
+        # We MUST know the Deleted Items folder id before any cascade DELETE.
+        # If we skipped it by mistake, DELETE /mailFolders/{id} removes the
+        # entire subtree including every message still in trash -- far worse
+        # than the documented "leave Deleted Items alone" behaviour. A lone
+        # warning + empty skip set was a data-loss footgun on transient Graph
+        # errors or odd tenants where the short path fails.
+
+        def _strip_host(url: str | None) -> str | None:
+            if url and url.startswith("https://graph.microsoft.com/v1.0"):
+                return url[len("https://graph.microsoft.com/v1.0"):]
+            return url
+
+        def _resolve_deleted_items_folder_id() -> str | None:
+            try:
+                resp = graph.get(
+                    f"/users/{upn}/mailFolders/deleteditems",
+                    expect_status=(200,),
+                )
+                return resp.json()["id"]
+            except Exception as e:
+                log.warning(
+                    "GET mailFolders/deleteditems failed ({}); "
+                    "trying wellKnownName filter fallback",
+                    e,
+                )
+            try:
+                body = graph.get(
+                    f"/users/{upn}/mailFolders",
+                    expect_status=(200,),
+                    params={
+                        "$filter": "wellKnownName eq 'deleteditems'",
+                        "$select": "id,displayName",
+                    },
+                ).json()
+                vals = body.get("value") or []
+                if len(vals) == 1:
+                    return vals[0]["id"]
+                log.warning(
+                    "wellKnownName filter returned {} row(s); "
+                    "trying full enumeration",
+                    len(vals),
+                )
+            except Exception as e:
+                log.warning("wellKnownName filter for deleteditems failed: {}", e)
+
+            # Last resort: walk root mailFolders and match wellKnownName (some
+            # tenants reject $filter on this collection).
+            try:
+                next_url: str | None = (
+                    f"/users/{upn}/mailFolders"
+                    f"?$select=id,wellKnownName&$top=100"
+                )
+                while next_url:
+                    r = graph.get(next_url, expect_status=(200,))
+                    payload = r.json()
+                    for folder in payload.get("value") or []:
+                        wk = folder.get("wellKnownName") or ""
+                        if wk.lower() == "deleteditems":
+                            return folder["id"]
+                    next_url = _strip_host(payload.get("@odata.nextLink"))
+            except Exception as e:
+                log.error("enumerating mailFolders for deleteditems failed: {}", e)
+
+            return None
+
+        deleted_items_id = _resolve_deleted_items_folder_id()
+        if not deleted_items_id:
+            log.error(
+                "Aborting purge-mail for this mailbox: cannot resolve Deleted "
+                "Items folder id. Fix connectivity/permissions and retry; "
+                "refusing to cascade-delete without a skip list."
             )
-            skip_folder_ids.add(resp.json()["id"])
-        except Exception as e:
-            log.warning(
-                "could not resolve deleteditems folder id: {} -- "
-                "continuing without skip", e,
-            )
+            return (0, 0, 1)
+
+        skip_folder_ids: set[str] = {deleted_items_id}
 
         # Aggregated counters (closure-mutated by helpers below).
         msg_deleted = 0
         msg_missing = 0
         msg_errors = 0
         folder_deleted = 0
-
-        def _strip_host(url: str | None) -> str | None:
-            if url and url.startswith("https://graph.microsoft.com/v1.0"):
-                return url[len("https://graph.microsoft.com/v1.0"):]
-            return url
 
         def _enum(path: str) -> list[dict]:
             """Page through a Graph collection, returning all values."""
