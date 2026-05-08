@@ -6,6 +6,7 @@ import pytest
 
 pytest.importorskip("fastapi")
 
+from jtet_pstmigrate.jobs import JobRecord
 from jtet_pstmigrate.webapp import create_app
 
 
@@ -39,6 +40,118 @@ async def test_web_destructive_job_requires_confirmation(tmp_path: Path) -> None
     assert response.status_code == 200
     assert "blocked" in response.text
     assert "Confirmation is required" in response.text
+
+
+@pytest.mark.anyio
+async def test_run_page_can_submit_import_skipped_duplicates(tmp_path: Path) -> None:
+    app = create_app(config_path=_config_file(tmp_path), mapping_path=_mapping_file(tmp_path))
+
+    class CapturingJobs:
+        def __init__(self) -> None:
+            self.spec = None
+
+        def latest(self):
+            return []
+
+        def submit(self, spec):
+            self.spec = spec
+            return JobRecord(job_id="job123", kind=spec.kind)
+
+        def get(self, job_id: str):
+            return JobRecord(job_id=job_id, kind="import-mail")
+
+    jobs = CapturingJobs()
+    app.state.jobs = jobs
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        run_page = await client.get("/run")
+        response = await client.post(
+            "/jobs",
+            data={
+                "kind": "import-mail",
+                "mailbox": "alice@example.com",
+                "pst": "a.pst",
+                "import_skipped_duplicates": "yes",
+            },
+            follow_redirects=False,
+        )
+
+    assert run_page.status_code == 200
+    assert 'name="import_skipped_duplicates"' in run_page.text
+    assert response.status_code == 303
+    assert jobs.spec is not None
+    assert jobs.spec.kind == "import-mail"
+    assert jobs.spec.import_skipped_duplicates is True
+    assert jobs.spec.filters.mailboxes == ["alice@example.com"]
+    assert jobs.spec.filters.pst_names == ["a.pst"]
+
+
+@pytest.mark.anyio
+async def test_missing_job_panel_stops_htmx_polling(tmp_path: Path) -> None:
+    transport = httpx.ASGITransport(
+        app=create_app(config_path=_config_file(tmp_path), mapping_path=_mapping_file(tmp_path))
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/jobs/missing/panel")
+
+    assert response.status_code == 286
+    assert "Job is no longer available" in response.text
+
+
+@pytest.mark.anyio
+async def test_terminal_job_panel_stops_htmx_polling(tmp_path: Path) -> None:
+    app = create_app(config_path=_config_file(tmp_path), mapping_path=_mapping_file(tmp_path))
+
+    class DoneJobs:
+        def get(self, job_id: str):
+            record = JobRecord(job_id=job_id, kind="import-mail", status="done")
+            record.record_progress({"total_delta": 4, "activity": "Processing mailbox"})
+            record.record_progress({"increment": 2, "outcome": "uploaded", "activity": "Uploaded 2/4"})
+            return record
+
+    app.state.jobs = DoneJobs()
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/jobs/done/panel")
+
+    assert response.status_code == 286
+    assert "Status:</strong> done" in response.text
+    assert "2/4 items processed (50%)" in response.text
+    assert "0 cancelled" in response.text
+    assert "Stop job" not in response.text
+    assert "Uploaded 2/4" in response.text
+
+
+@pytest.mark.anyio
+async def test_running_job_panel_shows_stop_button(tmp_path: Path) -> None:
+    app = create_app(config_path=_config_file(tmp_path), mapping_path=_mapping_file(tmp_path))
+
+    class RunningJobs:
+        cancelled = False
+
+        def get(self, job_id: str):
+            return JobRecord(job_id=job_id, kind="import-mail", status="running")
+
+        def cancel(self, job_id: str):
+            self.cancelled = True
+            return True
+
+    jobs = RunningJobs()
+    app.state.jobs = jobs
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        panel = await client.get("/jobs/running/panel")
+        response = await client.post("/jobs/running/cancel", follow_redirects=False)
+
+    assert panel.status_code == 200
+    assert "Stop job" in panel.text
+    assert response.status_code == 303
+    assert response.headers["location"] == "/jobs/running"
+    assert jobs.cancelled is True
 
 
 @pytest.mark.anyio

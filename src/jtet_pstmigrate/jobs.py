@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from jtet_pstmigrate.auth import AppPool
 from jtet_pstmigrate.config import MappingRow
@@ -32,8 +32,13 @@ JobKind = Literal[
     "reset-state",
     "status",
 ]
-JobStatus = Literal["queued", "running", "done", "failed", "blocked"]
+JobStatus = Literal["queued", "running", "done", "failed", "blocked", "cancelled"]
 JobCallback = Callable[["JobRecord"], None]
+ProgressUpdate = dict[str, Any]
+
+
+class JobCancelled(RuntimeError):
+    """Raised internally when a user requests a cooperative job stop."""
 
 MUTATING_JOBS: set[JobKind] = {
     "import-mail",
@@ -60,6 +65,8 @@ class JobSpec:
     mapping_path: Path | None = None
     filters: SelectionFilters = field(default_factory=SelectionFilters)
     confirmed: bool = False
+    import_skipped_duplicates: bool = False
+    cancel_event: threading.Event | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -75,6 +82,15 @@ class JobRecord:
     validation: ValidationReport | None = None
     result: dict[str, int] = field(default_factory=dict)
     last_error: str | None = None
+    progress_total: int = 0
+    progress_current: int = 0
+    progress_uploaded: int = 0
+    progress_skipped: int = 0
+    progress_failed: int = 0
+    progress_cancelled: int = 0
+    activity: str = "Queued"
+    events: list[dict[str, str]] = field(default_factory=list)
+    _progress_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def elapsed_seconds(self) -> float:
@@ -84,12 +100,55 @@ class JobRecord:
 
     @property
     def item_counts(self) -> dict[str, int]:
+        if self.progress_total or self.progress_current:
+            return {
+                "total": self.progress_total,
+                "uploaded": self.progress_uploaded,
+                "skipped": self.progress_skipped,
+                "failed": self.progress_failed,
+                "cancelled": self.progress_cancelled,
+            }
         return {
             "total": sum(r.items_total for r in self.reports),
             "uploaded": sum(r.items_uploaded for r in self.reports),
             "skipped": sum(r.items_skipped for r in self.reports),
             "failed": sum(r.items_failed for r in self.reports),
         }
+
+    @property
+    def progress_percent(self) -> int:
+        if self.progress_total <= 0:
+            return 0
+        return min(100, int((self.progress_current / self.progress_total) * 100))
+
+    def record_event(self, message: str) -> None:
+        with self._progress_lock:
+            self.activity = message
+            self.events.append({"elapsed": f"{self.elapsed_seconds:0.1f}s", "message": message})
+            del self.events[:-30]
+
+    def record_progress(self, update: ProgressUpdate) -> None:
+        with self._progress_lock:
+            if total := update.get("total"):
+                self.progress_total = int(total)
+            if total_delta := update.get("total_delta"):
+                self.progress_total += int(total_delta)
+            if increment := update.get("increment"):
+                self.progress_current += int(increment)
+            if outcome := update.get("outcome"):
+                if outcome == "uploaded":
+                    self.progress_uploaded += 1
+                elif outcome == "skipped":
+                    self.progress_skipped += 1
+                elif outcome == "failed":
+                    self.progress_failed += 1
+                elif outcome == "cancelled":
+                    self.progress_cancelled += 1
+            if activity := update.get("activity"):
+                self.activity = str(activity)
+            if message := update.get("message") or update.get("activity"):
+                self.events.append({"elapsed": f"{self.elapsed_seconds:0.1f}s", "message": str(message)})
+                del self.events[:-30]
 
 
 def load_selected_rows(spec: JobSpec) -> tuple[list[MappingRow], int]:
@@ -107,8 +166,19 @@ def run_job(spec: JobSpec, callbacks: list[JobCallback] | None = None) -> JobRec
 
     def emit(phase: str) -> None:
         record.phase = phase
+        record.record_event(phase)
         for callback in callbacks:
             callback(record)
+
+    def progress(update: ProgressUpdate) -> None:
+        record.record_progress(update)
+        for callback in callbacks:
+            callback(record)
+
+    def check_cancelled() -> None:
+        if spec.cancel_event is not None and spec.cancel_event.is_set():
+            record.record_event("Cancellation requested; stopping after in-flight work finishes")
+            raise JobCancelled("Cancelled by user.")
 
     try:
         if spec.kind in DESTRUCTIVE_JOBS and not spec.confirmed:
@@ -116,6 +186,7 @@ def run_job(spec: JobSpec, callbacks: list[JobCallback] | None = None) -> JobRec
             record.last_error = "Confirmation is required for destructive jobs."
             return record
 
+        check_cancelled()
         record.status = "running"
         record.started_at = time.time()
         emit("loading config")
@@ -123,6 +194,7 @@ def run_job(spec: JobSpec, callbacks: list[JobCallback] | None = None) -> JobRec
         log_id = f"{spec.kind}_{time.strftime('%Y%m%d_%H%M%S')}"
         configure_logging(cfg.paths.log_dir, cfg.log_level, run_id=log_id)
 
+        check_cancelled()
         emit("loading mapping")
         rows, _ = load_selected_rows(spec)
         record.selected_rows = len(rows)
@@ -136,6 +208,7 @@ def run_job(spec: JobSpec, callbacks: list[JobCallback] | None = None) -> JobRec
             raise ValueError("Selection produced 0 mapping rows.")
 
         if spec.kind == "validate":
+            check_cancelled()
             emit("validating")
             record.validation = validate_environment(cfg, rows)
             record.status = "done" if record.validation.ok else "failed"
@@ -143,43 +216,72 @@ def run_job(spec: JobSpec, callbacks: list[JobCallback] | None = None) -> JobRec
 
         state = StateStore(cfg.paths.state_dir / "state.sqlite")
         pool = AppPool(cfg.apps)
-        orch = Orchestrator(cfg, state, pool)
+        orch = Orchestrator(
+            cfg,
+            state,
+            pool,
+            import_skipped_duplicates=spec.import_skipped_duplicates,
+            progress_callback=progress,
+            cancel_event=spec.cancel_event,
+        )
 
         if spec.kind == "import-mail":
+            check_cancelled()
             emit("importing mail")
             record.reports = orch.run(rows)
+            check_cancelled()
         elif spec.kind == "import-calendar":
+            check_cancelled()
             emit("importing calendar")
             record.reports = orch.run_calendar(rows)
+            check_cancelled()
         elif spec.kind == "import-contacts":
+            check_cancelled()
             emit("importing contacts")
             record.reports = orch.run_contacts(rows)
+            check_cancelled()
         elif spec.kind == "import-all":
+            check_cancelled()
             emit("importing mail")
             record.reports.extend(orch.run(rows))
+            check_cancelled()
             emit("importing calendar")
             record.reports.extend(orch.run_calendar(rows))
+            check_cancelled()
             emit("importing contacts")
             record.reports.extend(orch.run_contacts(rows))
+            check_cancelled()
         elif spec.kind == "purge-calendar":
+            check_cancelled()
             emit("purging calendar")
             deleted, missing, errors = orch.purge_calendar(rows)
             record.result = {"deleted": deleted, "missing": missing, "errors": errors}
         elif spec.kind == "purge-contacts":
+            check_cancelled()
             emit("purging contacts")
             deleted, missing, errors = orch.purge_contacts(rows)
             record.result = {"deleted": deleted, "missing": missing, "errors": errors}
         elif spec.kind == "purge-mail":
+            check_cancelled()
             emit("purging mail")
             deleted, missing, errors = orch.purge_mail(rows)
             record.result = {"deleted": deleted, "missing": missing, "errors": errors}
         elif spec.kind == "reset-state":
+            check_cancelled()
             emit("resetting state")
             record.result = _reset_state(state, rows)
 
         failed_reports = sum(1 for r in record.reports if r.status != "done" or r.items_failed)
         result_errors = record.result.get("errors", 0)
-        record.status = "failed" if failed_reports or result_errors else "done"
+        if spec.cancel_event is not None and spec.cancel_event.is_set():
+            record.status = "cancelled"
+            record.last_error = "Cancelled by user."
+        else:
+            record.status = "failed" if failed_reports or result_errors else "done"
+        return record
+    except JobCancelled as e:
+        record.status = "cancelled"
+        record.last_error = str(e)
         return record
     except Exception as e:
         record.status = "failed"
@@ -209,9 +311,12 @@ class JobManager:
         self._lock = threading.Lock()
         self._active_mutating: str | None = None
         self._jobs: dict[str, JobRecord] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
 
     def submit(self, spec: JobSpec) -> JobRecord:
         record = JobRecord(job_id=uuid.uuid4().hex[:12], kind=spec.kind)
+        cancel_event = threading.Event()
+        spec.cancel_event = cancel_event
         with self._lock:
             if spec.kind in MUTATING_JOBS and self._active_mutating is not None:
                 record.status = "blocked"
@@ -221,6 +326,7 @@ class JobManager:
             if spec.kind in MUTATING_JOBS:
                 self._active_mutating = record.job_id
             self._jobs[record.job_id] = record
+            self._cancel_events[record.job_id] = cancel_event
 
         thread = threading.Thread(
             target=self._run_in_thread,
@@ -244,6 +350,14 @@ class JobManager:
             spec_record.validation = update.validation
             spec_record.result = update.result
             spec_record.last_error = update.last_error
+            spec_record.progress_total = update.progress_total
+            spec_record.progress_current = update.progress_current
+            spec_record.progress_uploaded = update.progress_uploaded
+            spec_record.progress_skipped = update.progress_skipped
+            spec_record.progress_failed = update.progress_failed
+            spec_record.progress_cancelled = update.progress_cancelled
+            spec_record.activity = update.activity
+            spec_record.events = list(update.events)
             with self._lock:
                 self._jobs[placeholder.job_id] = spec_record
 
@@ -251,8 +365,21 @@ class JobManager:
         final.job_id = placeholder.job_id
         with self._lock:
             self._jobs[placeholder.job_id] = final
+            self._cancel_events.pop(placeholder.job_id, None)
             if spec.kind in MUTATING_JOBS and self._active_mutating == placeholder.job_id:
                 self._active_mutating = None
+
+    def cancel(self, job_id: str) -> bool:
+        with self._lock:
+            record = self._jobs.get(job_id)
+            cancel_event = self._cancel_events.get(job_id)
+            if record is None or cancel_event is None or record.status not in {"queued", "running"}:
+                return False
+            cancel_event.set()
+            record.phase = "cancelling"
+            record.record_event("Stop requested from web UI; waiting for in-flight work to finish")
+            self._jobs[job_id] = record
+            return True
 
     def get(self, job_id: str) -> JobRecord | None:
         with self._lock:

@@ -71,6 +71,11 @@ TEMPLATES: dict[str, str] = {
     button.secondary, .button.secondary { background:white; color:var(--accent); }
     .row { display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }
     .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+    .progress-wrap { margin:12px 0; }
+    .progress-bar { height:18px; border-radius:999px; overflow:hidden; background:#d9e1ea; border:1px solid #bac6d4; }
+    .progress-fill { height:100%; background:linear-gradient(90deg, #176b87, #25a18e); transition:width .25s ease; }
+    .event-list { margin:8px 0 0; padding-left:20px; max-height:260px; overflow:auto; }
+    .event-list li { margin:3px 0; }
     pre { white-space:pre-wrap; overflow:auto; background:#0f1720; color:#e8eef5; padding:12px; border-radius:8px; max-height:520px; }
     @media (max-width: 760px) { .grid, .row { grid-template-columns:1fr; } main { padding:14px; } }
   </style>
@@ -234,6 +239,8 @@ TEMPLATES: dict[str, str] = {
       <option value="import-all">Import all</option>
     </select>
     {% include "mapping_select.html" %}
+    <label><input type="checkbox" name="import_skipped_duplicates" value="yes" style="width:auto"> Import skipped duplicate mail copies (remediation re-run).</label>
+    <p class="muted">Applies to mail imports only. Exact source rows already marked done are still skipped.</p>
     <div class="actions"><button>Start Import</button></div>
   </form>
 </section>
@@ -341,7 +348,27 @@ TEMPLATES: dict[str, str] = {
 """,
     "job_panel.html": """
 <p><strong>Kind:</strong> {{ job.kind }} | <strong>Status:</strong> {{ job.status }} | <strong>Phase:</strong> {{ job.phase }} | <strong>Rows:</strong> {{ job.selected_rows }}</p>
+<p><strong>Current activity:</strong> {{ job.activity }}</p>
+{% if job.progress_total %}
+<div class="progress-wrap" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ job.progress_percent }}">
+  <div class="progress-bar"><div class="progress-fill" style="width: {{ job.progress_percent }}%"></div></div>
+  <p class="muted">{{ job.progress_current }}/{{ job.progress_total }} items processed ({{ job.progress_percent }}%) — {{ job.progress_uploaded }} uploaded, {{ job.progress_skipped }} skipped, {{ job.progress_failed }} failed, {{ job.progress_cancelled }} cancelled</p>
+</div>
+{% endif %}
+{% if job.status in ["queued", "running"] %}
+<form method="post" action="/jobs/{{ job.job_id }}/cancel" onsubmit="return confirm('Stop this job after in-flight work finishes?');">
+  <button class="secondary" type="submit">Stop job</button>
+</form>
+{% endif %}
 {% if job.last_error %}<p class="bad">{{ job.last_error }}</p>{% endif %}
+{% if job.events %}
+<h2>Live activity</h2>
+<ul class="event-list">
+{% for event in job.events|reverse %}
+  <li><span class="muted">{{ event.elapsed }}</span> {{ event.message }}</li>
+{% endfor %}
+</ul>
+{% endif %}
 {% if job.validation %}
 <table><thead><tr><th>Check</th><th>Result</th><th>Message</th></tr></thead><tbody>
 {% for check in job.validation.checks %}
@@ -566,6 +593,7 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
         mailbox: Annotated[str, Form()] = "",
         pst: Annotated[str, Form()] = "",
         confirmed: Annotated[str | None, Form()] = None,
+        import_skipped_duplicates: Annotated[str | None, Form()] = None,
     ) -> RedirectResponse:
         spec = JobSpec(
             kind=kind,
@@ -576,9 +604,15 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
                 pst_names=[pst] if pst else None,
             ),
             confirmed=confirmed == "yes",
+            import_skipped_duplicates=import_skipped_duplicates == "yes",
         )
         record = app.state.jobs.submit(spec)
         return RedirectResponse(f"/jobs/{record.job_id}", status_code=303)
+
+    @app.post("/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str) -> RedirectResponse:
+        app.state.jobs.cancel(job_id)
+        return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
     async def job_detail(job_id: str) -> HTMLResponse:
@@ -591,8 +625,16 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
     async def job_panel(job_id: str) -> HTMLResponse:
         job = app.state.jobs.get(job_id)
         if job is None:
-            return HTMLResponse("Job not found", status_code=404)
-        return HTMLResponse(env.get_template("job_panel.html").render(job=job))
+            # HTMX keeps polling job panels while a tab is open. After a server
+            # restart the in-memory job list is gone, so old tabs otherwise spam
+            # 404s forever. Status 286 is HTMX's documented "stop polling" code.
+            return HTMLResponse(
+                '<p class="muted">Job is no longer available in this server session. '
+                'Refresh the Jobs list to view current jobs.</p>',
+                status_code=286,
+            )
+        status_code = 286 if job.status in {"done", "failed", "blocked", "cancelled"} else 200
+        return HTMLResponse(env.get_template("job_panel.html").render(job=job), status_code=status_code)
 
     return app
 

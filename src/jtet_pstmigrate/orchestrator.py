@@ -15,7 +15,7 @@ import csv
 import dataclasses
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -61,6 +61,8 @@ from jtet_pstmigrate.pst_reader import (
 from jtet_pstmigrate.state import StateStore
 from jtet_pstmigrate.uploader import MessageUploader
 
+ProgressCallback = Callable[[dict[str, object]], None]
+
 
 @dataclasses.dataclass
 class RunReport:
@@ -93,11 +95,30 @@ def load_mapping(csv_path: Path) -> list[MappingRow]:
 
 
 class Orchestrator:
-    def __init__(self, cfg: AppConfig, state: StateStore, pool: AppPool):
+    def __init__(
+        self,
+        cfg: AppConfig,
+        state: StateStore,
+        pool: AppPool,
+        *,
+        import_skipped_duplicates: bool = False,
+        progress_callback: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
+    ):
         self._cfg = cfg
         self._state = state
         self._pool = pool
+        self._import_skipped_duplicates = import_skipped_duplicates
+        self._progress_callback = progress_callback
+        self._cancel_event = cancel_event
         self._console = Console()
+
+    def _emit_progress(self, **update: object) -> None:
+        if self._progress_callback is not None:
+            self._progress_callback(update)
+
+    def _cancel_requested(self) -> bool:
+        return self._cancel_event is not None and self._cancel_event.is_set()
 
     def run(self, mapping: list[MappingRow]) -> list[RunReport]:
         if not mapping:
@@ -142,6 +163,12 @@ class Orchestrator:
         pst_str = str(row.pst_path)
 
         self._state.start_pst_run(pst_str, row.target_mailbox)
+        if self._cancel_requested():
+            report.status = "cancelled"
+            report.last_error = "Cancelled before extraction started"
+            self._emit_progress(activity=f"Cancelled before extracting {row.pst_path.name}")
+            return report
+        self._emit_progress(activity=f"Extracting {row.pst_path.name} for {row.target_mailbox}")
 
         try:
             extracted_dir = extract_pst(
@@ -159,12 +186,25 @@ class Orchestrator:
 
         messages = list(iter_messages(extracted_dir))
         report.items_total = len(messages)
+        self._emit_progress(
+            total_delta=len(messages),
+            activity=f"Found {len(messages)} messages in {row.pst_path.name}; preparing upload",
+        )
         self._state.update_pst_run(pst_str, row.target_mailbox, status="uploading", items_total=len(messages))
         log.info("{} messages to consider", len(messages))
 
         if not messages:
             self._state.update_pst_run(pst_str, row.target_mailbox, status="done")
             report.status = "done"
+            self._emit_progress(activity=f"No mail messages found in {row.pst_path.name}")
+            report.elapsed_seconds = time.time() - started
+            return report
+
+        if self._cancel_requested():
+            self._state.update_pst_run(pst_str, row.target_mailbox, status="cancelled", last_error="Cancelled before upload")
+            report.status = "cancelled"
+            report.last_error = "Cancelled before upload"
+            self._emit_progress(activity=f"Cancelled before uploading {row.pst_path.name}")
             report.elapsed_seconds = time.time() - started
             return report
 
@@ -189,15 +229,39 @@ class Orchestrator:
                     report.items_uploaded += 1
                 elif outcome == "skipped":
                     report.items_skipped += 1
+                elif outcome == "cancelled":
+                    pass
                 else:
                     report.items_failed += 1
+                done = report.items_uploaded + report.items_skipped + report.items_failed
+                self._emit_progress(
+                    increment=1,
+                    outcome=outcome,
+                    activity=(
+                        f"{row.target_mailbox} / {row.pst_path.name}: "
+                        f"{done}/{report.items_total} processed "
+                        f"({report.items_uploaded} uploaded, {report.items_skipped} skipped, "
+                        f"{report.items_failed} failed)"
+                    ),
+                )
 
-        if report.items_failed and self._cfg.migration.fail_fast:
+        if self._cancel_requested():
+            self._state.update_pst_run(pst_str, row.target_mailbox, status="cancelled", last_error="Cancelled by user")
+            report.status = "cancelled"
+            report.last_error = "Cancelled by user"
+        elif report.items_failed and self._cfg.migration.fail_fast:
             self._state.update_pst_run(pst_str, row.target_mailbox, status="failed", last_error=f"{report.items_failed} item failures")
             report.status = "failed"
         else:
             self._state.update_pst_run(pst_str, row.target_mailbox, status="done")
             report.status = "done"
+        self._emit_progress(
+            activity=(
+                f"Completed {row.pst_path.name} for {row.target_mailbox}: "
+                f"{report.items_uploaded} uploaded, {report.items_skipped} skipped, "
+                f"{report.items_failed} failed"
+            )
+        )
         report.elapsed_seconds = time.time() - started
         return report
 
@@ -208,6 +272,8 @@ class Orchestrator:
         folders: FolderManager,
         uploader: MessageUploader,
     ) -> str:
+        if self._cancel_requested():
+            return "cancelled"
         pst_str = str(row.pst_path)
         src = str(msg.file_path)
         # If THIS exact .eml file is already marked done, don't touch the row
@@ -215,10 +281,12 @@ class Orchestrator:
         # next run, causing the message to be re-uploaded as a duplicate).
         if self._state.is_row_done(row.target_mailbox, pst_str, src):
             return "skipped"
-        if self._state.is_message_done(row.target_mailbox, msg.dedupe_key):
-            # Different file with the same internet message-id (e.g. a copy in
-            # a different folder). Record it as a skipped *new* row so the
-            # audit shows which copies were de-duplicated.
+        # Different file with the same internet message-id (e.g. a copy in
+        # a different folder). By default we record it as skipped so the
+        # audit shows which copies were de-duplicated. In remediation mode,
+        # continue and upload this source row, which lets a scoped re-run
+        # import duplicates that were intentionally skipped before.
+        if self._state.is_message_done(row.target_mailbox, msg.dedupe_key) and not self._import_skipped_duplicates:
             self._state.upsert_message(
                 mailbox=row.target_mailbox,
                 pst_path=pst_str,
@@ -385,8 +453,21 @@ class Orchestrator:
                     report.items_uploaded += 1
                 elif outcome == "skipped":
                     report.items_skipped += 1
+                elif outcome == "cancelled":
+                    pass
                 else:
                     report.items_failed += 1
+                done = report.items_uploaded + report.items_skipped + report.items_failed
+                self._emit_progress(
+                    increment=1,
+                    outcome=outcome,
+                    activity=(
+                        f"{row.target_mailbox} / {row.pst_path.name}: "
+                        f"{done}/{report.items_total} processed "
+                        f"({report.items_uploaded} uploaded, {report.items_skipped} skipped, "
+                        f"{report.items_failed} failed)"
+                    ),
+                )
 
         if report.items_failed and self._cfg.migration.fail_fast:
             report.status = "failed"
@@ -889,8 +970,21 @@ class Orchestrator:
                     report.items_uploaded += 1
                 elif outcome == "skipped":
                     report.items_skipped += 1
+                elif outcome == "cancelled":
+                    pass
                 else:
                     report.items_failed += 1
+                done = report.items_uploaded + report.items_skipped + report.items_failed
+                self._emit_progress(
+                    increment=1,
+                    outcome=outcome,
+                    activity=(
+                        f"{row.target_mailbox} / {row.pst_path.name}: "
+                        f"{done}/{report.items_total} processed "
+                        f"({report.items_uploaded} uploaded, {report.items_skipped} skipped, "
+                        f"{report.items_failed} failed)"
+                    ),
+                )
 
         if report.items_failed and self._cfg.migration.fail_fast:
             report.status = "failed"

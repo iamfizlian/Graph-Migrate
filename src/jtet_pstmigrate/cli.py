@@ -339,6 +339,17 @@ def run_import(
     exclude_pst: ExcludePstFilterOpt = None,
     limit: LimitOpt = None,
     list_only: ListOnlyOpt = False,
+    import_skipped_duplicates: Annotated[
+        bool,
+        typer.Option(
+            "--import-skipped-duplicates",
+            help=(
+                "Upload source messages whose Message-ID already has a completed row. "
+                "Use with --mailbox/--pst for remediation re-runs that should import "
+                "copies previously recorded as skipped duplicates."
+            ),
+        ),
+    ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
 ) -> None:
     """Run the migration.
@@ -351,6 +362,8 @@ def run_import(
       Just a canary:     pstmigrate import -c c.toml -m m.csv -n 1
       One PST file:      pstmigrate import -c c.toml -m m.csv -P jsmith.pst
       Preview selection: pstmigrate import -c c.toml -m m.csv -M a@x --list
+      Import skipped duplicate copies for one mailbox:
+                          pstmigrate import -c c.toml -m m.csv -M a@x --import-skipped-duplicates
     """
     cfg = _load(config)
     run_id = f"import_{_run_id()}"
@@ -395,12 +408,13 @@ def run_import(
         f"  workers/mailbox = {cfg.migration.workers_per_mailbox}\n"
         f"  parallel mailboxes = {cfg.migration.max_parallel_mailboxes}\n"
         f"  state dir = {cfg.paths.state_dir}\n"
+        f"  duplicate mode = {'import skipped duplicates' if import_skipped_duplicates else 'skip duplicates'}\n"
     )
     if not yes and not typer.confirm("Proceed?", default=False):
         raise typer.Exit(0)
 
     state = StateStore(cfg.paths.state_dir / "state.sqlite")
-    orch = Orchestrator(cfg, state, pool)
+    orch = Orchestrator(cfg, state, pool, import_skipped_duplicates=import_skipped_duplicates)
     reports = orch.run(rows)
 
     failed = sum(1 for r in reports if r.status != "done" or r.items_failed)
@@ -1169,7 +1183,9 @@ def web(
         console.print(f"[yellow]Warning:[/] mapping file does not exist yet: {mapping}")
 
     console.print(f"[green]Starting pstmigrate web UI[/] at http://{host}:{port}")
-    uvicorn.run(create_app(config_path=config, mapping_path=mapping), host=host, port=port)
+    # The browser polls job panels frequently while work is running; suppress
+    # Uvicorn access logs so the terminal stays useful for migration logs.
+    uvicorn.run(create_app(config_path=config, mapping_path=mapping), host=host, port=port, access_log=False)
 
 
 def main() -> None:
