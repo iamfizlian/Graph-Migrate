@@ -595,8 +595,16 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
     async def job_panel(job_id: str) -> HTMLResponse:
         job = app.state.jobs.get(job_id)
         if job is None:
-            return HTMLResponse("Job not found", status_code=404)
-        return HTMLResponse(env.get_template("job_panel.html").render(job=job))
+            # HTMX keeps polling job panels while a tab is open. After a server
+            # restart the in-memory job list is gone, so old tabs otherwise spam
+            # 404s forever. Status 286 is HTMX's documented "stop polling" code.
+            return HTMLResponse(
+                '<p class="muted">Job is no longer available in this server session. '
+                'Refresh the Jobs list to view current jobs.</p>',
+                status_code=286,
+            )
+        status_code = 286 if job.status in {"done", "failed", "blocked"} else 200
+        return HTMLResponse(env.get_template("job_panel.html").render(job=job), status_code=status_code)
 
     return app
 

@@ -88,6 +88,37 @@ async def test_run_page_can_submit_import_skipped_duplicates(tmp_path: Path) -> 
 
 
 @pytest.mark.anyio
+async def test_missing_job_panel_stops_htmx_polling(tmp_path: Path) -> None:
+    transport = httpx.ASGITransport(
+        app=create_app(config_path=_config_file(tmp_path), mapping_path=_mapping_file(tmp_path))
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/jobs/missing/panel")
+
+    assert response.status_code == 286
+    assert "Job is no longer available" in response.text
+
+
+@pytest.mark.anyio
+async def test_terminal_job_panel_stops_htmx_polling(tmp_path: Path) -> None:
+    app = create_app(config_path=_config_file(tmp_path), mapping_path=_mapping_file(tmp_path))
+
+    class DoneJobs:
+        def get(self, job_id: str):
+            return JobRecord(job_id=job_id, kind="import-mail", status="done")
+
+    app.state.jobs = DoneJobs()
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/jobs/done/panel")
+
+    assert response.status_code == 286
+    assert "Status:</strong> done" in response.text
+
+
+@pytest.mark.anyio
 async def test_web_config_page_can_create_config(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     transport = httpx.ASGITransport(app=create_app(config_path=config, mapping_path=_mapping_file(tmp_path)))
