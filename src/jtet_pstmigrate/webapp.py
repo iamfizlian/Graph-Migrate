@@ -234,6 +234,8 @@ TEMPLATES: dict[str, str] = {
       <option value="import-all">Import all</option>
     </select>
     {% include "mapping_select.html" %}
+    <label><input type="checkbox" name="import_skipped_duplicates" value="yes" style="width:auto"> Import skipped duplicate mail copies (remediation re-run).</label>
+    <p class="muted">Applies to mail imports only. Exact source rows already marked done are still skipped.</p>
     <div class="actions"><button>Start Import</button></div>
   </form>
 </section>
@@ -566,6 +568,7 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
         mailbox: Annotated[str, Form()] = "",
         pst: Annotated[str, Form()] = "",
         confirmed: Annotated[str | None, Form()] = None,
+        import_skipped_duplicates: Annotated[str | None, Form()] = None,
     ) -> RedirectResponse:
         spec = JobSpec(
             kind=kind,
@@ -576,6 +579,7 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
                 pst_names=[pst] if pst else None,
             ),
             confirmed=confirmed == "yes",
+            import_skipped_duplicates=import_skipped_duplicates == "yes",
         )
         record = app.state.jobs.submit(spec)
         return RedirectResponse(f"/jobs/{record.job_id}", status_code=303)
@@ -591,8 +595,16 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
     async def job_panel(job_id: str) -> HTMLResponse:
         job = app.state.jobs.get(job_id)
         if job is None:
-            return HTMLResponse("Job not found", status_code=404)
-        return HTMLResponse(env.get_template("job_panel.html").render(job=job))
+            # HTMX keeps polling job panels while a tab is open. After a server
+            # restart the in-memory job list is gone, so old tabs otherwise spam
+            # 404s forever. Status 286 is HTMX's documented "stop polling" code.
+            return HTMLResponse(
+                '<p class="muted">Job is no longer available in this server session. '
+                'Refresh the Jobs list to view current jobs.</p>',
+                status_code=286,
+            )
+        status_code = 286 if job.status in {"done", "failed", "blocked"} else 200
+        return HTMLResponse(env.get_template("job_panel.html").render(job=job), status_code=status_code)
 
     return app
 

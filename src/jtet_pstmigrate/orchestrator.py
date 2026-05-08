@@ -93,10 +93,18 @@ def load_mapping(csv_path: Path) -> list[MappingRow]:
 
 
 class Orchestrator:
-    def __init__(self, cfg: AppConfig, state: StateStore, pool: AppPool):
+    def __init__(
+        self,
+        cfg: AppConfig,
+        state: StateStore,
+        pool: AppPool,
+        *,
+        import_skipped_duplicates: bool = False,
+    ):
         self._cfg = cfg
         self._state = state
         self._pool = pool
+        self._import_skipped_duplicates = import_skipped_duplicates
         self._console = Console()
 
     def run(self, mapping: list[MappingRow]) -> list[RunReport]:
@@ -215,10 +223,12 @@ class Orchestrator:
         # next run, causing the message to be re-uploaded as a duplicate).
         if self._state.is_row_done(row.target_mailbox, pst_str, src):
             return "skipped"
-        if self._state.is_message_done(row.target_mailbox, msg.dedupe_key):
-            # Different file with the same internet message-id (e.g. a copy in
-            # a different folder). Record it as a skipped *new* row so the
-            # audit shows which copies were de-duplicated.
+        # Different file with the same internet message-id (e.g. a copy in
+        # a different folder). By default we record it as skipped so the
+        # audit shows which copies were de-duplicated. In remediation mode,
+        # continue and upload this source row, which lets a scoped re-run
+        # import duplicates that were intentionally skipped before.
+        if self._state.is_message_done(row.target_mailbox, msg.dedupe_key) and not self._import_skipped_duplicates:
             self._state.upsert_message(
                 mailbox=row.target_mailbox,
                 pst_path=pst_str,
