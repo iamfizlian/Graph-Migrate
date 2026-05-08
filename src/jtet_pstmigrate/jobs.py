@@ -60,6 +60,7 @@ class JobSpec:
     mapping_path: Path | None = None
     filters: SelectionFilters = field(default_factory=SelectionFilters)
     confirmed: bool = False
+    import_skipped_duplicates: bool = False
 
 
 @dataclass(slots=True)
@@ -143,7 +144,12 @@ def run_job(spec: JobSpec, callbacks: list[JobCallback] | None = None) -> JobRec
 
         state = StateStore(cfg.paths.state_dir / "state.sqlite")
         pool = AppPool(cfg.apps)
-        orch = Orchestrator(cfg, state, pool)
+        orch = Orchestrator(
+            cfg,
+            state,
+            pool,
+            import_skipped_duplicates=spec.import_skipped_duplicates,
+        )
 
         if spec.kind == "import-mail":
             emit("importing mail")

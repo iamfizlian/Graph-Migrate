@@ -20,7 +20,6 @@ import datetime as _dt
 import re
 from urllib.parse import quote
 
-from icalendar import Calendar
 from loguru import logger
 
 from jtet_pstmigrate.graph_client import GraphClient
@@ -108,6 +107,8 @@ def _fix_libpst_rrule(raw: bytes) -> bytes:
 
 def _ics_to_graph_event(raw: bytes) -> dict | None:
     """Parse an .ics blob and return a Graph-shaped event document, or None."""
+    from icalendar import Calendar
+
     raw = _fix_libpst_rrule(raw)
     try:
         cal = Calendar.from_ical(raw)
