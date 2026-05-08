@@ -735,7 +735,10 @@ class Orchestrator:
             """Try to cascade-delete ``folder``; otherwise recurse + drain."""
             nonlocal msg_deleted, msg_errors, folder_deleted
             fid = folder["id"]
-            if fid in skip_folder_ids:
+            # Also skip by Graph well-known name so we never drain Deleted Items if
+            # the dedicated GET …/deleteditems above failed to resolve the id.
+            wkf = (folder.get("wellKnownFolderName") or "").lower()
+            if fid in skip_folder_ids or wkf == "deleteditems":
                 return
             display = folder.get("displayName", "?")
             total = folder.get("totalItemCount", 0) or 0
@@ -778,7 +781,7 @@ class Orchestrator:
                 for child in _enum(
                     f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
                     f"?$top=100"
-                    f"&$select=id,displayName,totalItemCount,childFolderCount"
+                    f"&$select=id,displayName,totalItemCount,childFolderCount,wellKnownFolderName"
                 ):
                     _walk(child)
             if total > 0:
@@ -787,7 +790,7 @@ class Orchestrator:
         top = _enum(
             f"/users/{upn}/mailFolders"
             f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
+            f"&$select=id,displayName,totalItemCount,childFolderCount,wellKnownFolderName"
         )
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
