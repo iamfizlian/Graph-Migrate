@@ -555,6 +555,7 @@ The GUI includes:
 - Dashboard and prior-run status from `.pstmigrate-state/state.sqlite`
 - Config and mapping preview pages
 - Validation, import, import-all, purge, and reset-state job forms
+- A run-page checkbox for mail remediation re-runs that imports previously skipped duplicate message copies
 - One active mutating job at a time
 - Explicit confirmation for destructive tools
 - Logs browser for JSONL run logs
@@ -591,6 +592,21 @@ pstmigrate validate -c config.toml -m mapping.csv -M emmak@contoso.onmicrosoft.c
 Resume is per-(mailbox, PST), so it is safe to migrate a single mailbox now,
 then come back later and run the full mapping — the canary's already-imported
 messages will be skipped.
+
+If you need to remediate a mailbox by importing duplicate message copies that
+were previously recorded as skipped because another source message had the same
+Message-ID, scope the re-run to that mailbox/PST and add
+`--import-skipped-duplicates`:
+
+```bash
+pstmigrate import -c config.toml -m mapping.csv \
+  -M emmak@contoso.onmicrosoft.com \
+  --import-skipped-duplicates
+```
+
+Exact source rows that are already marked done are still skipped; the flag only
+changes handling for separate source `.eml` rows whose dedupe key already has a
+completed import in the target mailbox.
 
 ## Post-import remediation: clearing stuck "draft" flags
 

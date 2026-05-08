@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from jtet_pstmigrate.jobs import JobSpec, run_job
+from jtet_pstmigrate.orchestrator import RunReport
 from jtet_pstmigrate.reports import StateQueries
 from jtet_pstmigrate.services import load_config
 from jtet_pstmigrate.state import StateStore
@@ -41,6 +42,36 @@ def test_state_queries_dashboard_totals(tmp_path: Path) -> None:
     assert totals.failed == 1
 
 
+def test_run_job_passes_duplicate_import_mode_to_orchestrator(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, bool] = {}
+
+    class FakePool:
+        def __init__(self, apps) -> None:
+            self.apps = apps
+
+    class FakeOrchestrator:
+        def __init__(self, cfg, state, pool, *, import_skipped_duplicates: bool = False) -> None:
+            captured["import_skipped_duplicates"] = import_skipped_duplicates
+
+        def run(self, rows):
+            return [RunReport(pst_path=rows[0].pst_path, mailbox=rows[0].target_mailbox, status="done")]
+
+    monkeypatch.setattr("jtet_pstmigrate.jobs.AppPool", FakePool)
+    monkeypatch.setattr("jtet_pstmigrate.jobs.Orchestrator", FakeOrchestrator)
+
+    record = run_job(
+        JobSpec(
+            kind="import-mail",
+            config_path=_config_file(tmp_path),
+            mapping_path=_mapping_file(tmp_path),
+            import_skipped_duplicates=True,
+        )
+    )
+
+    assert record.status == "done"
+    assert captured["import_skipped_duplicates"] is True
+
+
 def test_run_job_blocks_destructive_without_confirmation(tmp_path: Path) -> None:
     record = run_job(
         JobSpec(
@@ -75,3 +106,13 @@ readpst_binary = "readpst"
     )
     return config
 
+
+def _mapping_file(tmp_path: Path) -> Path:
+    pst = tmp_path / "a.pst"
+    pst.write_bytes(b"")
+    mapping = tmp_path / "mapping.csv"
+    mapping.write_text(
+        f"PSTPath,TargetMailbox,TargetRootFolder\n{pst},alice@example.com,Imported\n",
+        encoding="utf-8",
+    )
+    return mapping
