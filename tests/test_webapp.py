@@ -106,7 +106,10 @@ async def test_terminal_job_panel_stops_htmx_polling(tmp_path: Path) -> None:
 
     class DoneJobs:
         def get(self, job_id: str):
-            return JobRecord(job_id=job_id, kind="import-mail", status="done")
+            record = JobRecord(job_id=job_id, kind="import-mail", status="done")
+            record.record_progress({"total_delta": 4, "activity": "Processing mailbox"})
+            record.record_progress({"increment": 2, "outcome": "uploaded", "activity": "Uploaded 2/4"})
+            return record
 
     app.state.jobs = DoneJobs()
     transport = httpx.ASGITransport(app=app)
@@ -116,6 +119,39 @@ async def test_terminal_job_panel_stops_htmx_polling(tmp_path: Path) -> None:
 
     assert response.status_code == 286
     assert "Status:</strong> done" in response.text
+    assert "2/4 items processed (50%)" in response.text
+    assert "0 cancelled" in response.text
+    assert "Stop job" not in response.text
+    assert "Uploaded 2/4" in response.text
+
+
+@pytest.mark.anyio
+async def test_running_job_panel_shows_stop_button(tmp_path: Path) -> None:
+    app = create_app(config_path=_config_file(tmp_path), mapping_path=_mapping_file(tmp_path))
+
+    class RunningJobs:
+        cancelled = False
+
+        def get(self, job_id: str):
+            return JobRecord(job_id=job_id, kind="import-mail", status="running")
+
+        def cancel(self, job_id: str):
+            self.cancelled = True
+            return True
+
+    jobs = RunningJobs()
+    app.state.jobs = jobs
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        panel = await client.get("/jobs/running/panel")
+        response = await client.post("/jobs/running/cancel", follow_redirects=False)
+
+    assert panel.status_code == 200
+    assert "Stop job" in panel.text
+    assert response.status_code == 303
+    assert response.headers["location"] == "/jobs/running"
+    assert jobs.cancelled is True
 
 
 @pytest.mark.anyio

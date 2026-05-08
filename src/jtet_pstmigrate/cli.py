@@ -1183,7 +1183,9 @@ def web(
         console.print(f"[yellow]Warning:[/] mapping file does not exist yet: {mapping}")
 
     console.print(f"[green]Starting pstmigrate web UI[/] at http://{host}:{port}")
-    uvicorn.run(create_app(config_path=config, mapping_path=mapping), host=host, port=port)
+    # The browser polls job panels frequently while work is running; suppress
+    # Uvicorn access logs so the terminal stays useful for migration logs.
+    uvicorn.run(create_app(config_path=config, mapping_path=mapping), host=host, port=port, access_log=False)
 
 
 def main() -> None:
