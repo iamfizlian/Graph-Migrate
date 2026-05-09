@@ -45,7 +45,7 @@ from jtet_pstmigrate.contact_uploader import (
     ContactUploadError,
 )
 from jtet_pstmigrate.folder_manager import FolderManager
-from jtet_pstmigrate.graph_client import GraphClient, GraphError
+from jtet_pstmigrate.graph_client import GRAPH_BASE, GraphClient, GraphError
 from jtet_pstmigrate.pst_reader import (
     ExtractedAppointment,
     ExtractedContact,
@@ -90,6 +90,27 @@ def load_mapping(csv_path: Path) -> list[MappingRow]:
             )
             rows.append(row)
     return rows
+
+
+def _graph_collect_paged(graph: GraphClient, initial_path: str) -> list[dict]:
+    """Page through a Graph collection following ``@odata.nextLink``.
+
+    Any failure from ``graph.get`` or ``.json()`` propagates to the caller.
+    The purge-mail path used to swallow these and treat the mailbox as empty,
+    which produced a false success exit code.
+    """
+    out: list[dict] = []
+    next_url: str | None = initial_path
+    while next_url:
+        body = graph.get(next_url, expect_status=(200,)).json()
+        out.extend(body.get("value", []))
+        link = body.get("@odata.nextLink")
+        next_url = (
+            str(link)[len(GRAPH_BASE) :]
+            if link and str(link).startswith(GRAPH_BASE)
+            else link
+        )
+    return out
 
 
 class Orchestrator:
@@ -668,27 +689,6 @@ class Orchestrator:
         msg_errors = 0
         folder_deleted = 0
 
-        def _strip_host(url: str | None) -> str | None:
-            if url and url.startswith("https://graph.microsoft.com/v1.0"):
-                return url[len("https://graph.microsoft.com/v1.0"):]
-            return url
-
-        def _enum(path: str) -> list[dict]:
-            """Page through a Graph collection, returning all values."""
-            out: list[dict] = []
-            next_url: str | None = path
-            while next_url:
-                try:
-                    body = graph.get(
-                        next_url, expect_status=(200,)
-                    ).json()
-                except Exception as e:
-                    log.warning("enum GET failed at {}: {}", next_url, e)
-                    return out
-                out.extend(body.get("value", []))
-                next_url = _strip_host(body.get("@odata.nextLink"))
-            return out
-
         def _delete_message(mid: str) -> str:
             try:
                 graph.delete(
@@ -713,9 +713,10 @@ class Orchestrator:
             nonlocal msg_deleted, msg_missing, msg_errors
             ids = [
                 m["id"]
-                for m in _enum(
+                for m in _graph_collect_paged(
+                    graph,
                     f"/users/{upn}/mailFolders/{quote(fid)}/messages"
-                    f"?$top=999&$select=id"
+                    f"?$top=999&$select=id",
                 )
             ]
             if not ids:
@@ -775,19 +776,21 @@ class Orchestrator:
                 return
 
             if kids > 0:
-                for child in _enum(
+                for child in _graph_collect_paged(
+                    graph,
                     f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
                     f"?$top=100"
-                    f"&$select=id,displayName,totalItemCount,childFolderCount"
+                    f"&$select=id,displayName,totalItemCount,childFolderCount",
                 ):
                     _walk(child)
             if total > 0:
                 _drain_folder_messages(fid)
 
-        top = _enum(
+        top = _graph_collect_paged(
+            graph,
             f"/users/{upn}/mailFolders"
             f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
+            f"&$select=id,displayName,totalItemCount,childFolderCount",
         )
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
