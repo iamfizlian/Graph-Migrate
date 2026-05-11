@@ -135,6 +135,57 @@ def test_run_job_blocks_destructive_without_confirmation(tmp_path: Path) -> None
     assert "Confirmation is required" in (record.last_error or "")
 
 
+def test_run_job_setup_entra_writes_config(tmp_path: Path, monkeypatch) -> None:
+    from jtet_pstmigrate.entra_setup import CreatedMigrationApp
+
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        kwargs["device_flow_callback"](
+            {
+                "user_code": "ABCD-1234",
+                "verification_uri": "https://microsoft.com/devicelogin",
+                "expires_in": 900,
+            }
+        )
+        kwargs["event_callback"]("Created pstmigrate")
+        return [
+            CreatedMigrationApp(
+                name="pstmigrate",
+                tenant_id=kwargs["tenant_id"],
+                client_id="00000000-0000-0000-0000-000000000000",
+                client_secret="secret",
+                secret_expires_at="2026-12-01T00:00:00Z",
+                app_object_id="app-object",
+                service_principal_id="sp-object",
+                permissions=["Mail.ReadWrite"],
+            )
+        ]
+
+    monkeypatch.setattr("jtet_pstmigrate.jobs.create_migration_apps_with_device_login", fake_create)
+
+    config = tmp_path / "config.toml"
+    record = run_job(
+        JobSpec(
+            kind="setup-entra",
+            config_path=config,
+            tenant_id="contoso.onmicrosoft.com",
+            app_count=1,
+            secret_lifetime_days=180,
+            permission_preset="mail",
+            app_prefix="pstmigrate",
+        )
+    )
+
+    assert record.status == "done"
+    assert config.exists()
+    assert captured["tenant_id"] == "contoso.onmicrosoft.com"
+    assert captured["permission_preset"] == "mail"
+    assert record.result["apps"][0]["client_id"] == "00000000-0000-0000-0000-000000000000"
+    assert any("ABCD-1234" in event["message"] for event in record.events)
+
+
 def _config_file(tmp_path: Path) -> Path:
     config = tmp_path / "config.toml"
     config.write_text(
