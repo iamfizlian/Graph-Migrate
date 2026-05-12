@@ -189,6 +189,54 @@ async def test_web_config_page_can_create_config(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_web_config_page_can_submit_entra_setup(tmp_path: Path) -> None:
+    app = create_app(config_path=tmp_path / "config.toml", mapping_path=_mapping_file(tmp_path))
+
+    class CapturingJobs:
+        def __init__(self) -> None:
+            self.spec = None
+
+        def latest(self):
+            return []
+
+        def submit(self, spec):
+            self.spec = spec
+            return JobRecord(job_id="job123", kind=spec.kind)
+
+        def get(self, job_id: str):
+            return JobRecord(job_id=job_id, kind="setup-entra")
+
+    jobs = CapturingJobs()
+    app.state.jobs = jobs
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        config_page = await client.get("/config")
+        response = await client.post(
+            "/jobs",
+            data={
+                "kind": "setup-entra",
+                "tenant_id": "contoso.onmicrosoft.com",
+                "app_prefix": "pstmigrate",
+                "app_count": "3",
+                "secret_lifetime_days": "90",
+                "permission_preset": "mail",
+            },
+            follow_redirects=False,
+        )
+
+    assert config_page.status_code == 200
+    assert "Create Entra Apps" in config_page.text
+    assert response.status_code == 303
+    assert jobs.spec is not None
+    assert jobs.spec.kind == "setup-entra"
+    assert jobs.spec.tenant_id == "contoso.onmicrosoft.com"
+    assert jobs.spec.app_count == 3
+    assert jobs.spec.secret_lifetime_days == 90
+    assert jobs.spec.permission_preset == "mail"
+
+
+@pytest.mark.anyio
 async def test_mapping_aware_pages_render_select_options(tmp_path: Path) -> None:
     transport = httpx.ASGITransport(
         app=create_app(config_path=_config_file(tmp_path), mapping_path=_mapping_file(tmp_path))

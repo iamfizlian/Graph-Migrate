@@ -146,6 +146,28 @@ TEMPLATES: dict[str, str] = {
 </section>
 
 <section class="panel">
+  <h2>Create Entra Apps</h2>
+  <form method="post" action="/jobs">
+    <input type="hidden" name="kind" value="setup-entra">
+    <div class="row">
+      <div><label>Tenant ID or domain</label><input name="tenant_id" value="{{ form.tenant_id }}" required></div>
+      <div><label>App name prefix</label><input name="app_prefix" value="pstmigrate"></div>
+    </div>
+    <div class="row">
+      <div><label>Number of apps</label><input name="app_count" type="number" min="1" max="20" value="1"></div>
+      <div><label>Secret lifetime days</label><input name="secret_lifetime_days" type="number" min="1" max="730" value="180"></div>
+    </div>
+    <label>Permission preset</label>
+    <select name="permission_preset">
+      <option value="full">Mail + calendar + contacts</option>
+      <option value="mail">Mail only</option>
+    </select>
+    <div class="actions"><button>Create Apps And Save Config</button></div>
+  </form>
+  <p class="muted">This starts a Microsoft device-code admin sign-in, creates app registrations and enterprise apps, grants Graph application permissions, then writes the resulting app pool to config.toml.</p>
+</section>
+
+<section class="panel">
   <h2>Microsoft Graph App</h2>
   <form method="post" action="/config">
     <div class="row">
@@ -594,6 +616,11 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
         pst: Annotated[str, Form()] = "",
         confirmed: Annotated[str | None, Form()] = None,
         import_skipped_duplicates: Annotated[str | None, Form()] = None,
+        tenant_id: Annotated[str, Form()] = "",
+        app_prefix: Annotated[str, Form()] = "pstmigrate",
+        app_count: Annotated[int, Form()] = 1,
+        secret_lifetime_days: Annotated[int, Form()] = 180,
+        permission_preset: Annotated[str, Form()] = "full",
     ) -> RedirectResponse:
         spec = JobSpec(
             kind=kind,
@@ -605,6 +632,11 @@ def create_app(config_path: Path | None = None, mapping_path: Path | None = None
             ),
             confirmed=confirmed == "yes",
             import_skipped_duplicates=import_skipped_duplicates == "yes",
+            tenant_id=tenant_id,
+            app_prefix=app_prefix,
+            app_count=app_count,
+            secret_lifetime_days=secret_lifetime_days,
+            permission_preset="mail" if permission_preset == "mail" else "full",
         )
         record = app.state.jobs.submit(spec)
         return RedirectResponse(f"/jobs/{record.job_id}", status_code=303)

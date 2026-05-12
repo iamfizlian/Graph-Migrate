@@ -381,6 +381,33 @@ paste into `config.toml` come from. You need to do this **once per tenant**,
 not once per mailbox. Requires Global Admin (or Application Administrator +
 Privileged Role Administrator) in the **destination** tenant.
 
+### Automated setup
+
+The fastest path is to let `pstmigrate` create the app registration(s), matching
+enterprise app(s), Graph application permissions, admin consent assignments, and
+`config.toml` entries for you:
+
+```powershell
+pstmigrate setup-entra `
+  --tenant contoso.onmicrosoft.com `
+  --apps 1 `
+  --secret-days 180 `
+  --permission-preset full `
+  --config config.toml
+```
+
+`--permission-preset full` grants `Mail.ReadWrite`, `Calendars.ReadWrite`, and
+`Contacts.ReadWrite` for the web GUI's mail/calendar/contact workflows. Use
+`--permission-preset mail` for mail-only migration. Use `--apps 2` or higher if
+you want a multi-app pool for more Graph throughput.
+
+The web GUI exposes the same flow from the **Config** tab under **Create Entra
+Apps**. It shows the Microsoft device-code sign-in instructions in the job
+panel, then writes the generated app credentials to `config.toml`.
+
+The manual steps below are still useful if you prefer to create or audit the
+Entra objects yourself.
+
 ### 1. Register the app
 
 1. Sign in to <https://entra.microsoft.com> as a Global Admin.

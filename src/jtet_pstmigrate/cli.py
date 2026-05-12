@@ -13,6 +13,11 @@ from rich.table import Table
 
 from jtet_pstmigrate.auth import AppPool
 from jtet_pstmigrate.config import AppConfig, MappingRow
+from jtet_pstmigrate.entra_setup import (
+    PermissionPreset,
+    create_migration_apps_with_device_login,
+    write_config_for_created_apps,
+)
 from jtet_pstmigrate.graph_client import GraphClient
 from jtet_pstmigrate.log import configure_logging
 from jtet_pstmigrate.mapping import load_mapping
@@ -223,6 +228,65 @@ readpst_binary = "readpst"
         r"Edit the [bold]\[\[apps]][/] section(s), then run "
         "[bold]pstmigrate validate -c config.toml -m mapping.csv[/]"
     )
+
+
+@app.command("setup-entra")
+def setup_entra(
+    tenant: Annotated[str, typer.Option("--tenant", "-t", help="Tenant ID or domain")] = ...,
+    config: Annotated[Path, typer.Option("--config", "-c", help="Config file to write")] = Path("config.toml"),
+    apps: Annotated[int, typer.Option("--apps", help="Number of app registrations to create")] = 1,
+    app_prefix: Annotated[str, typer.Option("--app-prefix", help="Display-name prefix")] = "pstmigrate",
+    secret_days: Annotated[int, typer.Option("--secret-days", help="Client secret lifetime in days")] = 180,
+    permission_preset: Annotated[
+        PermissionPreset,
+        typer.Option("--permission-preset", help="Graph permission preset: full or mail"),
+    ] = "full",
+    force: Annotated[bool, typer.Option("--force", "-f", help="Overwrite existing config file")] = False,
+) -> None:
+    """Create Entra app registrations and write their credentials to config.toml."""
+    if config.exists() and not force:
+        console.print(
+            f"[red]{config} already exists.[/] Refusing to overwrite — pass [bold]--force[/] "
+            f"if you want setup to replace it."
+        )
+        raise typer.Exit(1)
+
+    def show_device_flow(flow: dict) -> None:
+        console.print("")
+        console.print("[yellow]Admin sign-in required[/]")
+        console.print(f"Open: [green]{flow.get('verification_uri')}[/]")
+        console.print(f"Code: [bold green]{flow.get('user_code')}[/]")
+        console.print("")
+
+    def show_event(message: str) -> None:
+        console.print(f"[cyan]{message}[/]")
+
+    created_apps = create_migration_apps_with_device_login(
+        tenant_id=tenant,
+        app_prefix=app_prefix,
+        app_count=apps,
+        secret_lifetime_days=secret_days,
+        permission_preset=permission_preset,
+        device_flow_callback=show_device_flow,
+        event_callback=show_event,
+    )
+    write_config_for_created_apps(config, created_apps)
+
+    table = Table(title="Created Entra Apps")
+    table.add_column("Name")
+    table.add_column("Client ID")
+    table.add_column("Secret Expires")
+    table.add_column("Permissions")
+    for created in created_apps:
+        table.add_row(
+            created.name,
+            created.client_id,
+            created.secret_expires_at,
+            ", ".join(created.permissions),
+        )
+    console.print(table)
+    console.print(f"[green]Wrote {config}[/]")
+    console.print("[yellow]Client secrets are stored in the config file. Protect it like a credential.[/]")
 
 
 @app.command()
