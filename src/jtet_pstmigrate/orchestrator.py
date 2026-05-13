@@ -88,8 +88,25 @@ def load_mapping(csv_path: Path) -> list[MappingRow]:
                 target_mailbox=raw["TargetMailbox"].strip(),
                 target_root_folder=(raw.get("TargetRootFolder") or "").strip(),
             )
-            rows.append(row)
+            rows.append(row            )
     return rows
+
+
+def _deleted_items_folder_id(graph: GraphClient, quoted_upn: str) -> str:
+    """Return Graph folder id for well-known ``deleteditems``.
+
+    Used by mail purge so we never walk that subtree. Raises if the id
+    cannot be determined — callers must abort rather than risk draining
+    recoverable deleted mail.
+    """
+    resp = graph.get(
+        f"/users/{quoted_upn}/mailFolders/deleteditems",
+        expect_status=(200,),
+    )
+    fid = resp.json().get("id")
+    if not fid:
+        raise ValueError("mailFolders/deleteditems response had no id")
+    return str(fid)
 
 
 class Orchestrator:
@@ -571,7 +588,9 @@ class Orchestrator:
     # entirely. The user has been clear that what's there doesn't
     # matter; we don't enter that subtree at all. Deleted folders /
     # messages may end up there as a side effect of the regular
-    # DELETE-soft-delete semantics, which is also fine.
+    # DELETE-soft-delete semantics, which is also fine. If that lookup
+    # fails we abort the mailbox — without the folder id we could not
+    # skip Deleted Items and would delete recoverable mail there.
     #
     # We deliberately do NOT consult the local `messages` state table.
     # That table is cleared by `reset-state`, and even when it isn't,
@@ -649,18 +668,15 @@ class Orchestrator:
 
         # Folder ids whose subtree we never enter. The well-known name
         # 'deleteditems' is locale-stable across tenants.
-        skip_folder_ids: set[str] = set()
         try:
-            resp = graph.get(
-                f"/users/{upn}/mailFolders/deleteditems",
-                expect_status=(200,),
-            )
-            skip_folder_ids.add(resp.json()["id"])
+            skip_folder_ids = {_deleted_items_folder_id(graph, upn)}
         except Exception as e:
-            log.warning(
-                "could not resolve deleteditems folder id: {} -- "
-                "continuing without skip", e,
+            log.error(
+                "Could not resolve Deleted Items folder id; refusing to purge this "
+                "mailbox (without it we could delete recoverable mail in Deleted Items). {}",
+                e,
             )
+            return (0, 0, 1)
 
         # Aggregated counters (closure-mutated by helpers below).
         msg_deleted = 0
