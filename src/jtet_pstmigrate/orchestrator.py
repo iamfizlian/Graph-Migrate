@@ -655,12 +655,21 @@ class Orchestrator:
                 f"/users/{upn}/mailFolders/deleteditems",
                 expect_status=(200,),
             )
-            skip_folder_ids.add(resp.json()["id"])
+            body = resp.json()
+            did = body.get("id") if isinstance(body, dict) else None
+            if not isinstance(did, str) or not did.strip():
+                log.error(
+                    "Refusing purge-mail: Deleted Items folder response had no id: {!r}",
+                    body,
+                )
+                return (0, 0, 1)
+            skip_folder_ids.add(did.strip())
         except Exception as e:
-            log.warning(
-                "could not resolve deleteditems folder id: {} -- "
-                "continuing without skip", e,
+            log.error(
+                "Refusing purge-mail: could not resolve Deleted Items folder id: {}",
+                e,
             )
+            return (0, 0, 1)
 
         # Aggregated counters (closure-mutated by helpers below).
         msg_deleted = 0
@@ -674,17 +683,15 @@ class Orchestrator:
             return url
 
         def _enum(path: str) -> list[dict]:
-            """Page through a Graph collection, returning all values."""
+            """Page through a Graph collection, returning all values.
+
+            Graph or transport failures propagate to the caller so we never
+            treat a failed enumeration as an empty mailbox.
+            """
             out: list[dict] = []
             next_url: str | None = path
             while next_url:
-                try:
-                    body = graph.get(
-                        next_url, expect_status=(200,)
-                    ).json()
-                except Exception as e:
-                    log.warning("enum GET failed at {}: {}", next_url, e)
-                    return out
+                body = graph.get(next_url, expect_status=(200,)).json()
                 out.extend(body.get("value", []))
                 next_url = _strip_host(body.get("@odata.nextLink"))
             return out
