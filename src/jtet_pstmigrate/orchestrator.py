@@ -659,7 +659,8 @@ class Orchestrator:
         except Exception as e:
             log.warning(
                 "could not resolve deleteditems folder id: {} -- "
-                "continuing without skip", e,
+                "continuing (folders are still skipped when Graph returns "
+                "wellKnownName=deleteditems on each row)", e,
             )
 
         # Aggregated counters (closure-mutated by helpers below).
@@ -674,7 +675,12 @@ class Orchestrator:
             return url
 
         def _enum(path: str) -> list[dict]:
-            """Page through a Graph collection, returning all values."""
+            """Page through a Graph collection, returning all values.
+
+            Any failure mid-pagination aborts the whole enumeration. Returning
+            a partial page list would leave part of the mailbox unprocessed
+            while the CLI still reports a successful purge.
+            """
             out: list[dict] = []
             next_url: str | None = path
             while next_url:
@@ -683,8 +689,8 @@ class Orchestrator:
                         next_url, expect_status=(200,)
                     ).json()
                 except Exception as e:
-                    log.warning("enum GET failed at {}: {}", next_url, e)
-                    return out
+                    log.error("enum GET failed at {}: {}", next_url, e)
+                    raise
                 out.extend(body.get("value", []))
                 next_url = _strip_host(body.get("@odata.nextLink"))
             return out
@@ -737,6 +743,10 @@ class Orchestrator:
             fid = folder["id"]
             if fid in skip_folder_ids:
                 return
+            # Backup when /mailFolders/deleteditems could not be resolved: Graph
+            # exposes a locale-stable wellKnownName on default folders.
+            if (folder.get("wellKnownName") or "").lower() == "deleteditems":
+                return
             display = folder.get("displayName", "?")
             total = folder.get("totalItemCount", 0) or 0
             kids = folder.get("childFolderCount", 0) or 0
@@ -778,7 +788,7 @@ class Orchestrator:
                 for child in _enum(
                     f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
                     f"?$top=100"
-                    f"&$select=id,displayName,totalItemCount,childFolderCount"
+                    f"&$select=id,displayName,wellKnownName,totalItemCount,childFolderCount"
                 ):
                     _walk(child)
             if total > 0:
@@ -787,7 +797,7 @@ class Orchestrator:
         top = _enum(
             f"/users/{upn}/mailFolders"
             f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
+            f"&$select=id,displayName,wellKnownName,totalItemCount,childFolderCount"
         )
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
