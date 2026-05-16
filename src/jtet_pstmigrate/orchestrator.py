@@ -92,6 +92,22 @@ def load_mapping(csv_path: Path) -> list[MappingRow]:
     return rows
 
 
+def _purge_mail_skip_deleted_items_folder(folder: dict, skip_folder_ids: set[str]) -> bool:
+    """Return True if ``folder`` is the Deleted Items root — never delete or drain it.
+
+    We normally resolve its id up front and add it to ``skip_folder_ids``. If that
+    GET fails (throttle, transport, permission blip), we must still skip the folder
+    or we would treat it as "protected", recurse, and **per-message DELETE** every
+    item the user still has in trash — contradicting the purge-mail contract.
+    Graph exposes ``wellKnownName`` (``deleteditems``, locale-stable) for this.
+    """
+    fid = folder.get("id")
+    if fid and fid in skip_folder_ids:
+        return True
+    wkn = (folder.get("wellKnownName") or "").strip().lower()
+    return wkn == "deleteditems"
+
+
 class Orchestrator:
     def __init__(self, cfg: AppConfig, state: StateStore, pool: AppPool):
         self._cfg = cfg
@@ -659,7 +675,8 @@ class Orchestrator:
         except Exception as e:
             log.warning(
                 "could not resolve deleteditems folder id: {} -- "
-                "continuing without skip", e,
+                "relying on wellKnownName from folder enumeration to skip trash",
+                e,
             )
 
         # Aggregated counters (closure-mutated by helpers below).
@@ -735,7 +752,7 @@ class Orchestrator:
             """Try to cascade-delete ``folder``; otherwise recurse + drain."""
             nonlocal msg_deleted, msg_errors, folder_deleted
             fid = folder["id"]
-            if fid in skip_folder_ids:
+            if _purge_mail_skip_deleted_items_folder(folder, skip_folder_ids):
                 return
             display = folder.get("displayName", "?")
             total = folder.get("totalItemCount", 0) or 0
@@ -778,7 +795,7 @@ class Orchestrator:
                 for child in _enum(
                     f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
                     f"?$top=100"
-                    f"&$select=id,displayName,totalItemCount,childFolderCount"
+                    f"&$select=id,displayName,wellKnownName,totalItemCount,childFolderCount"
                 ):
                     _walk(child)
             if total > 0:
@@ -787,7 +804,7 @@ class Orchestrator:
         top = _enum(
             f"/users/{upn}/mailFolders"
             f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
+            f"&$select=id,displayName,wellKnownName,totalItemCount,childFolderCount"
         )
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
