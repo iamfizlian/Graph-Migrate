@@ -648,19 +648,35 @@ class Orchestrator:
         workers = max(1, self._cfg.migration.workers_per_mailbox)
 
         # Folder ids whose subtree we never enter. The well-known name
-        # 'deleteditems' is locale-stable across tenants.
+        # ``deleteditems`` is locale-stable across tenants.  If we cannot
+        # resolve that folder's id we MUST abort: without the skip set,
+        # ``_walk`` would treat Deleted Items like any other folder and
+        # parallel-DELETE every message inside it -- wiping mail the user
+        # had already discarded (often intentionally kept for a window)
+        # even though this tool's job is only to clear space for re-import.
         skip_folder_ids: set[str] = set()
         try:
             resp = graph.get(
                 f"/users/{upn}/mailFolders/deleteditems",
                 expect_status=(200,),
             )
-            skip_folder_ids.add(resp.json()["id"])
+            di_id = resp.json().get("id")
+            if not di_id:
+                log.error(
+                    "deleteditems response missing id; refusing purge for {}",
+                    mailbox,
+                )
+                return (0, 0, 1)
+            skip_folder_ids.add(di_id)
         except Exception as e:
-            log.warning(
-                "could not resolve deleteditems folder id: {} -- "
-                "continuing without skip", e,
+            log.error(
+                "Could not resolve Deleted Items folder id for {}: {} — "
+                "aborting this mailbox purge so we never drain that folder "
+                "without an explicit skip.",
+                mailbox,
+                e,
             )
+            return (0, 0, 1)
 
         # Aggregated counters (closure-mutated by helpers below).
         msg_deleted = 0
@@ -674,17 +690,17 @@ class Orchestrator:
             return url
 
         def _enum(path: str) -> list[dict]:
-            """Page through a Graph collection, returning all values."""
+            """Page through a Graph collection, returning all values.
+
+            Any failure while paging propagates to the caller so we never
+            treat a truncated page set as a complete snapshot (which would
+            either skip real folders/messages or falsely report "nothing to
+            purge" after a transient Graph error).
+            """
             out: list[dict] = []
             next_url: str | None = path
             while next_url:
-                try:
-                    body = graph.get(
-                        next_url, expect_status=(200,)
-                    ).json()
-                except Exception as e:
-                    log.warning("enum GET failed at {}: {}", next_url, e)
-                    return out
+                body = graph.get(next_url, expect_status=(200,)).json()
                 out.extend(body.get("value", []))
                 next_url = _strip_host(body.get("@odata.nextLink"))
             return out
@@ -784,17 +800,26 @@ class Orchestrator:
             if total > 0:
                 _drain_folder_messages(fid)
 
-        top = _enum(
-            f"/users/{upn}/mailFolders"
-            f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
-        )
-        if not top:
-            log.info("Nothing to purge -- mailFolders enum returned 0 entries")
-            return (0, 0, 0)
+        try:
+            top = _enum(
+                f"/users/{upn}/mailFolders"
+                f"?$top=100"
+                f"&$select=id,displayName,totalItemCount,childFolderCount"
+            )
+            if not top:
+                log.info("Nothing to purge -- mailFolders enum returned 0 entries")
+                return (0, 0, 0)
 
-        for f in top:
-            _walk(f)
+            for f in top:
+                _walk(f)
+        except Exception as e:
+            log.exception(
+                "purge-mail failed partway through {} (partial deletes may "
+                "have occurred): {}",
+                mailbox,
+                e,
+            )
+            return (msg_deleted, msg_missing, msg_errors + 1)
 
         log.info(
             "Done. folders_deleted={} messages_deleted~={} missing={} errors={}",
