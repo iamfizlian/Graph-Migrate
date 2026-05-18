@@ -75,6 +75,23 @@ class RunReport:
     last_error: str | None = None
 
 
+def _purge_mail_skip_folder_tree(folder: dict, skip_folder_ids: set[str]) -> bool:
+    """Return True if this folder's entire subtree must not be touched.
+
+    ``purge-mail`` promises to leave ``Deleted Items`` alone. We normally
+    record its id via ``GET .../mailFolders/deleteditems``, but that call can
+    fail transiently (throttle, network). Enumeration still returns the same
+    folder with ``wellKnownFolderName`` set to ``deleteditems`` (locale-
+    stable), so we skip on either signal and avoid draining the user's trash
+    when the dedicated lookup failed.
+    """
+    fid = folder.get("id")
+    if fid and fid in skip_folder_ids:
+        return True
+    wkn = (folder.get("wellKnownFolderName") or "").strip().lower()
+    return wkn == "deleteditems"
+
+
 def load_mapping(csv_path: Path) -> list[MappingRow]:
     rows: list[MappingRow] = []
     with open(csv_path, encoding="utf-8-sig", newline="") as f:
@@ -567,11 +584,10 @@ class Orchestrator:
     #      _walk into each (their subtrees might be deletable),
     #      then drain the folder's own messages with parallel DELETE.
     #
-    # Deleted Items is resolved up front by well-known name and skipped
-    # entirely. The user has been clear that what's there doesn't
-    # matter; we don't enter that subtree at all. Deleted folders /
-    # messages may end up there as a side effect of the regular
-    # DELETE-soft-delete semantics, which is also fine.
+    # Deleted Items is skipped entirely: we resolve its id via
+    # ``GET .../mailFolders/deleteditems`` when possible, and we also skip
+    # any folder whose ``wellKnownFolderName`` is ``deleteditems`` so a
+    # failed id lookup cannot cause us to drain the user's trash anyway.
     #
     # We deliberately do NOT consult the local `messages` state table.
     # That table is cleared by `reset-state`, and even when it isn't,
@@ -734,8 +750,15 @@ class Orchestrator:
         def _walk(folder: dict) -> None:
             """Try to cascade-delete ``folder``; otherwise recurse + drain."""
             nonlocal msg_deleted, msg_errors, folder_deleted
-            fid = folder["id"]
-            if fid in skip_folder_ids:
+            if _purge_mail_skip_folder_tree(folder, skip_folder_ids):
+                return
+            fid = folder.get("id")
+            if not fid:
+                log.warning(
+                    "mailFolder missing id in purge walk, skipping ({})",
+                    folder.get("displayName", "?"),
+                )
+                msg_errors += 1
                 return
             display = folder.get("displayName", "?")
             total = folder.get("totalItemCount", 0) or 0
@@ -778,7 +801,7 @@ class Orchestrator:
                 for child in _enum(
                     f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
                     f"?$top=100"
-                    f"&$select=id,displayName,totalItemCount,childFolderCount"
+                    f"&$select=id,displayName,wellKnownFolderName,totalItemCount,childFolderCount"
                 ):
                     _walk(child)
             if total > 0:
@@ -787,7 +810,7 @@ class Orchestrator:
         top = _enum(
             f"/users/{upn}/mailFolders"
             f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
+            f"&$select=id,displayName,wellKnownFolderName,totalItemCount,childFolderCount"
         )
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
