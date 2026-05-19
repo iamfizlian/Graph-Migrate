@@ -215,10 +215,15 @@ _GRAPH_DAY = {
     "TH": "thursday", "FR": "friday", "SA": "saturday",
 }
 # BYDAY ordinal -> Graph relative-monthly index. Graph only supports the
-# first four positions and "last"; anything else falls back to single-event.
+# first four positions and "last". A fifth (or other) weekday position must
+# not be coerced to "last" — that would silently change the series; those
+# rules fall through (None) and the caller keeps the raw RRULE in the body.
 _GRAPH_INDEX = {
-    1: "first", 2: "second", 3: "third", 4: "fourth",
-    -1: "last", 5: "last",
+    1: "first",
+    2: "second",
+    3: "third",
+    4: "fourth",
+    -1: "last",
 }
 _BYDAY_RE = re.compile(r"^(-?\d+)?([A-Z]{2})$")
 
