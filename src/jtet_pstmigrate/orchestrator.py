@@ -647,21 +647,6 @@ class Orchestrator:
         log = logger.bind(ctx=f"purge-mail[{mailbox}]")
         workers = max(1, self._cfg.migration.workers_per_mailbox)
 
-        # Folder ids whose subtree we never enter. The well-known name
-        # 'deleteditems' is locale-stable across tenants.
-        skip_folder_ids: set[str] = set()
-        try:
-            resp = graph.get(
-                f"/users/{upn}/mailFolders/deleteditems",
-                expect_status=(200,),
-            )
-            skip_folder_ids.add(resp.json()["id"])
-        except Exception as e:
-            log.warning(
-                "could not resolve deleteditems folder id: {} -- "
-                "continuing without skip", e,
-            )
-
         # Aggregated counters (closure-mutated by helpers below).
         msg_deleted = 0
         msg_missing = 0
@@ -673,8 +658,13 @@ class Orchestrator:
                 return url[len("https://graph.microsoft.com/v1.0"):]
             return url
 
-        def _enum(path: str) -> list[dict]:
-            """Page through a Graph collection, returning all values."""
+        def _enum(path: str) -> tuple[list[dict], bool]:
+            """Page through a Graph collection.
+
+            Returns ``(values, complete)``. ``complete`` is False when a page
+            fetch fails partway through pagination so callers do not treat a
+            truncated list as the full mailbox tree (silent incomplete purge).
+            """
             out: list[dict] = []
             next_url: str | None = path
             while next_url:
@@ -683,11 +673,52 @@ class Orchestrator:
                         next_url, expect_status=(200,)
                     ).json()
                 except Exception as e:
-                    log.warning("enum GET failed at {}: {}", next_url, e)
-                    return out
+                    log.error("enum GET failed at {}: {}", next_url, e)
+                    return out, False
                 out.extend(body.get("value", []))
                 next_url = _strip_host(body.get("@odata.nextLink"))
-            return out
+            return out, True
+
+        # Folder ids whose subtree we never enter. Without a reliable id we
+        # would fall through to "drain messages" on the Deleted Items folder
+        # after DELETE is rejected -- wiping the user's native deleted mail,
+        # which contradicts the command contract.
+        skip_folder_ids: set[str] = set()
+        try:
+            resp = graph.get(
+                f"/users/{upn}/mailFolders/deleteditems",
+                expect_status=(200,),
+                params={"$select": "id"},
+            )
+            skip_folder_ids.add(resp.json()["id"])
+        except Exception as e:
+            log.warning("primary deleteditems folder resolution failed: {}", e)
+
+        if not skip_folder_ids:
+            roots, roots_ok = _enum(
+                f"/users/{upn}/mailFolders"
+                f"?$top=100"
+                f"&$select=id,wellKnownName"
+            )
+            if not roots_ok:
+                log.error(
+                    "cannot list mailFolders to resolve Deleted Items; "
+                    "aborting purge for this mailbox"
+                )
+                return (0, 0, 1)
+            for folder in roots:
+                wkn = (folder.get("wellKnownName") or "").lower()
+                if wkn == "deleteditems":
+                    skip_folder_ids.add(folder["id"])
+                    break
+
+        if not skip_folder_ids:
+            log.error(
+                "cannot resolve Deleted Items folder id; aborting purge for "
+                "this mailbox (without it we could delete messages in "
+                "Deleted Items)"
+            )
+            return (0, 0, 1)
 
         def _delete_message(mid: str) -> str:
             try:
@@ -711,13 +742,19 @@ class Orchestrator:
         def _drain_folder_messages(fid: str) -> None:
             """Per-message DELETE for a folder we couldn't cascade-delete."""
             nonlocal msg_deleted, msg_missing, msg_errors
-            ids = [
-                m["id"]
-                for m in _enum(
-                    f"/users/{upn}/mailFolders/{quote(fid)}/messages"
-                    f"?$top=999&$select=id"
+            rows, complete = _enum(
+                f"/users/{upn}/mailFolders/{quote(fid)}/messages"
+                f"?$top=999&$select=id"
+            )
+            if not complete:
+                log.error(
+                    "message enumeration incomplete for folder {}; "
+                    "aborting drain for this folder",
+                    fid,
                 )
-            ]
+                msg_errors += 1
+                return
+            ids = [m["id"] for m in rows]
             if not ids:
                 return
             with ThreadPoolExecutor(
@@ -775,20 +812,36 @@ class Orchestrator:
                 return
 
             if kids > 0:
-                for child in _enum(
+                children, ch_ok = _enum(
                     f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
                     f"?$top=100"
                     f"&$select=id,displayName,totalItemCount,childFolderCount"
-                ):
+                )
+                if not ch_ok:
+                    log.error(
+                        "childFolders enumeration incomplete under {!r} ({}); "
+                        "skipping further work in this branch",
+                        display,
+                        fid,
+                    )
+                    msg_errors += 1
+                    return
+                for child in children:
                     _walk(child)
             if total > 0:
                 _drain_folder_messages(fid)
 
-        top = _enum(
+        top, top_ok = _enum(
             f"/users/{upn}/mailFolders"
             f"?$top=100"
             f"&$select=id,displayName,totalItemCount,childFolderCount"
         )
+        if not top_ok:
+            log.error(
+                "top-level mailFolders enumeration incomplete; "
+                "aborting purge for this mailbox"
+            )
+            return (0, 0, 1)
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
             return (0, 0, 0)
