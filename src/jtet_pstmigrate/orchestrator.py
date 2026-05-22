@@ -92,6 +92,20 @@ def load_mapping(csv_path: Path) -> list[MappingRow]:
     return rows
 
 
+def _mail_folder_is_deleted_items(folder: dict) -> bool:
+    """True when Graph marks this mail folder as the Deleted Items well-known folder.
+
+    ``purge-mail`` must never recurse into or drain this subtree. We still
+    try to resolve ``/mailFolders/deleteditems`` up front so we can skip by
+    id, but that GET can fail while the folder still appears in the normal
+    ``/mailFolders`` enumeration — without this check we would treat Deleted
+    Items like any other protected folder and permanently DELETE every
+    message stored there (not just migration fallout).
+    """
+    wkn = folder.get("wellKnownFolderName")
+    return isinstance(wkn, str) and wkn.casefold() == "deleteditems"
+
+
 class Orchestrator:
     def __init__(self, cfg: AppConfig, state: StateStore, pool: AppPool):
         self._cfg = cfg
@@ -567,9 +581,11 @@ class Orchestrator:
     #      _walk into each (their subtrees might be deletable),
     #      then drain the folder's own messages with parallel DELETE.
     #
-    # Deleted Items is resolved up front by well-known name and skipped
-    # entirely. The user has been clear that what's there doesn't
-    # matter; we don't enter that subtree at all. Deleted folders /
+    # Deleted Items is skipped by id (GET .../mailFolders/deleteditems) and
+    # by ``wellKnownFolderName`` on every enumerated folder so a failed
+    # preliminary GET cannot cause us to drain the real Deleted Items tree.
+    # The user has been clear that what's there doesn't matter; we don't
+    # enter that subtree at all. Deleted folders /
     # messages may end up there as a side effect of the regular
     # DELETE-soft-delete semantics, which is also fine.
     #
@@ -735,7 +751,7 @@ class Orchestrator:
             """Try to cascade-delete ``folder``; otherwise recurse + drain."""
             nonlocal msg_deleted, msg_errors, folder_deleted
             fid = folder["id"]
-            if fid in skip_folder_ids:
+            if fid in skip_folder_ids or _mail_folder_is_deleted_items(folder):
                 return
             display = folder.get("displayName", "?")
             total = folder.get("totalItemCount", 0) or 0
@@ -778,7 +794,8 @@ class Orchestrator:
                 for child in _enum(
                     f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
                     f"?$top=100"
-                    f"&$select=id,displayName,totalItemCount,childFolderCount"
+                    f"&$select=id,displayName,totalItemCount,childFolderCount,"
+                    f"wellKnownFolderName"
                 ):
                     _walk(child)
             if total > 0:
@@ -787,7 +804,8 @@ class Orchestrator:
         top = _enum(
             f"/users/{upn}/mailFolders"
             f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
+            f"&$select=id,displayName,totalItemCount,childFolderCount,"
+            f"wellKnownFolderName"
         )
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
