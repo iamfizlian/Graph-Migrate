@@ -673,8 +673,16 @@ class Orchestrator:
                 return url[len("https://graph.microsoft.com/v1.0"):]
             return url
 
+        class _EnumerationFailed(Exception):
+            """Raised when a purge-mail folder/message listing cannot complete."""
+
         def _enum(path: str) -> list[dict]:
-            """Page through a Graph collection, returning all values."""
+            """Page through a Graph collection, returning all values.
+
+            On any GET failure we abort the whole mailbox job: returning a
+            partial page would silently skip the rest of the folder tree
+            (users would see a 'successful' purge with mail still left behind).
+            """
             out: list[dict] = []
             next_url: str | None = path
             while next_url:
@@ -684,7 +692,7 @@ class Orchestrator:
                     ).json()
                 except Exception as e:
                     log.warning("enum GET failed at {}: {}", next_url, e)
-                    return out
+                    raise _EnumerationFailed(next_url) from e
                 out.extend(body.get("value", []))
                 next_url = _strip_host(body.get("@odata.nextLink"))
             return out
@@ -784,17 +792,32 @@ class Orchestrator:
             if total > 0:
                 _drain_folder_messages(fid)
 
-        top = _enum(
-            f"/users/{upn}/mailFolders"
-            f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
-        )
+        try:
+            top = _enum(
+                f"/users/{upn}/mailFolders"
+                f"?$top=100"
+                f"&$select=id,displayName,totalItemCount,childFolderCount"
+            )
+        except _EnumerationFailed:
+            log.error(
+                "purge-mail aborted: could not finish listing mailFolders "
+                "for mailbox — destination may be only partially cleared"
+            )
+            return (msg_deleted, msg_missing, msg_errors + 1)
+
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
             return (0, 0, 0)
 
-        for f in top:
-            _walk(f)
+        try:
+            for f in top:
+                _walk(f)
+        except _EnumerationFailed:
+            log.error(
+                "purge-mail aborted mid-walk: folder/message listing failed — "
+                "destination may be only partially cleared"
+            )
+            return (msg_deleted, msg_missing, msg_errors + 1)
 
         log.info(
             "Done. folders_deleted={} messages_deleted~={} missing={} errors={}",
