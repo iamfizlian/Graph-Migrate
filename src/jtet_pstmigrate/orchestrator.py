@@ -92,6 +92,15 @@ def load_mapping(csv_path: Path) -> list[MappingRow]:
     return rows
 
 
+def _purge_mail_should_skip_folder(folder: dict, skip_folder_ids: set[str]) -> bool:
+    """Return True if this mailFolder must not be deleted or entered (Deleted Items subtree)."""
+    fid = folder.get("id")
+    if fid and fid in skip_folder_ids:
+        return True
+    wkn = (folder.get("wellKnownName") or "").casefold()
+    return wkn == "deleteditems"
+
+
 class Orchestrator:
     def __init__(self, cfg: AppConfig, state: StateStore, pool: AppPool):
         self._cfg = cfg
@@ -657,10 +666,17 @@ class Orchestrator:
             )
             skip_folder_ids.add(resp.json()["id"])
         except Exception as e:
-            log.warning(
-                "could not resolve deleteditems folder id: {} -- "
-                "continuing without skip", e,
+            # Without a stable Deleted Items id we must not run the tree walk:
+            # distinguished-folder fallback would treat Deleted Items like any
+            # other protected root and drain every message inside it, wiping
+            # unrelated trash the user expected to keep (docs promise we skip
+            # this subtree entirely).
+            log.error(
+                "cannot resolve Deleted Items folder id — refusing to purge "
+                "this mailbox (would risk draining Deleted Items): {}",
+                e,
             )
+            return (0, 0, 1)
 
         # Aggregated counters (closure-mutated by helpers below).
         msg_deleted = 0
@@ -674,17 +690,16 @@ class Orchestrator:
             return url
 
         def _enum(path: str) -> list[dict]:
-            """Page through a Graph collection, returning all values."""
+            """Page through a Graph collection, returning all values.
+
+            On failure, raises (after GraphClient retries) so we never continue
+            with a partial folder/message list — that would look like success
+            while leaving most of the mailbox intact.
+            """
             out: list[dict] = []
             next_url: str | None = path
             while next_url:
-                try:
-                    body = graph.get(
-                        next_url, expect_status=(200,)
-                    ).json()
-                except Exception as e:
-                    log.warning("enum GET failed at {}: {}", next_url, e)
-                    return out
+                body = graph.get(next_url, expect_status=(200,)).json()
                 out.extend(body.get("value", []))
                 next_url = _strip_host(body.get("@odata.nextLink"))
             return out
@@ -734,9 +749,9 @@ class Orchestrator:
         def _walk(folder: dict) -> None:
             """Try to cascade-delete ``folder``; otherwise recurse + drain."""
             nonlocal msg_deleted, msg_errors, folder_deleted
-            fid = folder["id"]
-            if fid in skip_folder_ids:
+            if _purge_mail_should_skip_folder(folder, skip_folder_ids):
                 return
+            fid = folder["id"]
             display = folder.get("displayName", "?")
             total = folder.get("totalItemCount", 0) or 0
             kids = folder.get("childFolderCount", 0) or 0
@@ -778,7 +793,7 @@ class Orchestrator:
                 for child in _enum(
                     f"/users/{upn}/mailFolders/{quote(fid)}/childFolders"
                     f"?$top=100"
-                    f"&$select=id,displayName,totalItemCount,childFolderCount"
+                    f"&$select=id,displayName,totalItemCount,childFolderCount,wellKnownName"
                 ):
                     _walk(child)
             if total > 0:
@@ -787,7 +802,7 @@ class Orchestrator:
         top = _enum(
             f"/users/{upn}/mailFolders"
             f"?$top=100"
-            f"&$select=id,displayName,totalItemCount,childFolderCount"
+            f"&$select=id,displayName,totalItemCount,childFolderCount,wellKnownName"
         )
         if not top:
             log.info("Nothing to purge -- mailFolders enum returned 0 entries")
