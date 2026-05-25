@@ -567,6 +567,11 @@ class Orchestrator:
     #      _walk into each (their subtrees might be deletable),
     #      then drain the folder's own messages with parallel DELETE.
     #
+    #      Any *other* terminal DELETE failure (429 after retries, 5xx,
+    #      etc.) uses the same fallback. Otherwise a throttle on
+    #      cascade-delete would skip the entire subtree and ``purge-mail``
+    #      would report success while leaving mail behind.
+    #
     # Deleted Items is resolved up front by well-known name and skipped
     # entirely. The user has been clear that what's there doesn't
     # matter; we don't enter that subtree at all. Deleted folders /
@@ -755,18 +760,29 @@ class Orchestrator:
                 )
                 return
             except GraphError as e:
-                if e.status not in (400, 403, 405):
-                    log.warning(
-                        "DELETE folder {!r} ({}) failed: {} {}",
-                        display, fid, e.status, e.body,
+                if e.status == 404:
+                    # Already removed (race, prior partial run, or parent
+                    # cascade) — nothing left under this id.
+                    log.debug(
+                        "folder {!r} already gone (404 on DELETE), skipping",
+                        display,
                     )
-                    msg_errors += 1
                     return
-                # Distinguished / protected folder -- fall through.
-                log.debug(
-                    "folder {!r} is protected, draining contents in place",
-                    display,
-                )
+                if e.status in (400, 403, 405):
+                    # Distinguished / protected folder -- fall through.
+                    log.debug(
+                        "folder {!r} is protected, draining contents in place",
+                        display,
+                    )
+                else:
+                    log.warning(
+                        "DELETE folder {!r} ({}) failed: {} {} — "
+                        "falling back to child walk + per-message delete",
+                        display,
+                        fid,
+                        e.status,
+                        e.body,
+                    )
             except Exception as e:
                 log.warning(
                     "DELETE folder {!r} ({}) crashed: {}", display, fid, e
